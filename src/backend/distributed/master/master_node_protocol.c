@@ -321,6 +321,8 @@ master_get_new_placementid(PG_FUNCTION_ARGS)
 	int savedSecurityContext = 0;
 	Datum shardIdDatum = 0;
 
+	EnsureSchemaNode();
+
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 

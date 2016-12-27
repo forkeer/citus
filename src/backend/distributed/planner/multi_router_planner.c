@@ -26,6 +26,7 @@
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distribution_column.h"
 #include "distributed/master_metadata_utility.h"
+#include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_planner.h"
@@ -643,6 +644,8 @@ ErrorIfInsertSelectQueryNotSupported(Query *queryTree, RangeTblEntry *insertRte,
 	/* we only do this check for INSERT ... SELECT queries */
 	AssertArg(InsertSelectQuery(queryTree));
 
+	EnsureSchemaNode();
+
 	subquery = subqueryRte->subquery;
 
 	if (contain_volatile_functions((Node *) queryTree))
@@ -1002,6 +1005,7 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 	Oid distributedTableId = ExtractFirstDistributedTableId(queryTree);
 	uint32 rangeTableId = 1;
 	Var *partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
+	bool schemaNode = SchemaNode();
 	List *rangeTableList = NIL;
 	ListCell *rangeTableCell = NULL;
 	bool hasValuesScan = false;
@@ -1045,6 +1049,28 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 	foreach(rangeTableCell, rangeTableList)
 	{
 		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+		bool referenceTable = false;
+
+		if (IsDistributedTable(rangeTableEntry->relid))
+		{
+			DistTableCacheEntry *distTableEntry =
+				DistributedTableCacheEntry(rangeTableEntry->relid);
+
+			if (distTableEntry->replicationModel == REPLICATION_MODEL_2PC)
+			{
+				referenceTable = true;
+			}
+		}
+
+		if (referenceTable && !schemaNode)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot perform distributed planning for the given"
+								   " modification"),
+							errdetail("Modifications to reference tables are supported "
+									  "only from the schema node.")));
+		}
+
 		if (rangeTableEntry->rtekind == RTE_RELATION)
 		{
 			queryTableCount++;
