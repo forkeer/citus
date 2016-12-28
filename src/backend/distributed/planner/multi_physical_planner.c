@@ -1531,11 +1531,13 @@ NewTableId(Index originalTableId, List *rangeTableList)
 		if (listMember)
 		{
 			newTableId = rangeTableIndex;
-			break;
+			return newTableId;
 		}
 
 		rangeTableIndex++;
 	}
+
+	ereport(ERROR, (errmsg("Unrecognized range table id %d", (int) originalTableId)));
 
 	return newTableId;
 }
