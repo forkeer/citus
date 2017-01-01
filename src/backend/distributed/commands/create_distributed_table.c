@@ -34,7 +34,10 @@
 #include "commands/extension.h"
 #include "commands/trigger.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/connection_cache.h"
+#include "distributed/connection_management.h"
 #include "distributed/distribution_column.h"
+#include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
@@ -42,6 +45,9 @@
 #include "distributed/multi_logical_planner.h"
 #include "distributed/pg_dist_colocation.h"
 #include "distributed/pg_dist_partition.h"
+#include "distributed/remote_commands.h"
+#include "distributed/resource_lock.h"
+#include "distributed/transaction_management.h"
 #include "distributed/worker_transaction.h"
 #include "executor/spi.h"
 #include "nodes/execnodes.h"
@@ -60,6 +66,12 @@
 
 
 /* local function forward declarations */
+static void ReplicateReferenceTableToAllNodes(Oid relationId);
+static void ReplicateShardToWorkersInSeparateTransaction(List *workerNodeList,
+														 ShardInterval *shardInterval);
+static void ReplicateShardToWorkersInCoordinatedTransaction(List *workerNodeList,
+															ShardInterval *shardInterval);
+static void ConvertToReferenceTableMetadata(Oid relationId, uint64 shardId);
 static void CreateReferenceTable(Oid relationId);
 static void ConvertToDistributedTable(Oid relationId, char *distributionColumnName,
 									  char distributionMethod, uint32 colocationId,
@@ -83,12 +95,13 @@ static void CreateHashDistributedTable(Oid relationId, char *distributionColumnN
 									   char *colocateWithTableName,
 									   int shardCount, int replicationFactor);
 static Oid ColumnType(Oid relationId, char *columnName);
-
+static bool TableReferenced(Oid relationId);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_distributed_table);
 PG_FUNCTION_INFO_V1(create_distributed_table);
 PG_FUNCTION_INFO_V1(create_reference_table);
+PG_FUNCTION_INFO_V1(upgrade_reference_table);
 
 
 /*
@@ -212,6 +225,299 @@ create_reference_table(PG_FUNCTION_ARGS)
 
 
 /*
+ * upgrade_reference_table accepts a distributed table which has only one shard and
+ * replicates it across all nodes to create a reference table. It also modifies related
+ * metadata to mark the table as reference explicitly.
+ */
+Datum
+upgrade_reference_table(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+	List *shardIntervalList = NIL;
+	ShardInterval *shardInterval = NULL;
+	uint64 shardId = INVALID_SHARD_ID;
+
+	if (!IsDistributedTable(relationId))
+	{
+		char *relationName = get_rel_name(relationId);
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cannot create reference table"),
+						errdetail("Relation %s is not distributed", relationName),
+						errhint("Instead, you can use; "
+								"create_reference_table('%s');", relationName)));
+	}
+
+	if (PartitionMethod(relationId) != DISTRIBUTE_BY_HASH)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create reference table"),
+						errdetail("Only hash distributed tables can be upgraded to "
+								  "reference tables.")));
+	}
+
+	shardIntervalList = LoadShardIntervalList(relationId);
+	if (shardIntervalList->length != 1)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create reference table"),
+						errdetail("Only tables with one shard can be upgraded to "
+								  "reference tables.")));
+	}
+
+	shardInterval = (ShardInterval *) linitial(shardIntervalList);
+	shardId = shardInterval->shardId;
+
+	LockShardDistributionMetadata(shardId, ExclusiveLock);
+	LockShardResource(shardId, ExclusiveLock);
+
+	ReplicateReferenceTableToAllNodes(relationId);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * ReplicateReferenceTableToAllNodes accepts an implicit reference table and replicates
+ * it to all worker nodes. It assumes that caller of this function ensures that given
+ * table is an implicit reference table (i.e. hash distributed table with one shard).
+ */
+static void
+ReplicateReferenceTableToAllNodes(Oid relationId)
+{
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+	ShardInterval *shardInterval = (ShardInterval *) linitial(shardIntervalList);
+	uint64 shardId = shardInterval->shardId;
+
+	List *workerNodeList = WorkerNodeList();
+
+	List *foreignConstraintCommandList = CopyShardForeignConstraintCommandList(
+		shardInterval);
+
+	if (foreignConstraintCommandList != NIL || TableReferenced(relationId))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create reference table"),
+						errdetail("Foreign key constraints are not allowed "
+								  "from or to reference tables.")));
+	}
+
+	workerNodeList = SortList(workerNodeList, CompareWorkerNodes);
+	ReplicateShardToWorkersInSeparateTransaction(workerNodeList, shardInterval);
+
+	if (false)
+	{
+		ReplicateShardToWorkersInCoordinatedTransaction(workerNodeList, shardInterval);
+	}
+
+	/*
+	 * After copying the shards, we need to update metadata tables to mark this table as
+	 * reference table explicitly. We modify pg_dist_partition, pg_dist_colocation and
+	 * pg_dist_shard tables in ConvertToReferenceTableMetadata function.
+	 */
+	ConvertToReferenceTableMetadata(relationId, shardId);
+}
+
+
+/*
+ * ReplicateShardToWorkersInSeparateTransaction function replicates given shard to the
+ * given worker nodes in a separate transactions. While replicating, it only replicates
+ * shard to the workers which either does not have the shard or has the shard but it
+ * unhealthy state. This function also modifies metadata by inserting/updating related
+ * rows in pg_dist_shard_placement.
+ */
+static void
+ReplicateShardToWorkersInSeparateTransaction(List *workerNodeList,
+											 ShardInterval *shardInterval)
+{
+	uint64 shardId = shardInterval->shardId;
+	List *shardPlacementList = ShardPlacementList(shardId);
+	bool missingOk = false;
+	ShardPlacement *sourceShardPlacement = FinalizedShardPlacement(shardId, missingOk);
+	char *srcNodeName = sourceShardPlacement->nodeName;
+	uint32 srcNodePort = sourceShardPlacement->nodePort;
+	char *tableOwner = TableOwner(shardInterval->relationId);
+	List *ddlCommandList = CopyShardCommandList(shardInterval, srcNodeName, srcNodePort);
+	ListCell *workerNodeCell = NULL;
+
+	/*
+	 * We will iterate over all worker nodes and if healthy placement is not exist at
+	 * given node we will copy the shard to that node. Then we will also modify
+	 * the metadata to reflect newly copied shard.
+	 */
+	foreach(workerNodeCell, workerNodeList)
+	{
+		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
+		char *nodeName = workerNode->workerName;
+		uint32 nodePort = workerNode->workerPort;
+		bool missingWorkerOk = true;
+
+		ShardPlacement *workerPlacement = SearchShardPlacementInList(shardPlacementList,
+																	 nodeName, nodePort,
+																	 missingWorkerOk);
+		if (workerPlacement == NULL || workerPlacement->shardState != FILE_FINALIZED)
+		{
+			SendCommandListToWorkerInSingleTransaction(nodeName, nodePort, tableOwner,
+													   ddlCommandList);
+			if (workerPlacement == NULL)
+			{
+				InsertShardPlacementRow(shardId, INVALID_PLACEMENT_ID, FILE_FINALIZED, 0,
+										nodeName, nodePort);
+			}
+			else
+			{
+				UpdateShardPlacementState(workerPlacement->placementId, FILE_FINALIZED);
+			}
+		}
+	}
+}
+
+
+/*
+ * ReplicateShardToWorkersInCoordinatedTransaction function replicates given shard to the
+ * given worker nodes in a coordinated transaction. While replicating, it only replicates
+ * shard to the workers which either does not have the shard or has the shard but it
+ * unhealthy state. This function also modifies metadata by inserting/updating related
+ * rows in pg_dist_shard_placement.
+ */
+static void
+ReplicateShardToWorkersInCoordinatedTransaction(List *workerNodeList,
+												ShardInterval *shardInterval)
+{
+	uint64 shardId = shardInterval->shardId;
+	List *shardPlacementList = ShardPlacementList(shardId);
+	bool missingOk = false;
+	ShardPlacement *sourceShardPlacement = FinalizedShardPlacement(shardId, missingOk);
+	char *srcNodeName = sourceShardPlacement->nodeName;
+	uint32 srcNodePort = sourceShardPlacement->nodePort;
+
+	List *connectionList = NIL;
+	ListCell *connectionCell = NULL;
+	char *nodeUser = CitusExtensionOwnerName();
+
+	List *ddlCommandList = CopyShardCommandList(shardInterval, srcNodeName, srcNodePort);
+	ListCell *commandCell = NULL;
+
+	ListCell *workerNodeCell = NULL;
+
+	/*
+	 * We want to do all these operations in a coordinated transaction with 2PC so that
+	 * if an error occurs or we ROLLBACK at master, we can ROLLBACK at workers too.
+	 */
+	BeginOrContinueCoordinatedTransaction();
+	CoordinatedTransactionUse2PC();
+
+	/*
+	 * We will iterate over all worker nodes and if healthy placement is not exist at
+	 * given node we will copy the shard to that node.
+	 */
+	foreach(workerNodeCell, workerNodeList)
+	{
+		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
+		char *nodeName = workerNode->workerName;
+		uint32 nodePort = workerNode->workerPort;
+		bool missingWorkerOk = true;
+
+		ShardPlacement *workerPlacement = SearchShardPlacementInList(shardPlacementList,
+																	 nodeName, nodePort,
+																	 missingWorkerOk);
+		if (workerPlacement == NULL || workerPlacement->shardState != FILE_FINALIZED)
+		{
+			int connectionFlags = 0;
+			MultiConnection *connection = StartNodeUserDatabaseConnection(connectionFlags,
+																		  nodeName,
+																		  nodePort,
+																		  nodeUser,
+																		  NULL);
+
+			MarkRemoteTransactionCritical(connection);
+			connectionList = lappend(connectionList, connection);
+		}
+	}
+
+	/* finish opening connections */
+	foreach(connectionCell, connectionList)
+	{
+		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
+
+		FinishConnectionEstablishment(connection);
+	}
+
+	RemoteTransactionsBeginIfNecessary(connectionList);
+
+	/* send commands to each node */
+	foreach(connectionCell, connectionList)
+	{
+		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
+
+		/* iterate over the commands and execute them in the same connection */
+		foreach(commandCell, ddlCommandList)
+		{
+			char *commandString = lfirst(commandCell);
+
+			/* TODO send commands in parallel */
+			ExecuteCriticalRemoteCommand(connection, commandString);
+		}
+	}
+
+	/* after copying the shards, we will update the metadata */
+	foreach(workerNodeCell, workerNodeList)
+	{
+		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
+		char *nodeName = workerNode->workerName;
+		uint32 nodePort = workerNode->workerPort;
+		bool missingOk = true;
+
+		ShardPlacement *workerPlacement = SearchShardPlacementInList(shardPlacementList,
+																	 nodeName, nodePort,
+																	 missingOk);
+		if (workerPlacement == NULL)
+		{
+			InsertShardPlacementRow(shardId, INVALID_PLACEMENT_ID, FILE_FINALIZED, 0,
+									nodeName, nodePort);
+		}
+		else if (workerPlacement->shardState != FILE_FINALIZED)
+		{
+			UpdateShardPlacementState(workerPlacement->placementId, FILE_FINALIZED);
+		}
+	}
+}
+
+
+/*
+ * ConvertToReferenceTableMetadata accepts an implicit reference table and modifies its
+ * metadata to reference table metadata. It assumes that caller of this function ensures
+ * that given table is an implicit reference table (i.e. hash distributed table with one
+ * shard).
+ */
+static void
+ConvertToReferenceTableMetadata(Oid relationId, uint64 shardId)
+{
+	uint32 currentColocationId = TableColocationId(relationId);
+	uint32 newColocationId = CreateReferenceTableColocationId();
+	char *distributionColumnName = NULL;
+	Relation relation = relation_open(relationId, ExclusiveLock);
+	Var *distributionColumn = BuildDistributionKeyFromColumnName(relation,
+																 distributionColumnName);
+	char shardStorageType = ShardStorageType(relationId);
+	text *shardMinValue = NULL;
+	text *shardMaxValue = NULL;
+
+	/* update pg_dist_partition table */
+	DeletePartitionRow(relationId);
+	InsertIntoPgDistPartition(relationId, DISTRIBUTE_BY_NONE, distributionColumn,
+							  newColocationId, REPLICATION_MODEL_2PC);
+	relation_close(relation, NoLock);
+
+	/* update pg_dist_colocation */
+	DeleteColocationGroupIfEmpty(currentColocationId);
+
+	/* update pg_dist_shard */
+	DeleteShardRow(shardId);
+	InsertShardRow(relationId, shardId, shardStorageType, shardMinValue, shardMaxValue);
+}
+
+
+/*
  * CreateReferenceTable creates a distributed table with the given relationId. The
  * created table has one shard and replication factor is set to the active worker
  * count. In fact, the above is the definition of a reference table in Citus.
@@ -221,9 +527,7 @@ CreateReferenceTable(Oid relationId)
 {
 	uint32 colocationId = INVALID_COLOCATION_ID;
 	List *workerNodeList = WorkerNodeList();
-	int shardCount = 1;
 	int replicationFactor = list_length(workerNodeList);
-	Oid distributionColumnType = InvalidOid;
 	char *distributionColumnName = NULL;
 
 	/* if there are no workers, error out */
@@ -236,13 +540,7 @@ CreateReferenceTable(Oid relationId)
 						errdetail("There are no active worker nodes.")));
 	}
 
-	/* check for existing colocations */
-	colocationId = ColocationId(shardCount, replicationFactor, distributionColumnType);
-	if (colocationId == INVALID_COLOCATION_ID)
-	{
-		colocationId = CreateColocationGroup(shardCount, replicationFactor,
-											 distributionColumnType);
-	}
+	colocationId = CreateReferenceTableColocationId();
 
 	/* first, convert the relation into distributed relation */
 	ConvertToDistributedTable(relationId, distributionColumnName,
@@ -1087,4 +1385,52 @@ ColumnType(Oid relationId, char *columnName)
 	Oid columnType = get_atttype(relationId, columnIndex);
 
 	return columnType;
+}
+
+
+/*
+ * TableReferenced function checks whether given table is referenced by another table
+ * via foreign constraints. If it is referenced, this function returns true. To check
+ * that, this function searches given relation at pg_constraints system catalog. However
+ * since there is no index for the column we searched, this function performs sequential
+ * search, therefore call this function with caution.
+ */
+static bool
+TableReferenced(Oid relationId)
+{
+	Relation pgConstraint = NULL;
+	HeapTuple heapTuple = NULL;
+	SysScanDesc scanDescriptor = NULL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	Oid scanIndexId = InvalidOid;
+	bool useIndex = false;
+
+	pgConstraint = heap_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_constraint_confrelid, BTEqualStrategyNumber, F_OIDEQ,
+				relationId);
+	scanDescriptor = systable_beginscan(pgConstraint, scanIndexId, useIndex, NULL,
+										scanKeyCount, scanKey);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_constraint constraintForm = (Form_pg_constraint) GETSTRUCT(heapTuple);
+
+		if (constraintForm->contype == CONSTRAINT_FOREIGN)
+		{
+			systable_endscan(scanDescriptor);
+			heap_close(pgConstraint, NoLock);
+
+			return true;
+		}
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgConstraint, NoLock);
+
+	return false;
 }

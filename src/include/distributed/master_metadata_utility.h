@@ -65,6 +65,7 @@ extern void CopyShardInterval(ShardInterval *srcInterval, ShardInterval *destInt
 extern uint64 ShardLength(uint64 shardId);
 extern bool NodeHasActiveShardPlacements(char *nodeName, int32 nodePort);
 extern List * FinalizedShardPlacementList(uint64 shardId);
+extern ShardPlacement * FinalizedShardPlacement(uint64 shardId, bool missingOk);
 extern List * ShardPlacementList(uint64 shardId);
 extern ShardPlacement * TupleToShardPlacement(TupleDesc tupleDesc,
 											  HeapTuple heapTuple);

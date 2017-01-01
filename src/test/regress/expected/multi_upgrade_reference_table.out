@@ -1,0 +1,533 @@
+--
+-- MULTI_UPGRADE_REFERENCE_TABLE
+--
+-- Tests around upgrade_reference_table UDF
+--
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1360000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1360000;
+-- test with not distributed table
+CREATE TABLE upgrade_reference_table_append(column1 int);
+SELECT upgrade_reference_table('upgrade_reference_table_append');
+ERROR:  cannot create reference table
+DETAIL:  Relation upgrade_reference_table_append is not distributed
+HINT:  Instead, you can use; create_reference_table('upgrade_reference_table_append');
+-- test with append distributed table
+SET citus.shard_count TO 4;
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('upgrade_reference_table_append', 'column1', 'append');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT upgrade_reference_table('upgrade_reference_table_append');
+ERROR:  cannot create reference table
+DETAIL:  Only hash distributed tables can be upgraded to reference tables.
+-- test with table which has more than one shard
+CREATE TABLE upgrade_reference_table_multiple_shard(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_multiple_shard', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT upgrade_reference_table('upgrade_reference_table_multiple_shard');
+ERROR:  cannot create reference table
+DETAIL:  Only tables with one shard can be upgraded to reference tables.
+-- test with table with foreign keys
+SET citus.shard_count TO 1;
+CREATE TABLE upgrade_reference_table_referenced(column1 int PRIMARY KEY);
+SELECT create_distributed_table('upgrade_reference_table_referenced', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+CREATE TABLE upgrade_reference_table_referencing(column1 int REFERENCES upgrade_reference_table_referenced(column1));
+SELECT create_distributed_table('upgrade_reference_table_referencing', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT upgrade_reference_table('upgrade_reference_table_referenced');
+ERROR:  cannot create reference table
+DETAIL:  Foreign key constraints are not allowed from or to reference tables.
+SELECT upgrade_reference_table('upgrade_reference_table_referencing');
+ERROR:  cannot create reference table
+DETAIL:  Foreign key constraints are not allowed from or to reference tables.
+-- test with no healthy placements
+CREATE TABLE upgrade_reference_table_unhealthy(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_unhealthy', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 1360006;
+SELECT upgrade_reference_table('upgrade_reference_table_unhealthy');
+ERROR:  could not find any healthy placement for shard 1360006
+-- test valid cases, shard exists at one worker
+CREATE TABLE upgrade_reference_table_one_worker(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_one_worker', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+-- situation before upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass;
+            logicalrelid            | partmethod |                                                        partkey                                                         | colocationid | repmodel 
+------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------+--------------+----------
+ upgrade_reference_table_one_worker | h          | {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varlevelsup 0 :varnoold 1 :varoattno 1 :location -1} |           32 | s
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass;
+            logicalrelid            | shardid | shardstorage | shardminvalue | shardmaxvalue 
+------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_one_worker | 1360007 | t            | -2147483648   | 2147483647
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           32 |          1 |                 1 |                     23
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360007 |          1 |           0 | localhost |    57637 |         372
+(1 row)
+
+SELECT upgrade_reference_table('upgrade_reference_table_one_worker');
+ upgrade_reference_table 
+-------------------------
+ 
+(1 row)
+
+-- situation after upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass;
+            logicalrelid            | partmethod | partkey | colocationid | repmodel 
+------------------------------------+------------+---------+--------------+----------
+ upgrade_reference_table_one_worker | n          |         |           33 | t
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass;
+            logicalrelid            | shardid | shardstorage | shardminvalue | shardmaxvalue 
+------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_one_worker | 1360007 | t            |               | 
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           33 |          1 |                 2 |                      0
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_one_worker'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360007 |          1 |           0 | localhost |    57637 |         372
+ 1360007 |          1 |           0 | localhost |    57638 |         373
+(2 rows)
+
+-- test valid cases, shard exists at both workers but one is unhealthy
+SET citus.shard_replication_factor TO 2;
+CREATE TABLE upgrade_reference_table_one_unhealthy(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_one_unhealthy', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 1360008 AND nodeport = :worker_1_port;
+-- situation before upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass;
+             logicalrelid              | partmethod |                                                        partkey                                                         | colocationid | repmodel 
+---------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------+--------------+----------
+ upgrade_reference_table_one_unhealthy | h          | {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varlevelsup 0 :varnoold 1 :varoattno 1 :location -1} |           34 | c
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass;
+             logicalrelid              | shardid | shardstorage | shardminvalue | shardmaxvalue 
+---------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_one_unhealthy | 1360008 | t            | -2147483648   | 2147483647
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           34 |          1 |                 2 |                     23
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360008 |          1 |           0 | localhost |    57638 |         375
+ 1360008 |          3 |           0 | localhost |    57637 |         374
+(2 rows)
+
+SELECT upgrade_reference_table('upgrade_reference_table_one_unhealthy');
+ upgrade_reference_table 
+-------------------------
+ 
+(1 row)
+
+-- situation after upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass;
+             logicalrelid              | partmethod | partkey | colocationid | repmodel 
+---------------------------------------+------------+---------+--------------+----------
+ upgrade_reference_table_one_unhealthy | n          |         |           33 | t
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass;
+             logicalrelid              | shardid | shardstorage | shardminvalue | shardmaxvalue 
+---------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_one_unhealthy | 1360008 | t            |               | 
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           33 |          1 |                 2 |                      0
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_one_unhealthy'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360008 |          1 |           0 | localhost |    57638 |         375
+ 1360008 |          1 |           0 | localhost |    57637 |         374
+(2 rows)
+
+-- test valid cases, shard exists at both workers and both are healthy
+CREATE TABLE upgrade_reference_table_both_healthy(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_both_healthy', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+-- situation before upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass;
+             logicalrelid             | partmethod |                                                        partkey                                                         | colocationid | repmodel 
+--------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------+--------------+----------
+ upgrade_reference_table_both_healthy | h          | {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varlevelsup 0 :varnoold 1 :varoattno 1 :location -1} |           35 | c
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass;
+             logicalrelid             | shardid | shardstorage | shardminvalue | shardmaxvalue 
+--------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_both_healthy | 1360009 | t            | -2147483648   | 2147483647
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           35 |          1 |                 2 |                     23
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360009 |          1 |           0 | localhost |    57637 |         376
+ 1360009 |          1 |           0 | localhost |    57638 |         377
+(2 rows)
+
+SELECT upgrade_reference_table('upgrade_reference_table_both_healthy');
+ upgrade_reference_table 
+-------------------------
+ 
+(1 row)
+
+-- situation after upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass;
+             logicalrelid             | partmethod | partkey | colocationid | repmodel 
+--------------------------------------+------------+---------+--------------+----------
+ upgrade_reference_table_both_healthy | n          |         |           33 | t
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass;
+             logicalrelid             | shardid | shardstorage | shardminvalue | shardmaxvalue 
+--------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_both_healthy | 1360009 | t            |               | 
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           33 |          1 |                 2 |                      0
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_both_healthy'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360009 |          1 |           0 | localhost |    57637 |         376
+ 1360009 |          1 |           0 | localhost |    57638 |         377
+(2 rows)
+
+-- test valid cases, do it in transaction and ROLLBACK
+SET citus.shard_replication_factor TO 1;
+CREATE TABLE upgrade_reference_table_transaction_rollback(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_transaction_rollback', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+-- situation before upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass;
+                 logicalrelid                 | partmethod |                                                        partkey                                                         | colocationid | repmodel 
+----------------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------+--------------+----------
+ upgrade_reference_table_transaction_rollback | h          | {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varlevelsup 0 :varnoold 1 :varoattno 1 :location -1} |           32 | s
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass;
+                 logicalrelid                 | shardid | shardstorage | shardminvalue | shardmaxvalue 
+----------------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_transaction_rollback | 1360010 | t            | -2147483648   | 2147483647
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           32 |          1 |                 1 |                     23
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360010 |          1 |           0 | localhost |    57637 |         378
+(1 row)
+
+BEGIN;
+SELECT upgrade_reference_table('upgrade_reference_table_transaction_rollback');
+ upgrade_reference_table 
+-------------------------
+ 
+(1 row)
+
+ROLLBACK;
+-- situation after upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass;
+                 logicalrelid                 | partmethod |                                                        partkey                                                         | colocationid | repmodel 
+----------------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------+--------------+----------
+ upgrade_reference_table_transaction_rollback | h          | {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varlevelsup 0 :varnoold 1 :varoattno 1 :location -1} |           32 | s
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass;
+                 logicalrelid                 | shardid | shardstorage | shardminvalue | shardmaxvalue 
+----------------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_transaction_rollback | 1360010 | t            | -2147483648   | 2147483647
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           32 |          1 |                 1 |                     23
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_rollback'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360010 |          1 |           0 | localhost |    57637 |         378
+(1 row)
+
+-- verify that shard is not replicated to other worker
+\c - - - :worker_2_port
+\d upgrade_reference_table_transaction_rollback_*
+Table "public.upgrade_reference_table_transaction_rollback_1360010"
+ Column  |  Type   | Modifiers 
+---------+---------+-----------
+ column1 | integer | 
+
+\c - - - :master_port
+-- test valid cases, do it in transaction and COMMIT
+SET citus.shard_replication_factor TO 1;
+SET citus.shard_count TO 1;
+CREATE TABLE upgrade_reference_table_transaction_commit(column1 int);
+SELECT create_distributed_table('upgrade_reference_table_transaction_commit', 'column1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+-- situation before upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass;
+                logicalrelid                | partmethod |                                                        partkey                                                         | colocationid | repmodel 
+--------------------------------------------+------------+------------------------------------------------------------------------------------------------------------------------+--------------+----------
+ upgrade_reference_table_transaction_commit | h          | {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varlevelsup 0 :varnoold 1 :varoattno 1 :location -1} |           32 | s
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass;
+                logicalrelid                | shardid | shardstorage | shardminvalue | shardmaxvalue 
+--------------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_transaction_commit | 1360011 | t            | -2147483648   | 2147483647
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           32 |          1 |                 1 |                     23
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360011 |          1 |           0 | localhost |    57637 |         380
+(1 row)
+
+BEGIN;
+SELECT upgrade_reference_table('upgrade_reference_table_transaction_commit');
+ upgrade_reference_table 
+-------------------------
+ 
+(1 row)
+
+COMMIT;
+-- situation after upgrade_reference_table
+SELECT * FROM pg_dist_partition WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass;
+                logicalrelid                | partmethod | partkey | colocationid | repmodel 
+--------------------------------------------+------------+---------+--------------+----------
+ upgrade_reference_table_transaction_commit | n          |         |           33 | t
+(1 row)
+
+SELECT * FROM pg_dist_shard WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass;
+                logicalrelid                | shardid | shardstorage | shardminvalue | shardmaxvalue 
+--------------------------------------------+---------+--------------+---------------+---------------
+ upgrade_reference_table_transaction_commit | 1360011 | t            |               | 
+(1 row)
+
+SELECT *
+FROM pg_dist_colocation
+WHERE colocationid IN
+    (SELECT colocationid
+     FROM pg_dist_partition
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass);
+ colocationid | shardcount | replicationfactor | distributioncolumntype 
+--------------+------------+-------------------+------------------------
+           33 |          1 |                 2 |                      0
+(1 row)
+
+SELECT *
+FROM pg_dist_shard_placement
+WHERE shardid IN
+    (SELECT shardid
+     FROM pg_dist_shard
+     WHERE logicalrelid = 'upgrade_reference_table_transaction_commit'::regclass);
+ shardid | shardstate | shardlength | nodename  | nodeport | placementid 
+---------+------------+-------------+-----------+----------+-------------
+ 1360011 |          1 |           0 | localhost |    57637 |         380
+ 1360011 |          1 |           0 | localhost |    57638 |         381
+(2 rows)
+
+-- verify that shard is replicated to other worker
+\c - - - :worker_2_port
+\d upgrade_reference_table_transaction_commit_*
+Table "public.upgrade_reference_table_transaction_commit_1360011"
+ Column  |  Type   | Modifiers 
+---------+---------+-----------
+ column1 | integer | 
+
+\c - - - :master_port
+-- drop used tables to clean the workspace
+DROP TABLE upgrade_reference_table_append;
+DROP TABLE upgrade_reference_table_multiple_shard;
+DROP TABLE upgrade_reference_table_referencing;
+DROP TABLE upgrade_reference_table_referenced;
+DROP TABLE upgrade_reference_table_unhealthy;
+DROP TABLE upgrade_reference_table_one_worker;
+DROP TABLE upgrade_reference_table_one_unhealthy;
+DROP TABLE upgrade_reference_table_both_healthy;
+DROP TABLE upgrade_reference_table_transaction_rollback;
+DROP TABLE upgrade_reference_table_transaction_commit;

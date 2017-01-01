@@ -143,16 +143,7 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 	UpdateRelationColocationGroup(targetRelationId, sourceColocationId);
 
 	/* if there is not any remaining table in the colocation group, delete it */
-	if (targetColocationId != INVALID_COLOCATION_ID)
-	{
-		List *colocatedTableList = ColocationGroupTableList(targetColocationId);
-		int colocatedTableCount = list_length(colocatedTableList);
-
-		if (colocatedTableCount == 0)
-		{
-			DeleteColocationGroup(targetColocationId);
-		}
-	}
+	DeleteColocationGroupIfEmpty(targetColocationId);
 
 	heap_close(pgDistColocation, NoLock);
 }
@@ -446,6 +437,34 @@ ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType)
 
 	systable_endscan(scanDescriptor);
 	heap_close(pgDistColocation, AccessShareLock);
+
+	return colocationId;
+}
+
+
+/*
+ * CreateReferenceTableColocationId creates a new co-location id for reference tables and
+ * writes it into pg_dist_colocation, then returns the created co-location id. Since there
+ * can be only one colocation group for all kinds of reference tables, if a co-location id
+ * is already created for reference tables, this function returns it without creating
+ * anything.
+ */
+uint32
+CreateReferenceTableColocationId()
+{
+	uint32 colocationId = INVALID_COLOCATION_ID;
+	List *workerNodeList = WorkerNodeList();
+	int shardCount = 1;
+	int replicationFactor = list_length(workerNodeList);
+	Oid distributionColumnType = InvalidOid;
+
+	/* check for existing colocations */
+	colocationId = ColocationId(shardCount, replicationFactor, distributionColumnType);
+	if (colocationId == INVALID_COLOCATION_ID)
+	{
+		colocationId = CreateColocationGroup(shardCount, replicationFactor,
+											 distributionColumnType);
+	}
 
 	return colocationId;
 }
@@ -935,6 +954,29 @@ ColocatedShardIdInRelation(Oid relationId, int shardIndex)
 	DistTableCacheEntry *tableCacheEntry = DistributedTableCacheEntry(relationId);
 
 	return tableCacheEntry->sortedShardIntervalArray[shardIndex]->shardId;
+}
+
+
+/*
+ * DeleteColocationGroupIfEmpty function deletes given co-location group if there is no
+ * relation in that colocation group. A co-location group may become empty after we change
+ * co-location group of a table with mark_tables_colocated or upgrade_reference_table
+ * UDFs. In that case we need to remove empty co-location group to prevent orphaned
+ * co-location groups.
+ */
+void
+DeleteColocationGroupIfEmpty(uint32 colocationId)
+{
+	if (colocationId != INVALID_COLOCATION_ID)
+	{
+		List *colocatedTableList = ColocationGroupTableList(colocationId);
+		int colocatedTableCount = list_length(colocatedTableList);
+
+		if (colocatedTableCount == 0)
+		{
+			DeleteColocationGroup(colocationId);
+		}
+	}
 }
 
 

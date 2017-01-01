@@ -20,6 +20,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_namespace.h"
+#include "distributed/connection_management.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
@@ -319,6 +320,38 @@ FinalizedShardPlacementList(uint64 shardId)
 	}
 
 	return finalizedPlacementList;
+}
+
+
+/*
+ * FinalizedShardPlacement finds a shard placement for the given shardId from
+ * system catalog, chooses a placement that is in finalized state and returns
+ * that shard placement. If this function cannot find a healthy shard placement
+ * and missingOk is set to false it errors out.
+ */
+ShardPlacement *
+FinalizedShardPlacement(uint64 shardId, bool missingOk)
+{
+	List *shardPlacementList = ShardPlacementList(shardId);
+	ListCell *shardPlacementCell = NULL;
+
+	foreach(shardPlacementCell, shardPlacementList)
+	{
+		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(shardPlacementCell);
+		if (shardPlacement->shardState == FILE_FINALIZED)
+		{
+			return shardPlacement;
+		}
+	}
+
+	if (!missingOk)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("could not find any healthy placement for shard "
+							   UINT64_FORMAT, shardId)));
+	}
+
+	return NULL;
 }
 
 
