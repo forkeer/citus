@@ -77,6 +77,11 @@ extern void DeleteShardRow(uint64 shardId);
 extern void InsertShardPlacementRow(uint64 shardId, uint64 placementId,
 									char shardState, uint64 shardLength,
 									char *nodeName, uint32 nodePort);
+extern void InsertIntoPgDistPartition(Oid relationId, char distributionMethod,
+									  Var *distributionColumn, uint32 colocationId,
+									  char replicationModel);
+extern void RecordDistributedRelationDependencies(Oid distributedRelationId,
+												  Node *distributionKey);
 extern void DeletePartitionRow(Oid distributedRelationId);
 extern void DeleteShardRow(uint64 shardId);
 extern void UpdateShardPlacementState(uint64 placementId, char shardState);
@@ -89,5 +94,6 @@ extern char * TableOwner(Oid relationId);
 extern void EnsureTablePermissions(Oid relationId, AclMode mode);
 extern void EnsureTableOwner(Oid relationId);
 extern void EnsureSuperUser(void);
+extern bool TableReferenced(Oid relationId);
 
 #endif   /* MASTER_METADATA_UTILITY_H */
