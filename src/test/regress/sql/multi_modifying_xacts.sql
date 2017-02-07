@@ -111,15 +111,21 @@ INSERT INTO labs VALUES (6, 'Bell Labs');
 INSERT INTO researchers VALUES (9, 6, 'Leslie Lamport');
 COMMIT;
 
--- this logic even applies to router SELECTs occurring after a modification:
--- selecting from the modified node is fine...
+-- unless we disable deadlock prevention
+BEGIN;
+SET citus.enable_deadlock_prevention TO off;
+INSERT INTO labs VALUES (6, 'Bell Labs');
+INSERT INTO researchers VALUES (9, 6, 'Leslie Lamport');
+ABORT;
+
+-- SELECTs may occur after a modification: First check that selecting
+-- from the modified node works.
 BEGIN;
 INSERT INTO labs VALUES (6, 'Bell Labs');
 SELECT count(*) FROM researchers WHERE lab_id = 6;
 ABORT;
 
--- but if a SELECT needs to go to new node, that's a problem...
-
+-- then check that SELECT going to new node still is fine
 BEGIN;
 
 UPDATE pg_dist_shard_placement AS sp SET shardstate = 3
@@ -149,7 +155,7 @@ COMMIT;
 \d labs
 SELECT * FROM labs WHERE id = 6;
 
--- COPY can't happen second,
+-- COPY can happen after single row INSERT
 BEGIN;
 INSERT INTO labs VALUES (6, 'Bell Labs');
 \copy labs from stdin delimiter ','
@@ -157,7 +163,7 @@ INSERT INTO labs VALUES (6, 'Bell Labs');
 \.
 COMMIT;
 
--- though it will work if before any modifications
+-- COPY can happen before single row INSERT
 BEGIN;
 \copy labs from stdin delimiter ','
 10,Weyland-Yutani
@@ -166,7 +172,7 @@ SELECT name FROM labs WHERE id = 10;
 INSERT INTO labs VALUES (6, 'Bell Labs');
 COMMIT;
 
--- but a double-copy isn't allowed (the first will persist)
+-- two consecutive COPYs in a transaction are allowed
 BEGIN;
 \copy labs from stdin delimiter ','
 11,Planet Express
@@ -176,7 +182,93 @@ BEGIN;
 \.
 COMMIT;
 
-SELECT name FROM labs WHERE id = 11;
+SELECT name FROM labs WHERE id = 11 OR id = 12 ORDER BY id;
+
+-- 1pc failure test
+SELECT recover_prepared_transactions();
+-- copy with unique index violation
+BEGIN;
+\copy researchers FROM STDIN delimiter ','
+17, 6, 'Bjarne Stroustrup'
+\.
+\copy researchers FROM STDIN delimiter ','
+18, 6, 'Bjarne Stroustrup'
+\.
+COMMIT;
+-- verify rollback
+SELECT * FROM researchers WHERE lab_id = 6;
+SELECT count(*) FROM pg_dist_transaction;
+
+-- 2pc failure and success tests
+SET citus.multi_shard_commit_protocol TO '2pc';
+SELECT recover_prepared_transactions();
+-- copy with unique index violation
+BEGIN;
+\copy researchers FROM STDIN delimiter ','
+17, 6, 'Bjarne Stroustrup'
+\.
+\copy researchers FROM STDIN delimiter ','
+18, 6, 'Bjarne Stroustrup'
+\.
+COMMIT;
+-- verify rollback
+SELECT * FROM researchers WHERE lab_id = 6;
+SELECT count(*) FROM pg_dist_transaction;
+
+BEGIN;
+\copy researchers FROM STDIN delimiter ','
+17, 6, 'Bjarne Stroustrup'
+\.
+\copy researchers FROM STDIN delimiter ','
+18, 6, 'Dennis Ritchie'
+\.
+COMMIT;
+-- verify success
+SELECT * FROM researchers WHERE lab_id = 6;
+-- verify 2pc
+SELECT count(*) FROM pg_dist_transaction;
+
+RESET citus.multi_shard_commit_protocol;
+
+-- create a check function
+SELECT * from run_command_on_workers('CREATE FUNCTION reject_large_id() RETURNS trigger AS $rli$
+    BEGIN
+        IF (NEW.id > 30) THEN
+            RAISE ''illegal value'';
+        END IF;
+
+        RETURN NEW;
+    END;
+$rli$ LANGUAGE plpgsql;')
+ORDER BY nodeport;
+
+-- register after insert trigger
+SELECT * FROM run_command_on_placements('researchers', 'CREATE CONSTRAINT TRIGGER reject_large_researcher_id AFTER INSERT ON %s DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE  reject_large_id()')
+ORDER BY nodeport, shardid;
+
+-- hide postgresql version dependend messages for next test only
+\set VERBOSITY terse
+-- deferred check should abort the transaction
+BEGIN;
+DELETE FROM researchers WHERE lab_id = 6;
+\copy researchers FROM STDIN delimiter ','
+31, 6, 'Bjarne Stroustrup'
+\.
+\copy researchers FROM STDIN delimiter ','
+30, 6, 'Dennis Ritchie'
+\.
+COMMIT;
+\unset VERBOSITY
+
+-- verify everyhing including delete is rolled back
+SELECT * FROM researchers WHERE lab_id = 6;
+
+-- cleanup triggers and the function
+SELECT * from run_command_on_placements('researchers', 'drop trigger reject_large_researcher_id on %s')
+ORDER BY nodeport, shardid;
+
+SELECT * FROM run_command_on_workers('drop function reject_large_id()')
+ORDER BY nodeport;
 
 -- finally, ALTER and copy aren't compatible
 BEGIN;
@@ -188,7 +280,6 @@ COMMIT;
 
 -- but the DDL should correctly roll back
 \d labs
-SELECT * FROM labs WHERE id = 12;
 
 -- and if the copy is before the ALTER...
 BEGIN;
@@ -468,3 +559,376 @@ INSERT INTO append_researchers VALUES (500000, 500000, 'Tony Hoare');
 ROLLBACK;
 
 SELECT * FROM append_researchers;
+
+-- we use 2PC for reference tables by default
+-- let's add some tests for them
+CREATE TABLE reference_modifying_xacts (key int, value int);
+SELECT create_reference_table('reference_modifying_xacts');
+
+-- very basic test, ensure that INSERTs work
+INSERT INTO reference_modifying_xacts VALUES (1, 1);
+SELECT * FROM reference_modifying_xacts;
+
+-- now ensure that it works in a transaction as well
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (2, 2);
+SELECT * FROM reference_modifying_xacts;
+COMMIT;
+
+-- we should be able to see the insert outside of the transaction as well
+SELECT * FROM reference_modifying_xacts;
+
+-- rollback should also work
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (3, 3);
+SELECT * FROM reference_modifying_xacts;
+ROLLBACK;
+
+-- see that we've not inserted
+SELECT * FROM reference_modifying_xacts;
+
+-- lets fail on of the workers at before the commit time
+\c - - - :worker_1_port
+
+CREATE FUNCTION reject_bad_reference() RETURNS trigger AS $rb$
+    BEGIN
+        IF (NEW.key = 999) THEN
+            RAISE 'illegal value';
+        END IF;
+
+        RETURN NEW;
+    END;
+$rb$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER reject_bad_reference
+AFTER INSERT ON reference_modifying_xacts_1200006
+DEFERRABLE INITIALLY IMMEDIATE
+FOR EACH ROW EXECUTE PROCEDURE reject_bad_reference();
+
+\c - - - :master_port
+\set VERBOSITY terse
+-- try without wrapping inside a transaction
+INSERT INTO reference_modifying_xacts VALUES (999, 3);
+
+-- same test within a transaction
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (999, 3);
+COMMIT;
+
+-- lets fail one of the workers at COMMIT time
+\c - - - :worker_1_port
+DROP TRIGGER reject_bad_reference ON reference_modifying_xacts_1200006;
+
+CREATE CONSTRAINT TRIGGER reject_bad_reference
+AFTER INSERT ON reference_modifying_xacts_1200006
+DEFERRABLE INITIALLY  DEFERRED
+FOR EACH ROW EXECUTE PROCEDURE reject_bad_reference();
+
+\c - - - :master_port
+\set VERBOSITY terse
+
+-- try without wrapping inside a transaction
+INSERT INTO reference_modifying_xacts VALUES (999, 3);
+
+-- same test within a transaction
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (999, 3);
+COMMIT;
+
+-- all placements should be healthy
+SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
+FROM     pg_dist_shard_placement AS sp,
+	     pg_dist_shard           AS s
+WHERE    sp.shardid = s.shardid
+AND      s.logicalrelid = 'reference_modifying_xacts'::regclass
+GROUP BY s.logicalrelid, sp.shardstate
+ORDER BY s.logicalrelid, sp.shardstate;
+
+-- for the time-being drop the constraint
+\c - - - :worker_1_port
+DROP TRIGGER reject_bad_reference ON reference_modifying_xacts_1200006;
+
+
+\c - - - :master_port
+
+-- now create a hash distributed table and run tests
+-- including both the reference table and the hash
+-- distributed table
+SET citus.shard_count = 4;
+SET citus.shard_replication_factor = 1;
+CREATE TABLE hash_modifying_xacts (key int, value int);
+SELECT create_distributed_table('hash_modifying_xacts', 'key');
+
+-- let's try to expand the xact participants
+BEGIN;
+INSERT INTO hash_modifying_xacts VALUES (1, 1);
+INSERT INTO reference_modifying_xacts VALUES (10, 10);
+COMMIT;
+
+-- it is allowed when turning off deadlock prevention
+BEGIN;
+SET citus.enable_deadlock_prevention TO off;
+INSERT INTO hash_modifying_xacts VALUES (1, 1);
+INSERT INTO reference_modifying_xacts VALUES (10, 10);
+ABORT;
+
+BEGIN;
+SET citus.enable_deadlock_prevention TO off;
+INSERT INTO hash_modifying_xacts VALUES (1, 1);
+INSERT INTO hash_modifying_xacts VALUES (2, 2);
+ABORT;
+
+-- lets fail one of the workers before COMMIT time for the hash table
+\c - - - :worker_1_port
+
+CREATE FUNCTION reject_bad_hash() RETURNS trigger AS $rb$
+    BEGIN
+        IF (NEW.key = 997) THEN
+            RAISE 'illegal value';
+        END IF;
+
+        RETURN NEW;
+    END;
+$rb$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER reject_bad_hash
+AFTER INSERT ON hash_modifying_xacts_1200007
+DEFERRABLE INITIALLY IMMEDIATE
+FOR EACH ROW EXECUTE PROCEDURE reject_bad_hash();
+
+\c - - - :master_port
+\set VERBOSITY terse
+
+-- the transaction as a whole should fail
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (55, 10);
+INSERT INTO hash_modifying_xacts VALUES (997, 1);
+COMMIT;
+
+-- ensure that the value didn't go into the reference table
+SELECT * FROM reference_modifying_xacts WHERE key = 55;
+
+-- now lets fail on of the workers for the hash distributed table table
+-- when there is a reference table involved
+\c - - - :worker_1_port
+DROP TRIGGER reject_bad_hash ON hash_modifying_xacts_1200007;
+
+-- the trigger is on execution time
+CREATE CONSTRAINT TRIGGER reject_bad_hash
+AFTER INSERT ON hash_modifying_xacts_1200007
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE PROCEDURE reject_bad_hash();
+
+\c - - - :master_port
+\set VERBOSITY terse
+
+-- the transaction as a whole should fail
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (12, 12);
+INSERT INTO hash_modifying_xacts VALUES (997, 1);
+COMMIT;
+
+-- ensure that the values didn't go into the reference table
+SELECT * FROM reference_modifying_xacts WHERE key = 12;
+
+-- all placements should be healthy
+SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
+FROM     pg_dist_shard_placement AS sp,
+	     pg_dist_shard           AS s
+WHERE    sp.shardid = s.shardid
+AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR 
+		  s.logicalrelid = 'hash_modifying_xacts'::regclass)	
+GROUP BY s.logicalrelid, sp.shardstate
+ORDER BY s.logicalrelid, sp.shardstate;
+
+-- now, fail the insert on reference table
+-- and ensure that hash distributed table's
+-- change is rollbacked as well
+
+\c - - - :worker_1_port
+
+CREATE CONSTRAINT TRIGGER reject_bad_reference
+AFTER INSERT ON reference_modifying_xacts_1200006
+DEFERRABLE INITIALLY IMMEDIATE
+FOR EACH ROW EXECUTE PROCEDURE reject_bad_reference();
+
+\c - - - :master_port
+\set VERBOSITY terse
+
+BEGIN;
+
+-- to expand participant to include all worker nodes
+INSERT INTO reference_modifying_xacts VALUES (66, 3);
+INSERT INTO hash_modifying_xacts VALUES (80, 1);
+INSERT INTO reference_modifying_xacts VALUES (999, 3);
+COMMIT;
+
+SELECT * FROM hash_modifying_xacts WHERE key = 80;
+SELECT * FROM reference_modifying_xacts WHERE key = 66;
+SELECT * FROM reference_modifying_xacts WHERE key = 999;
+
+-- all placements should be healthy
+SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
+FROM     pg_dist_shard_placement AS sp,
+	     pg_dist_shard           AS s
+WHERE    sp.shardid = s.shardid
+AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR 
+		  s.logicalrelid = 'hash_modifying_xacts'::regclass)	
+GROUP BY s.logicalrelid, sp.shardstate
+ORDER BY s.logicalrelid, sp.shardstate;
+
+-- now show that all modifications to reference
+-- tables are done in 2PC
+SELECT recover_prepared_transactions();
+
+INSERT INTO reference_modifying_xacts VALUES (70, 70);
+SELECT count(*) FROM pg_dist_transaction;
+
+-- reset the transactions table
+SELECT recover_prepared_transactions();
+BEGIN;
+INSERT INTO reference_modifying_xacts VALUES (71, 71);
+COMMIT;
+SELECT count(*) FROM pg_dist_transaction;
+
+
+-- create a hash distributed tablw which spans all nodes
+SET citus.shard_count = 4;
+SET citus.shard_replication_factor = 2;
+CREATE TABLE hash_modifying_xacts_second (key int, value int);
+SELECT create_distributed_table('hash_modifying_xacts_second', 'key');
+
+-- reset the transactions table
+SELECT recover_prepared_transactions();
+
+BEGIN;
+INSERT INTO hash_modifying_xacts_second VALUES (72, 1);
+INSERT INTO reference_modifying_xacts VALUES (72, 3);
+COMMIT;
+SELECT count(*) FROM pg_dist_transaction;
+
+-- reset the transactions table
+SELECT recover_prepared_transactions();
+DELETE FROM reference_modifying_xacts;
+SELECT count(*) FROM pg_dist_transaction;
+
+-- reset the transactions table
+SELECT recover_prepared_transactions();
+UPDATE reference_modifying_xacts SET key = 10;
+SELECT count(*) FROM pg_dist_transaction;
+
+-- now to one more type of failure testing
+-- in which we'll make the remote host unavailable
+
+-- first create the new user on all nodes
+CREATE USER test_user;
+\c - - - :worker_1_port
+CREATE USER test_user;
+\c - - - :worker_2_port
+CREATE USER test_user;
+
+-- now connect back to the master with the new user
+\c - test_user - :master_port
+CREATE TABLE reference_failure_test (key int, value int);
+SELECT create_reference_table('reference_failure_test');
+
+-- create a hash distributed table
+SET citus.shard_count TO 4;
+CREATE TABLE numbers_hash_failure_test(key int, value int);
+SELECT create_distributed_table('numbers_hash_failure_test', 'key');
+
+-- ensure that the shard is created for this user
+\c - test_user - :worker_1_port
+\dt reference_failure_test_1200015
+
+-- now connect with the default user, 
+-- and rename the existing user
+\c - :default_user - :worker_1_port
+ALTER USER test_user RENAME TO test_user_new;
+
+-- connect back to master and query the reference table
+ \c - test_user - :master_port
+-- should fail since the worker doesn't have test_user anymore
+INSERT INTO reference_failure_test VALUES (1, '1');
+
+-- the same as the above, but wrapped within a transaction
+BEGIN;
+INSERT INTO reference_failure_test VALUES (1, '1');
+COMMIT;
+
+BEGIN;
+COPY reference_failure_test FROM STDIN WITH (FORMAT 'csv');
+2,2
+\.
+COMMIT;
+
+-- show that no data go through the table and shard states are good
+SELECT * FROM reference_failure_test;
+
+
+-- all placements should be healthy
+SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
+FROM     pg_dist_shard_placement AS sp,
+	     pg_dist_shard           AS s
+WHERE    sp.shardid = s.shardid
+AND      s.logicalrelid = 'reference_failure_test'::regclass	
+GROUP BY s.logicalrelid, sp.shardstate
+ORDER BY s.logicalrelid, sp.shardstate;
+
+BEGIN;
+COPY numbers_hash_failure_test FROM STDIN WITH (FORMAT 'csv');
+1,1
+2,2
+\.
+
+-- some placements are invalid before abort
+SELECT shardid, shardstate, nodename, nodeport
+FROM pg_dist_shard_placement JOIN pg_dist_shard USING (shardid)
+WHERE logicalrelid = 'numbers_hash_failure_test'::regclass
+ORDER BY shardid, nodeport;
+
+ABORT;
+
+-- verify nothing is inserted
+SELECT count(*) FROM numbers_hash_failure_test;
+
+-- all placements to be market valid
+SELECT shardid, shardstate, nodename, nodeport
+FROM pg_dist_shard_placement JOIN pg_dist_shard USING (shardid)
+WHERE logicalrelid = 'numbers_hash_failure_test'::regclass
+ORDER BY shardid, nodeport;
+
+BEGIN;
+COPY numbers_hash_failure_test FROM STDIN WITH (FORMAT 'csv');
+1,1
+2,2
+\.
+
+-- check shard states before commit
+SELECT shardid, shardstate, nodename, nodeport
+FROM pg_dist_shard_placement JOIN pg_dist_shard USING (shardid)
+WHERE logicalrelid = 'numbers_hash_failure_test'::regclass
+ORDER BY shardid, nodeport;
+
+COMMIT;
+
+-- expect some placements to be market invalid after commit
+SELECT shardid, shardstate, nodename, nodeport
+FROM pg_dist_shard_placement JOIN pg_dist_shard USING (shardid)
+WHERE logicalrelid = 'numbers_hash_failure_test'::regclass
+ORDER BY shardid, nodeport;
+
+-- verify data is inserted
+SELECT count(*) FROM numbers_hash_failure_test;
+
+-- connect back to the worker and set rename the test_user back
+\c - :default_user - :worker_1_port
+ALTER USER test_user_new RENAME TO test_user;
+
+-- connect back to the master with the proper user to continue the tests 
+\c - :default_user - :master_port
+DROP TABLE reference_modifying_xacts, hash_modifying_xacts, hash_modifying_xacts_second,
+	reference_failure_test, numbers_hash_failure_test;
+
+SELECT * FROM run_command_on_workers('DROP USER test_user');
+DROP USER test_user;

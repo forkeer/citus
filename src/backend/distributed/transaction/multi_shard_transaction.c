@@ -14,12 +14,11 @@
 #include "postgres.h"
 
 #include "distributed/colocation_utils.h"
-#include "distributed/commit_protocol.h"
-#include "distributed/connection_cache.h"
 #include "distributed/connection_management.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_shard_transaction.h"
+#include "distributed/placement_connection.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/worker_manager.h"
 #include "nodes/pg_list.h"
@@ -27,35 +26,23 @@
 #include "utils/memutils.h"
 
 
-#define INITIAL_CONNECTION_CACHE_SIZE 1001
-
-
-/* per-transaction state */
-static HTAB *shardConnectionHash = NULL;
+#define INITIAL_SHARD_CONNECTION_HASH_SIZE 128
 
 
 /*
  * OpenTransactionsToAllShardPlacements opens connections to all placements
- * using the provided shard identifier list. Connections accumulate in a global
- * shardConnectionHash variable for use (and re-use) within this transaction.
+ * using the provided shard identifier list and returns it as a shard ID ->
+ * ShardConnections hash. connectionFlags can be used to specify whether
+ * the command is FOR_DML or FOR_DDL.
  */
-void
-OpenTransactionsToAllShardPlacements(List *shardIntervalList, char *userName)
+HTAB *
+OpenTransactionsToAllShardPlacements(List *shardIntervalList, int connectionFlags)
 {
+	HTAB *shardConnectionHash = NULL;
 	ListCell *shardIntervalCell = NULL;
 	List *newConnectionList = NIL;
-	ListCell *connectionCell = NULL;
 
-	if (shardConnectionHash == NULL)
-	{
-		shardConnectionHash = CreateShardConnectionHash(TopTransactionContext);
-	}
-
-	BeginOrContinueCoordinatedTransaction();
-	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
-	{
-		CoordinatedTransactionUse2PC();
-	}
+	shardConnectionHash = CreateShardConnectionHash(CurrentMemoryContext);
 
 	/* open connections to shards which don't have connections yet */
 	foreach(shardIntervalCell, shardIntervalList)
@@ -67,7 +54,8 @@ OpenTransactionsToAllShardPlacements(List *shardIntervalList, char *userName)
 		List *shardPlacementList = NIL;
 		ListCell *placementCell = NULL;
 
-		shardConnections = GetShardConnections(shardId, &shardConnectionsFound);
+		shardConnections = GetShardHashConnections(shardConnectionHash, shardId,
+												   &shardConnectionsFound);
 		if (shardConnectionsFound)
 		{
 			continue;
@@ -85,7 +73,6 @@ OpenTransactionsToAllShardPlacements(List *shardIntervalList, char *userName)
 		{
 			ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(placementCell);
 			MultiConnection *connection = NULL;
-			MemoryContext oldContext = NULL;
 
 			WorkerNode *workerNode = FindWorkerNode(shardPlacement->nodeName,
 													shardPlacement->nodePort);
@@ -96,19 +83,14 @@ OpenTransactionsToAllShardPlacements(List *shardIntervalList, char *userName)
 									   shardPlacement->nodePort)));
 			}
 
-			connection = StartNodeUserDatabaseConnection(FORCE_NEW_CONNECTION,
-														 shardPlacement->nodeName,
-														 shardPlacement->nodePort,
-														 userName,
-														 NULL);
+			connection = StartPlacementConnection(connectionFlags,
+												  shardPlacement,
+												  NULL);
 
-			/* we need to preserve the connection list for the next statement */
-			oldContext = MemoryContextSwitchTo(TopTransactionContext);
+			ClaimConnectionExclusively(connection);
 
 			shardConnections->connectionList = lappend(shardConnections->connectionList,
 													   connection);
-
-			MemoryContextSwitchTo(oldContext);
 
 			newConnectionList = lappend(newConnectionList, connection);
 
@@ -121,18 +103,15 @@ OpenTransactionsToAllShardPlacements(List *shardIntervalList, char *userName)
 	}
 
 	/* finish connection establishment newly opened connections */
-	foreach(connectionCell, newConnectionList)
-	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
-		FinishConnectionEstablishment(connection);
-	}
+	FinishConnectionListEstablishment(newConnectionList);
 
 	/* the special BARE mode (for e.g. VACUUM/ANALYZE) skips BEGIN */
 	if (MultiShardCommitProtocol > COMMIT_PROTOCOL_BARE)
 	{
 		RemoteTransactionsBeginIfNecessary(newConnectionList);
 	}
+
+	return shardConnectionHash;
 }
 
 
@@ -155,33 +134,10 @@ CreateShardConnectionHash(MemoryContext memoryContext)
 	hashFlags = (HASH_ELEM | HASH_CONTEXT | HASH_BLOBS);
 
 	shardConnectionsHash = hash_create("Shard Connections Hash",
-									   INITIAL_CONNECTION_CACHE_SIZE, &info,
+									   INITIAL_SHARD_CONNECTION_HASH_SIZE, &info,
 									   hashFlags);
 
 	return shardConnectionsHash;
-}
-
-
-/*
- * GetShardConnections finds existing connections for a shard in the global
- * connection hash. If not found, then a ShardConnections structure with empty
- * connectionList is returned and the shardConnectionsFound output parameter
- * will be set to false.
- */
-ShardConnections *
-GetShardConnections(int64 shardId, bool *shardConnectionsFound)
-{
-	ShardConnections *shardConnections = NULL;
-
-	ShardInterval *shardInterval = LoadShardInterval(shardId);
-	List *colocatedShardIds = ColocatedShardIntervalList(shardInterval);
-	ShardInterval *baseShardInterval = LowestShardIntervalById(colocatedShardIds);
-	int64 baseShardId = baseShardInterval->shardId;
-
-	shardConnections = GetShardHashConnections(shardConnectionHash, baseShardId,
-											   shardConnectionsFound);
-
-	return shardConnections;
 }
 
 
@@ -208,12 +164,12 @@ GetShardHashConnections(HTAB *connectionHash, int64 shardId, bool *connectionsFo
 
 
 /*
- * ConnectionList flattens the connection hash to a list of placement connections.
+ * ShardConnectionList returns the list of ShardConnections in connectionHash.
  */
 List *
-ConnectionList(HTAB *connectionHash)
+ShardConnectionList(HTAB *connectionHash)
 {
-	List *connectionList = NIL;
+	List *shardConnectionsList = NIL;
 	HASH_SEQ_STATUS status;
 	ShardConnections *shardConnections = NULL;
 
@@ -227,13 +183,12 @@ ConnectionList(HTAB *connectionHash)
 	shardConnections = (ShardConnections *) hash_seq_search(&status);
 	while (shardConnections != NULL)
 	{
-		List *shardConnectionsList = list_copy(shardConnections->connectionList);
-		connectionList = list_concat(connectionList, shardConnectionsList);
+		shardConnectionsList = lappend(shardConnectionsList, shardConnections);
 
 		shardConnections = (ShardConnections *) hash_seq_search(&status);
 	}
 
-	return connectionList;
+	return shardConnectionsList;
 }
 
 
@@ -244,13 +199,6 @@ ConnectionList(HTAB *connectionHash)
 void
 ResetShardPlacementTransactionState(void)
 {
-	/*
-	 * Now that transaction management does most of our work, nothing remains
-	 * but to reset the connection hash, which wouldn't be valid next time
-	 * round.
-	 */
-	shardConnectionHash = NULL;
-
 	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_BARE)
 	{
 		MultiShardCommitProtocol = SavedMultiShardCommitProtocol;
@@ -260,19 +208,28 @@ ResetShardPlacementTransactionState(void)
 
 
 /*
- * CloseConnections closes all connections in connectionList.
+ * UnclaimAllShardConnections unclaims all connections in the given
+ * shard connections hash after previously claiming them exclusively
+ * in OpenTransactionsToAllShardPlacements.
  */
 void
-CloseConnections(List *connectionList)
+UnclaimAllShardConnections(HTAB *shardConnectionHash)
 {
-	ListCell *connectionCell = NULL;
+	HASH_SEQ_STATUS status;
+	ShardConnections *shardConnections = NULL;
 
-	foreach(connectionCell, connectionList)
+	hash_seq_init(&status, shardConnectionHash);
+
+	while ((shardConnections = hash_seq_search(&status)) != 0)
 	{
-		TransactionConnection *transactionConnection =
-			(TransactionConnection *) lfirst(connectionCell);
-		PGconn *connection = transactionConnection->connection;
+		List *connectionList = shardConnections->connectionList;
+		ListCell *connectionCell = NULL;
 
-		CloseConnectionByPGconn(connection);
+		foreach(connectionCell, connectionList)
+		{
+			MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
+
+			UnclaimConnection(connection);
+		}
 	}
 }

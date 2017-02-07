@@ -226,6 +226,29 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 2))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 
+-- CTE with queries other than SELECT is not supported
+WITH new_article AS (
+    INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+)
+SELECT * FROM new_article;
+
+-- Modifying statement in nested CTE case is covered by PostgreSQL itself
+WITH new_article AS (
+    WITH nested_cte AS (
+        INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+    )
+    SELECT * FROM nested_cte
+)
+SELECT * FROM new_article;
+
+-- Modifying statement in a CTE in subquwey is also covered by PostgreSQL
+SELECT * FROM (
+    WITH new_article AS (
+        INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+    )
+    SELECT * FROM new_article
+) AS subquery_cte;
+
 -- grouping sets are supported on single shard
 SELECT
 	id, substring(title, 2, 1) AS subtitle, count(*)
@@ -896,6 +919,44 @@ SELECT id
 	WHERE author_id = 1;
 
 SET client_min_messages to 'NOTICE';
+
+-- test that a connection failure marks placements invalid
+SET citus.shard_replication_factor TO 2;
+CREATE TABLE failure_test (a int, b int);
+SELECT master_create_distributed_table('failure_test', 'a', 'hash');
+SELECT master_create_worker_shards('failure_test', 2);
+
+CREATE USER router_user;
+GRANT INSERT ON ALL TABLES IN SCHEMA public TO router_user;
+\c - - - :worker_1_port
+CREATE USER router_user;
+GRANT INSERT ON ALL TABLES IN SCHEMA public TO router_user;
+\c - router_user - :master_port
+-- first test that it is marked invalid inside a transaction block
+-- we will fail to connect to worker 2, since the user does not exist
+BEGIN;
+INSERT INTO failure_test VALUES (1, 1);
+SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
+	WHERE shardid IN (
+		SELECT shardid FROM pg_dist_shard
+		WHERE logicalrelid = 'failure_test'::regclass
+	)
+	ORDER BY placementid;
+ROLLBACK;
+INSERT INTO failure_test VALUES (2, 1);
+SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
+	WHERE shardid IN (
+		SELECT shardid FROM pg_dist_shard
+		WHERE logicalrelid = 'failure_test'::regclass
+	)
+	ORDER BY placementid;
+\c - postgres - :worker_1_port
+DROP OWNED BY router_user;
+DROP USER router_user;
+\c - - - :master_port
+DROP OWNED BY router_user;
+DROP USER router_user;
+DROP TABLE failure_test;
 
 DROP FUNCTION author_articles_max_id();
 DROP FUNCTION author_articles_id_word_count();

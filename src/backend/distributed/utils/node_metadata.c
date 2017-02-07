@@ -23,13 +23,16 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "commands/sequence.h"
+#include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
 #include "distributed/master_protocol.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_router_planner.h"
 #include "distributed/pg_dist_node.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
@@ -38,6 +41,7 @@
 #include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 
@@ -47,8 +51,9 @@ int GroupSize = 1;
 
 
 /* local function forward declarations */
+static void RemoveNodeFromCluster(char *nodeName, int32 nodePort, bool forceRemove);
 static Datum AddNodeMetadata(char *nodeName, int32 nodePort, int32 groupId,
-							 char *nodeRack, bool hasMetadata);
+							 char *nodeRack, bool hasMetadata, bool *nodeAlreadyExists);
 static Datum GenerateNodeTuple(WorkerNode *workerNode);
 static int32 GetNextGroupId(void);
 static uint32 GetMaxGroupId(void);
@@ -62,12 +67,14 @@ static WorkerNode * TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapT
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(master_add_node);
 PG_FUNCTION_INFO_V1(master_remove_node);
+PG_FUNCTION_INFO_V1(master_disable_node);
 PG_FUNCTION_INFO_V1(master_initialize_node_metadata);
 PG_FUNCTION_INFO_V1(get_shard_id_for_distribution_column);
 
 
 /*
- * master_add_node function adds a new node to the cluster and returns its data.
+ * master_add_node function adds a new node to the cluster and returns its data. It also
+ * replicates all reference tables to the new node.
  */
 Datum
 master_add_node(PG_FUNCTION_ARGS)
@@ -78,9 +85,21 @@ master_add_node(PG_FUNCTION_ARGS)
 	int32 groupId = 0;
 	char *nodeRack = WORKER_DEFAULT_RACK;
 	bool hasMetadata = false;
+	bool nodeAlreadyExists = false;
 
 	Datum returnData = AddNodeMetadata(nodeNameString, nodePort, groupId, nodeRack,
-									   hasMetadata);
+									   hasMetadata, &nodeAlreadyExists);
+
+	/*
+	 * After adding new node, if the node is not already exist, we  replicate all existing
+	 * reference tables to the new node. ReplicateAllReferenceTablesToAllNodes replicates
+	 * reference tables to all nodes however, it skips nodes which already has healthy
+	 * placement of particular reference table.
+	 */
+	if (!nodeAlreadyExists)
+	{
+		ReplicateAllReferenceTablesToAllNodes();
+	}
 
 	PG_RETURN_CSTRING(returnData);
 }
@@ -91,6 +110,9 @@ master_add_node(PG_FUNCTION_ARGS)
  * the master node and all nodes with metadata.
  * The call to the master_remove_node should be done by the super user and the specified
  * node should not have any active placements.
+ * This function also deletes all reference table placements belong to the given node from
+ * pg_dist_shard_placement, but it does not drop actual placement at the node. In the case
+ * of re-adding the node, master_add_node first drops and re-creates the reference tables.
  */
 Datum
 master_remove_node(PG_FUNCTION_ARGS)
@@ -98,29 +120,30 @@ master_remove_node(PG_FUNCTION_ARGS)
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
 	char *nodeNameString = text_to_cstring(nodeName);
-	char *nodeDeleteCommand = NULL;
-	bool hasShardPlacements = false;
-	WorkerNode *workerNode = NULL;
+	bool forceRemove = false;
+	RemoveNodeFromCluster(nodeNameString, nodePort, forceRemove);
 
-	EnsureSuperUser();
+	PG_RETURN_VOID();
+}
 
-	hasShardPlacements = NodeHasActiveShardPlacements(nodeNameString, nodePort);
-	if (hasShardPlacements)
-	{
-		ereport(ERROR, (errmsg("you cannot remove a node which has active "
-							   "shard placements")));
-	}
 
-	workerNode = FindWorkerNode(nodeNameString, nodePort);
-
-	DeleteNodeRow(nodeNameString, nodePort);
-
-	nodeDeleteCommand = NodeDeleteCommand(workerNode->nodeId);
-
-	/* make sure we don't have any open connections */
-	CloseNodeConnections(nodeNameString, nodePort);
-
-	SendCommandToWorkers(WORKERS_WITH_METADATA, nodeDeleteCommand);
+/*
+ * master_disable_node function removes the provided node from the pg_dist_node table of
+ * the master node and all nodes with metadata regardless of the node having an active
+ * shard placement.
+ * The call to the master_remove_node should be done by the super user.
+ * This function also deletes all reference table placements belong to the given node from
+ * pg_dist_shard_placement, but it does not drop actual placement at the node. In the case
+ * of re-adding the node, master_add_node first drops and re-creates the reference tables.
+ */
+Datum
+master_disable_node(PG_FUNCTION_ARGS)
+{
+	text *nodeName = PG_GETARG_TEXT_P(0);
+	int32 nodePort = PG_GETARG_INT32(1);
+	char *nodeNameString = text_to_cstring(nodeName);
+	bool forceRemove = true;
+	RemoveNodeFromCluster(nodeNameString, nodePort, forceRemove);
 
 	PG_RETURN_VOID();
 }
@@ -136,13 +159,14 @@ master_initialize_node_metadata(PG_FUNCTION_ARGS)
 {
 	ListCell *workerNodeCell = NULL;
 	List *workerNodes = ParseWorkerNodeFileAndRename();
+	bool nodeAlreadyExists = false;
 
 	foreach(workerNodeCell, workerNodes)
 	{
 		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
 
 		AddNodeMetadata(workerNode->workerName, workerNode->workerPort, 0,
-						workerNode->workerRack, false);
+						workerNode->workerRack, false, &nodeAlreadyExists);
 	}
 
 	PG_RETURN_BOOL(true);
@@ -157,20 +181,9 @@ master_initialize_node_metadata(PG_FUNCTION_ARGS)
 Datum
 get_shard_id_for_distribution_column(PG_FUNCTION_ARGS)
 {
-	Oid relationId = InvalidOid;
-	Datum distributionValue = 0;
-
-	Var *distributionColumn = NULL;
-	char distributionMethod = 0;
-	Oid expectedElementType = InvalidOid;
-	Oid inputElementType = InvalidOid;
-	DistTableCacheEntry *cacheEntry = NULL;
-	int shardCount = 0;
-	ShardInterval **shardIntervalArray = NULL;
-	FmgrInfo *hashFunction = NULL;
-	FmgrInfo *compareFunction = NULL;
-	bool useBinarySearch = true;
 	ShardInterval *shardInterval = NULL;
+	char distributionMethod = 0;
+	Oid relationId = InvalidOid;
 
 	/*
 	 * To have optional parameter as NULL, we defined this UDF as not strict, therefore
@@ -205,6 +218,13 @@ get_shard_id_for_distribution_column(PG_FUNCTION_ARGS)
 	else if (distributionMethod == DISTRIBUTE_BY_HASH ||
 			 distributionMethod == DISTRIBUTE_BY_RANGE)
 	{
+		Var *distributionColumn = NULL;
+		Oid distributionDataType = InvalidOid;
+		Oid inputDataType = InvalidOid;
+		char *distributionValueString = NULL;
+		Datum inputDatum = 0;
+		Datum distributionValueDatum = 0;
+
 		/* if given table is not reference table, distributionValue cannot be NULL */
 		if (PG_ARGISNULL(1))
 		{
@@ -213,36 +233,17 @@ get_shard_id_for_distribution_column(PG_FUNCTION_ARGS)
 								   "than reference tables.")));
 		}
 
-		distributionValue = PG_GETARG_DATUM(1);
+		inputDatum = PG_GETARG_DATUM(1);
+		inputDataType = get_fn_expr_argtype(fcinfo->flinfo, 1);
+		distributionValueString = DatumToString(inputDatum, inputDataType);
 
 		distributionColumn = PartitionKey(relationId);
-		expectedElementType = distributionColumn->vartype;
-		inputElementType = get_fn_expr_argtype(fcinfo->flinfo, 1);
-		if (expectedElementType != inputElementType)
-		{
-			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("invalid distribution value type"),
-							errdetail("Type of the value does not match the type of the "
-									  "distribution column. Expected type id: %d, given "
-									  "type id: %d", expectedElementType,
-									  inputElementType)));
-		}
+		distributionDataType = distributionColumn->vartype;
 
-		cacheEntry = DistributedTableCacheEntry(relationId);
+		distributionValueDatum = StringToDatum(distributionValueString,
+											   distributionDataType);
 
-		if (distributionMethod == DISTRIBUTE_BY_HASH &&
-			cacheEntry->hasUniformHashDistribution)
-		{
-			useBinarySearch = false;
-		}
-
-		shardCount = cacheEntry->shardIntervalArrayLength;
-		shardIntervalArray = cacheEntry->sortedShardIntervalArray;
-		hashFunction = cacheEntry->hashFunction;
-		compareFunction = cacheEntry->shardIntervalCompareFunction;
-		shardInterval = FindShardInterval(distributionValue, shardIntervalArray,
-										  shardCount, distributionMethod, compareFunction,
-										  hashFunction, useBinarySearch);
+		shardInterval = FastShardPruning(relationId, distributionValueDatum);
 	}
 	else
 	{
@@ -325,6 +326,84 @@ ReadWorkerNodes()
 
 
 /*
+ * RemoveNodeFromCluster removes the provided node from the pg_dist_node table of
+ * the master node and all nodes with metadata.
+ * The call to the master_remove_node should be done by the super user. If there are
+ * active shard placements on the node; the function removes the node when forceRemove
+ * flag is set, it errors out otherwise.
+ * This function also deletes all reference table placements belong to the given node from
+ * pg_dist_shard_placement, but it does not drop actual placement at the node. It also
+ * modifies replication factor of the colocation group of reference tables, so that
+ * replication factor will be equal to worker count.
+ */
+static void
+RemoveNodeFromCluster(char *nodeName, int32 nodePort, bool forceRemove)
+{
+	char *nodeDeleteCommand = NULL;
+	bool hasShardPlacements = false;
+	WorkerNode *workerNode = NULL;
+	List *referenceTableList = NIL;
+	uint32 deletedNodeId = INVALID_PLACEMENT_ID;
+
+	EnsureCoordinator();
+	EnsureSuperUser();
+
+	workerNode = FindWorkerNode(nodeName, nodePort);
+
+	if (workerNode != NULL)
+	{
+		deletedNodeId = workerNode->nodeId;
+	}
+
+	DeleteNodeRow(nodeName, nodePort);
+
+	DeleteAllReferenceTablePlacementsFromNode(nodeName, nodePort);
+
+	/*
+	 * After deleting reference tables placements, we will update replication factor
+	 * column for colocation group of reference tables so that replication factor will
+	 * be equal to worker count.
+	 */
+	referenceTableList = ReferenceTableOidList();
+	if (list_length(referenceTableList) != 0)
+	{
+		Oid firstReferenceTableId = linitial_oid(referenceTableList);
+		uint32 referenceTableColocationId = TableColocationId(firstReferenceTableId);
+
+		List *workerNodeList = WorkerNodeList();
+		int workerCount = list_length(workerNodeList);
+
+		UpdateColocationGroupReplicationFactor(referenceTableColocationId, workerCount);
+	}
+
+	hasShardPlacements = NodeHasActiveShardPlacements(nodeName, nodePort);
+	if (hasShardPlacements)
+	{
+		if (forceRemove)
+		{
+			ereport(NOTICE, (errmsg("Node %s:%d has active shard placements. Some "
+									"queries may fail after this operation. Use "
+									"select master_add_node('%s', %d) to add this "
+									"node back.",
+									nodeName, nodePort, nodeName, nodePort)));
+		}
+		else
+		{
+			ereport(ERROR, (errmsg("you cannot remove a node which has active "
+								   "shard placements")));
+		}
+	}
+
+	nodeDeleteCommand = NodeDeleteCommand(deletedNodeId);
+
+	/* make sure we don't have any lingering session lifespan connections */
+	CloseNodeConnectionsAfterTransaction(nodeName, nodePort);
+
+	SendCommandToWorkers(WORKERS_WITH_METADATA, nodeDeleteCommand);
+}
+
+
+/*
  * AddNodeMetadata checks the given node information and adds the specified node to the
  * pg_dist_node table of the master and workers with metadata.
  * If the node already exists, the function returns the information about the node.
@@ -335,7 +414,7 @@ ReadWorkerNodes()
  */
 static Datum
 AddNodeMetadata(char *nodeName, int32 nodePort, int32 groupId, char *nodeRack,
-				bool hasMetadata)
+				bool hasMetadata, bool *nodeAlreadyExists)
 {
 	Relation pgDistNode = NULL;
 	int nextNodeIdInt = 0;
@@ -345,7 +424,10 @@ AddNodeMetadata(char *nodeName, int32 nodePort, int32 groupId, char *nodeRack,
 	char *nodeInsertCommand = NULL;
 	List *workerNodeList = NIL;
 
+	EnsureCoordinator();
 	EnsureSuperUser();
+
+	*nodeAlreadyExists = false;
 
 	/* acquire a lock so that no one can do this concurrently */
 	pgDistNode = heap_open(DistNodeRelationId(), AccessExclusiveLock);
@@ -359,6 +441,8 @@ AddNodeMetadata(char *nodeName, int32 nodePort, int32 groupId, char *nodeRack,
 
 		/* close the heap */
 		heap_close(pgDistNode, AccessExclusiveLock);
+
+		*nodeAlreadyExists = true;
 
 		PG_RETURN_DATUM(returnData);
 	}
@@ -544,6 +628,23 @@ GetNextNodeId()
 
 
 /*
+ * EnsureCoordinator checks if the current node is the coordinator. If it does not,
+ * the function errors out.
+ */
+void
+EnsureCoordinator(void)
+{
+	int localGroupId = GetLocalGroupId();
+
+	if (localGroupId != 0)
+	{
+		ereport(ERROR, (errmsg("operation is not allowed on this node"),
+						errhint("Connect to the coordinator and run it again.")));
+	}
+}
+
+
+/*
  * InsertNodedRow opens the node system catalog, and inserts a new row with the
  * given values into that system catalog.
  */
@@ -611,6 +712,7 @@ DeleteNodeRow(char *nodeName, int32 nodePort)
 								  NULL, scanKeyCount, scanKey);
 
 	heapTuple = systable_getnext(heapScan);
+
 	if (!HeapTupleIsValid(heapTuple))
 	{
 		ereport(ERROR, (errmsg("could not find valid entry for node \"%s:%d\"",
@@ -816,4 +918,41 @@ TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 	workerNode->hasMetadata = DatumGetBool(hasMetadata);
 
 	return workerNode;
+}
+
+
+/*
+ * StringToDatum transforms a string representation into a Datum.
+ */
+Datum
+StringToDatum(char *inputString, Oid dataType)
+{
+	Oid typIoFunc = InvalidOid;
+	Oid typIoParam = InvalidOid;
+	int32 typeModifier = -1;
+	Datum datum = 0;
+
+	getTypeInputInfo(dataType, &typIoFunc, &typIoParam);
+	getBaseTypeAndTypmod(dataType, &typeModifier);
+
+	datum = OidInputFunctionCall(typIoFunc, inputString, typIoParam, typeModifier);
+
+	return datum;
+}
+
+
+/*
+ * DatumToString returns the string representation of the given datum.
+ */
+char *
+DatumToString(Datum datum, Oid dataType)
+{
+	char *outputString = NULL;
+	Oid typIoFunc = InvalidOid;
+	bool typIsVarlena = false;
+
+	getTypeOutputInfo(dataType, &typIoFunc, &typIsVarlena);
+	outputString = OidOutputFunctionCall(typIoFunc, datum);
+
+	return outputString;
 }

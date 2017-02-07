@@ -74,6 +74,8 @@ mark_tables_colocated(PG_FUNCTION_ARGS)
 							   "operation")));
 	}
 
+	EnsureCoordinator();
+
 	relationIdDatumArray = DeconstructArrayObject(relationIdArrayObject);
 
 	for (relationIndex = 0; relationIndex < relationCount; relationIndex++)
@@ -143,16 +145,7 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 	UpdateRelationColocationGroup(targetRelationId, sourceColocationId);
 
 	/* if there is not any remaining table in the colocation group, delete it */
-	if (targetColocationId != INVALID_COLOCATION_ID)
-	{
-		List *colocatedTableList = ColocationGroupTableList(targetColocationId);
-		int colocatedTableCount = list_length(colocatedTableList);
-
-		if (colocatedTableCount == 0)
-		{
-			DeleteColocationGroup(targetColocationId);
-		}
-	}
+	DeleteColocationGroupIfNoTablesBelong(targetColocationId);
 
 	heap_close(pgDistColocation, NoLock);
 }
@@ -848,7 +841,11 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 	if ((partitionMethod == DISTRIBUTE_BY_APPEND) ||
 		(partitionMethod == DISTRIBUTE_BY_RANGE))
 	{
-		colocatedShardList = lappend(colocatedShardList, shardInterval);
+		ShardInterval *copyShardInterval = CitusMakeNode(ShardInterval);
+		CopyShardInterval(shardInterval, copyShardInterval);
+
+		colocatedShardList = lappend(colocatedShardList, copyShardInterval);
+
 		return colocatedShardList;
 	}
 
@@ -864,6 +861,7 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 		DistTableCacheEntry *colocatedTableCacheEntry =
 			DistributedTableCacheEntry(colocatedTableId);
 		ShardInterval *colocatedShardInterval = NULL;
+		ShardInterval *copyShardInterval = NULL;
 
 		/*
 		 * Since we iterate over co-located tables, shard count of each table should be
@@ -875,7 +873,10 @@ ColocatedShardIntervalList(ShardInterval *shardInterval)
 		colocatedShardInterval =
 			colocatedTableCacheEntry->sortedShardIntervalArray[shardIntervalIndex];
 
-		colocatedShardList = lappend(colocatedShardList, colocatedShardInterval);
+		copyShardInterval = CitusMakeNode(ShardInterval);
+		CopyShardInterval(colocatedShardInterval, copyShardInterval);
+
+		colocatedShardList = lappend(colocatedShardList, copyShardInterval);
 	}
 
 	Assert(list_length(colocatedTableList) == list_length(colocatedShardList));
@@ -939,6 +940,28 @@ ColocatedShardIdInRelation(Oid relationId, int shardIndex)
 
 
 /*
+ * DeleteColocationGroupIfNoTablesBelong function deletes given co-location group if there
+ * is no relation in that co-location group. A co-location group may become empty after
+ * mark_tables_colocated or upgrade_reference_table UDF calls. In that case we need to
+ * remove empty co-location group to prevent orphaned co-location groups.
+ */
+void
+DeleteColocationGroupIfNoTablesBelong(uint32 colocationId)
+{
+	if (colocationId != INVALID_COLOCATION_ID)
+	{
+		List *colocatedTableList = ColocationGroupTableList(colocationId);
+		int colocatedTableCount = list_length(colocatedTableList);
+
+		if (colocatedTableCount == 0)
+		{
+			DeleteColocationGroup(colocationId);
+		}
+	}
+}
+
+
+/*
  * DeleteColocationGroup deletes the colocation group from pg_dist_colocation.
  */
 static void
@@ -965,7 +988,6 @@ DeleteColocationGroup(uint32 colocationId)
 	{
 		simple_heap_delete(pgDistColocation, &(heapTuple->t_self));
 
-		CatalogUpdateIndexes(pgDistColocation, heapTuple);
 		CitusInvalidateRelcacheByRelid(DistColocationRelationId());
 		CommandCounterIncrement();
 	}

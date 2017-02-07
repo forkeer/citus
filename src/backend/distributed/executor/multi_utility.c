@@ -32,8 +32,6 @@
 #include "commands/prepare.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
-#include "distributed/commit_protocol.h"
-#include "distributed/connection_cache.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
@@ -172,11 +170,35 @@ multi_ProcessUtility(Node *parsetree,
 					 DestReceiver *dest,
 					 char *completionTag)
 {
-	bool schemaNode = SchemaNode();
-	bool propagateChanges = schemaNode && EnableDDLPropagation;
 	bool commandMustRunAsOwner = false;
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
+
+	if (IsA(parsetree, TransactionStmt))
+	{
+		/*
+		 * Transaction statements (e.g. ABORT, COMMIT) can be run in aborted
+		 * transactions in which case a lot of checks cannot be done safely in
+		 * that state. Since we never need to intercept transaction statements,
+		 * skip our checks and immediately fall into standard_ProcessUtility.
+		 */
+		standard_ProcessUtility(parsetree, queryString, context,
+								params, dest, completionTag);
+
+		return;
+	}
+
+	if (!CitusHasBeenLoaded())
+	{
+		/*
+		 * Ensure that utility commands do not behave any differently until CREATE
+		 * EXTENSION is invoked.
+		 */
+		standard_ProcessUtility(parsetree, queryString, context,
+								params, dest, completionTag);
+
+		return;
+	}
 
 	/*
 	 * TRANSMIT used to be separate command, but to avoid patching the grammar
@@ -231,9 +253,9 @@ multi_ProcessUtility(Node *parsetree,
 
 	/*
 	 * DDL commands are propagated to workers only if EnableDDLPropagation is
-	 * set to true and the current node is the schema node
+	 * set to true and the current node is the coordinator
 	 */
-	if (propagateChanges)
+	if (EnableDDLPropagation)
 	{
 		bool isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
 
@@ -291,7 +313,7 @@ multi_ProcessUtility(Node *parsetree,
 		 * AlterTableMoveAllStmt. At the moment we do not support this functionality in
 		 * the distributed environment. We warn out here.
 		 */
-		if (IsA(parsetree, AlterTableMoveAllStmt) && CitusHasBeenLoaded())
+		if (IsA(parsetree, AlterTableMoveAllStmt))
 		{
 			ereport(WARNING, (errmsg("not propagating ALTER TABLE ALL IN TABLESPACE "
 									 "commands to worker nodes"),
@@ -299,33 +321,38 @@ multi_ProcessUtility(Node *parsetree,
 									  "move all tables.")));
 		}
 	}
-	else if (!schemaNode)
+	else
 	{
+		/*
+		 * citus.enable_ddl_propagation is disabled, which means that PostgreSQL
+		 * should handle the DDL command on a distributed table directly, without
+		 * Citus intervening. Advanced Citus users use this to implement their own
+		 * DDL propagation. We also use it to avoid re-propagating DDL commands
+		 * when changing MX tables on workers. Below, we also make sure that DDL
+		 * commands don't run queries that might get intercepted by Citus and error
+		 * out, specifically we skip validation in foreign keys.
+		 */
+
 		if (IsA(parsetree, AlterTableStmt))
 		{
 			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parsetree;
 			if (alterTableStmt->relkind == OBJECT_TABLE)
 			{
 				/*
-				 * When the schema node issues an ALTER TABLE ... ADD FOREIGN KEY
-				 * command, the validation step should be skipped on the distributed
-				 * table of the worker. Therefore, we check whether the given ALTER
-				 * TABLE statement is a FOREIGN KEY constraint and if so disable the
-				 * validation step. Note that validation is done on the shard level.
+				 * When issuing an ALTER TABLE ... ADD FOREIGN KEY command, the
+				 * the validation step should be skipped on the distributed table.
+				 * Therefore, we check whether the given ALTER TABLE statement is a
+				 * FOREIGN KEY constraint and if so disable the validation step.
+				 * Note that validation is done on the shard level when DDL
+				 * propagation is enabled.
 				 */
 				parsetree = WorkerProcessAlterTableStmt(alterTableStmt, queryString);
 			}
 		}
 	}
 
-	/*
-	 * Inform the user about potential caveats.
-	 *
-	 * To prevent failures in aborted transactions, CitusHasBeenLoaded() needs
-	 * to be the second condition. See RelationIdGetRelation() which is called
-	 * by CitusHasBeenLoaded().
-	 */
-	if (IsA(parsetree, CreatedbStmt) && CitusHasBeenLoaded())
+	/* inform the user about potential caveats */
+	if (IsA(parsetree, CreatedbStmt))
 	{
 		ereport(NOTICE, (errmsg("Citus partially supports CREATE DATABASE for "
 								"distributed databases"),
@@ -334,7 +361,7 @@ multi_ProcessUtility(Node *parsetree,
 						 errhint("You can manually create a database and its "
 								 "extensions on workers.")));
 	}
-	else if (IsA(parsetree, CreateRoleStmt) && CitusHasBeenLoaded())
+	else if (IsA(parsetree, CreateRoleStmt))
 	{
 		ereport(NOTICE, (errmsg("not propagating CREATE ROLE/USER commands to worker"
 								" nodes"),
@@ -1127,9 +1154,10 @@ VacuumTaskList(Oid relationId, VacuumStmt *vacuumStmt)
 		task = CitusMakeNode(Task);
 		task->jobId = jobId;
 		task->taskId = taskId++;
-		task->taskType = SQL_TASK;
+		task->taskType = DDL_TASK;
 		task->queryString = pstrdup(vacuumString->data);
 		task->dependedTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
 		task->anchorShardId = shardId;
 		task->taskPlacementList = FinalizedShardPlacementList(shardId);
 
@@ -1564,6 +1592,19 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				}
 
 				/*
+				 * The following logic requires the referenced columns to exists in
+				 * the statement. Otherwise, we cannot apply some of the checks.
+				 */
+				if (constraint->pk_attrs == NULL)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint "
+										   "because referenced column list is empty"),
+									errhint("Add column names to \"REFERENCES\" part of "
+											"the statement.")));
+				}
+
+				/*
 				 * Referencing column's list length should be equal to referenced columns
 				 * list length.
 				 */
@@ -1977,6 +2018,7 @@ ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString,
 							   "modifications")));
 	}
 
+	EnsureCoordinator();
 	ShowNoticeIfNotUsing2PC();
 
 	if (shouldSyncMetadata)
@@ -2018,6 +2060,7 @@ ExecuteDistributedForeignKeyCommand(Oid leftRelationId, Oid rightRelationId,
 							   "modifications")));
 	}
 
+	EnsureCoordinator();
 	ShowNoticeIfNotUsing2PC();
 
 	/*
@@ -2094,8 +2137,9 @@ DDLTaskList(Oid relationId, const char *commandString)
 		task = CitusMakeNode(Task);
 		task->jobId = jobId;
 		task->taskId = taskId++;
-		task->taskType = SQL_TASK;
+		task->taskType = DDL_TASK;
 		task->queryString = applyCommand->data;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
 		task->dependedTaskList = NULL;
 		task->anchorShardId = shardId;
 		task->taskPlacementList = FinalizedShardPlacementList(shardId);
@@ -2157,9 +2201,10 @@ ForeignKeyTaskList(Oid leftRelationId, Oid rightRelationId,
 		task = CitusMakeNode(Task);
 		task->jobId = jobId;
 		task->taskId = taskId++;
-		task->taskType = SQL_TASK;
+		task->taskType = DDL_TASK;
 		task->queryString = applyCommand->data;
 		task->dependedTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
 		task->anchorShardId = leftShardId;
 		task->taskPlacementList = FinalizedShardPlacementList(leftShardId);
 

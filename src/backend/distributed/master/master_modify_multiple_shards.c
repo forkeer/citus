@@ -26,8 +26,6 @@
 #include "commands/event_trigger.h"
 #include "distributed/citus_clauses.h"
 #include "distributed/citus_ruleutils.h"
-#include "distributed/commit_protocol.h"
-#include "distributed/connection_cache.h"
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
@@ -88,6 +86,8 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 	List *taskList = NIL;
 	int32 affectedTupleCount = 0;
 
+	EnsureCoordinator();
+
 	queryTreeNode = ParseTreeNode(queryString);
 	if (IsA(queryTreeNode, DeleteStmt))
 	{
@@ -139,7 +139,11 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 
 	if (modifyQuery->commandType != CMD_UTILITY)
 	{
-		ErrorIfModifyQueryNotSupported(modifyQuery);
+		DeferredErrorMessage *error = ModifyQuerySupported(modifyQuery);
+		if (error)
+		{
+			RaiseDeferredError(error, ERROR);
+		}
 	}
 
 	/* reject queries with a returning list */
@@ -199,6 +203,7 @@ ModifyMultipleShardsTaskList(Query *query, List *shardIntervalList, Oid relation
 		task->taskType = SQL_TASK;
 		task->queryString = shardQueryString->data;
 		task->dependedTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
 		task->anchorShardId = shardId;
 		task->taskPlacementList = FinalizedShardPlacementList(shardId);
 

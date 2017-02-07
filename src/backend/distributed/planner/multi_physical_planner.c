@@ -1515,7 +1515,6 @@ UpdateColumnAttributes(Var *column, List *rangeTableList, List *dependedJobList)
 static Index
 NewTableId(Index originalTableId, List *rangeTableList)
 {
-	Index newTableId = 0;
 	Index rangeTableIndex = 1;
 	ListCell *rangeTableCell = NULL;
 
@@ -1530,14 +1529,15 @@ NewTableId(Index originalTableId, List *rangeTableList)
 		listMember = list_member_int(originalTableIdList, originalTableId);
 		if (listMember)
 		{
-			newTableId = rangeTableIndex;
-			break;
+			return rangeTableIndex;
 		}
 
 		rangeTableIndex++;
 	}
 
-	return newTableId;
+	ereport(ERROR, (errmsg("Unrecognized range table id %d", (int) originalTableId)));
+
+	return 0;
 }
 
 
@@ -1713,6 +1713,8 @@ UniqueJobId(void)
 	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
 	Datum jobIdDatum = 0;
 	int64 jobId = 0;
+	int64 localizedJobId = 0;
+	int64 localGroupId = GetLocalGroupId();
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
 
@@ -1723,8 +1725,15 @@ UniqueJobId(void)
 	jobIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
 	jobId = DatumGetInt64(jobIdDatum);
 
+	/*
+	 * Add the local group id information to the jobId to
+	 * prevent concurrent jobs on different groups to conflict.
+	 */
+	localizedJobId = jobId | (localGroupId << 32);
+
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
-	return jobId;
+
+	return localizedJobId;
 }
 
 
@@ -4024,6 +4033,7 @@ CreateBasicTask(uint64 jobId, uint32 taskId, TaskType taskType, char *queryStrin
 	task->jobId = jobId;
 	task->taskId = taskId;
 	task->taskType = taskType;
+	task->replicationModel = REPLICATION_MODEL_INVALID;
 	task->queryString = queryString;
 
 	return task;

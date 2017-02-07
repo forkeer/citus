@@ -14,6 +14,7 @@
 #include <math.h>
 
 #include "distributed/citus_nodefuncs.h"
+#include "distributed/errormessage.h"
 #include "distributed/multi_planner.h"
 #include "nodes/parsenodes.h"
 #include "nodes/readfuncs.h"
@@ -186,6 +187,7 @@ ReadMultiPlan(READFUNC_ARGS)
 	READ_NODE_FIELD(masterQuery);
 	READ_STRING_FIELD(masterTableName);
 	READ_BOOL_FIELD(routerExecutable);
+	READ_NODE_FIELD(planningError);
 
 	READ_DONE();
 }
@@ -268,6 +270,10 @@ ReadShardPlacement(READFUNC_ARGS)
 	READ_ENUM_FIELD(shardState, RelayFileState);
 	READ_STRING_FIELD(nodeName);
 	READ_UINT_FIELD(nodePort);
+	/* so we can deal with 0 */
+	READ_INT_FIELD(partitionMethod);
+	READ_UINT_FIELD(colocationGroupId);
+	READ_UINT_FIELD(representativeValue);
 
 	READ_DONE();
 }
@@ -303,11 +309,30 @@ ReadTask(READFUNC_ARGS)
 	READ_BOOL_FIELD(assignmentConstrained);
 	READ_NODE_FIELD(taskExecution);
 	READ_BOOL_FIELD(upsertQuery);
+	READ_CHAR_FIELD(replicationModel);
 	READ_BOOL_FIELD(insertSelectQuery);
 	READ_NODE_FIELD(relationShardList);
 
 	READ_DONE();
 }
+
+
+READFUNC_RET
+ReadDeferredErrorMessage(READFUNC_ARGS)
+{
+	READ_LOCALS(DeferredErrorMessage);
+
+	READ_INT_FIELD(code);
+	READ_STRING_FIELD(message);
+	READ_STRING_FIELD(detail);
+	READ_STRING_FIELD(hint);
+	READ_STRING_FIELD(filename);
+	READ_INT_FIELD(linenumber);
+	READ_STRING_FIELD(functionname);
+
+	READ_DONE();
+}
+
 
 READFUNC_RET
 ReadUnsupportedCitusNode(READFUNC_ARGS)

@@ -46,7 +46,7 @@ SELECT master_create_empty_shard('test_truncate_append');
 (1 row)
 
 -- verify 3 shards are presents
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_append'::regclass;
+SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_append'::regclass ORDER BY shardid;
  shardid 
 ---------
  1210000
@@ -68,11 +68,8 @@ SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_append'::r
 ---------
 (0 rows)
 
--- command can not be run inside transaction
+-- command can run inside transaction
 BEGIN; TRUNCATE TABLE test_truncate_append; COMMIT;
-ERROR:  DROP distributed table cannot run inside a transaction block
-CONTEXT:  SQL statement "SELECT master_drop_all_shards(TG_RELID, TG_TABLE_SCHEMA, TG_TABLE_NAME)"
-PL/pgSQL function citus_truncate_trigger() line 13 at PERFORM
 DROP TABLE test_truncate_append;
 --
 -- truncate for range distribution
@@ -113,7 +110,7 @@ SELECT count(*) FROM test_truncate_range;
 (1 row)
 
 -- verify 3 shards are presents
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_range'::regclass;
+SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_range'::regclass ORDER BY shardid;
  shardid 
 ---------
  1210003
@@ -130,7 +127,7 @@ SELECT count(*) FROM test_truncate_range;
 (1 row)
 
 -- verify 3 shards are still present
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_range'::regclass;
+SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_range'::regclass ORDER BY shardid;
  shardid 
 ---------
  1210003
@@ -190,7 +187,7 @@ SELECT count(*) FROM test_truncate_hash;
 (1 row)
 
 -- verify 4 shards are present
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_hash'::regclass;
+SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_hash'::regclass ORDER BY shardid;
  shardid 
 ---------
 (0 rows)
@@ -221,7 +218,7 @@ SELECT count(*) FROM test_truncate_hash;
 (1 row)
 
 -- verify 4 shards are still presents
-SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_hash'::regclass;
+SELECT shardid FROM pg_dist_shard where logicalrelid = 'test_truncate_hash'::regclass ORDER BY shardid;
  shardid 
 ---------
  1210006

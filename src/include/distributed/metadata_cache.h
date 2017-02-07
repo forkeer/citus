@@ -49,14 +49,21 @@ typedef struct
 
 	FmgrInfo *shardIntervalCompareFunction; /* NULL if no shard intervals exist */
 	FmgrInfo *hashFunction; /* NULL if table is not distributed by hash */
+
+	/* pg_dist_shard_placement metadata */
+	ShardPlacement **arrayOfPlacementArrays;
+	int *arrayOfPlacementArrayLengths;
 } DistTableCacheEntry;
 
 
 extern bool IsDistributedTable(Oid relationId);
 extern List * DistributedTableList(void);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
+extern ShardPlacement * LoadShardPlacement(uint64 shardId, uint64 placementId);
 extern DistTableCacheEntry * DistributedTableCacheEntry(Oid distributedRelationId);
 extern int GetLocalGroupId(void);
+extern List * DistTableOidList(void);
+extern List * ShardPlacementList(uint64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
 
@@ -68,6 +75,7 @@ extern HTAB * GetWorkerNodeHash(void);
 /* relation oids */
 extern Oid DistColocationRelationId(void);
 extern Oid DistColocationConfigurationIndexId(void);
+extern Oid DistColocationColocationidIndexId(void);
 extern Oid DistPartitionRelationId(void);
 extern Oid DistShardRelationId(void);
 extern Oid DistShardPlacementRelationId(void);

@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 #include "miscadmin.h"
+#include "libpq-fe.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -23,14 +24,13 @@
 #include "access/relscan.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
-#include "distributed/commit_protocol.h"
-#include "distributed/connection_cache.h"
+#include "distributed/connection_management.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/pg_dist_transaction.h"
+#include "distributed/remote_commands.h"
 #include "distributed/transaction_recovery.h"
 #include "distributed/worker_manager.h"
-#include "distributed/worker_transaction.h"
 #include "lib/stringinfo.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -51,7 +51,7 @@ static List * NameListDifference(List *nameList, List *subtractList);
 static int CompareNames(const void *leftPointer, const void *rightPointer);
 static bool FindMatchingName(char **nameArray, int nameCount, char *needle,
 							 int *matchIndex);
-static List * PendingWorkerTransactionList(PGconn *connection);
+static List * PendingWorkerTransactionList(MultiConnection *connection);
 static List * UnconfirmedWorkerTransactionsList(int groupId);
 static void DeleteTransactionRecord(int32 groupId, char *transactionName);
 
@@ -68,35 +68,6 @@ recover_prepared_transactions(PG_FUNCTION_ARGS)
 	recoveredTransactionCount = RecoverPreparedTransactions();
 
 	PG_RETURN_INT32(recoveredTransactionCount);
-}
-
-
-/*
- * LogPreparedTransactions logs a commit record for all prepared transactions
- * on connections in connectionList. The remote transaction is safe to commit
- * once the record has been durably stored (i.e. the local transaction is
- * committed).
- */
-void
-LogPreparedTransactions(List *connectionList)
-{
-	ListCell *connectionCell = NULL;
-
-	foreach(connectionCell, connectionList)
-	{
-		TransactionConnection *transactionConnection =
-			(TransactionConnection *) lfirst(connectionCell);
-
-		char transactionState PG_USED_FOR_ASSERTS_ONLY =
-			transactionConnection->transactionState;
-		int groupId = transactionConnection->groupId;
-		int64 connectionId = transactionConnection->connectionId;
-		StringInfo transactionName = BuildTransactionName(connectionId);
-
-		Assert(transactionState == TRANSACTION_STATE_PREPARED);
-
-		LogTransactionRecord(groupId, transactionName->data);
-	}
 }
 
 
@@ -194,8 +165,9 @@ RecoverWorkerTransactions(WorkerNode *workerNode)
 	MemoryContext localContext = NULL;
 	MemoryContext oldContext = NULL;
 
-	PGconn *connection = GetOrEstablishConnection(nodeName, nodePort);
-	if (connection == NULL)
+	int connectionFlags = SESSION_LIFESPAN;
+	MultiConnection *connection = GetNodeConnection(connectionFlags, nodeName, nodePort);
+	if (connection->pgConn == NULL)
 	{
 		/* cannot recover transactions on this worker right now */
 		return 0;
@@ -238,6 +210,7 @@ RecoverWorkerTransactions(WorkerNode *workerNode)
 	{
 		char *transactionName = (char *) lfirst(pendingTransactionCell);
 		StringInfo command = makeStringInfo();
+		int executeCommand = 0;
 		PGresult *result = NULL;
 
 		bool shouldCommit = FindMatchingName(unconfirmedTransactionArray,
@@ -256,17 +229,19 @@ RecoverWorkerTransactions(WorkerNode *workerNode)
 			appendStringInfo(command, "ROLLBACK PREPARED '%s'", transactionName);
 		}
 
-		result = PQexec(connection, command->data);
-		if (PQresultStatus(result) != PGRES_COMMAND_OK)
+		executeCommand = ExecuteOptionalRemoteCommand(connection, command->data, &result);
+		if (executeCommand == QUERY_SEND_FAILED)
 		{
-			WarnRemoteError(connection, result);
-			PQclear(result);
-
+			break;
+		}
+		if (executeCommand == RESPONSE_NOT_OKAY)
+		{
 			/* cannot recover this transaction right now */
 			continue;
 		}
 
 		PQclear(result);
+		ForgetResults(connection);
 
 		ereport(NOTICE, (errmsg("recovered a prepared transaction on %s:%d",
 								nodeName, nodePort),
@@ -398,9 +373,11 @@ FindMatchingName(char **nameArray, int nameCount, char *needle,
  * transactions on a remote node that were started by this node.
  */
 static List *
-PendingWorkerTransactionList(PGconn *connection)
+PendingWorkerTransactionList(MultiConnection *connection)
 {
 	StringInfo command = makeStringInfo();
+	bool raiseInterrupts = true;
+	int querySent = 0;
 	PGresult *result = NULL;
 	int rowCount = 0;
 	int rowIndex = 0;
@@ -411,10 +388,16 @@ PendingWorkerTransactionList(PGconn *connection)
 							  "WHERE gid LIKE 'citus_%d_%%'",
 					 coordinatorId);
 
-	result = PQexec(connection, command->data);
-	if (PQresultStatus(result) != PGRES_TUPLES_OK)
+	querySent = SendRemoteCommand(connection, command->data);
+	if (querySent == 0)
 	{
-		ReraiseRemoteError(connection, result);
+		ReportConnectionError(connection, ERROR);
+	}
+
+	result = GetRemoteCommandResult(connection, raiseInterrupts);
+	if (!IsResponseOK(result))
+	{
+		ReportResultError(connection, result, ERROR);
 	}
 
 	rowCount = PQntuples(result);
@@ -428,6 +411,7 @@ PendingWorkerTransactionList(PGconn *connection)
 	}
 
 	PQclear(result);
+	ForgetResults(connection);
 
 	return transactionNames;
 }

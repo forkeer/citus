@@ -20,10 +20,13 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_foreign_server.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/distribution_column.h"
 #include "distributed/master_metadata_utility.h"
@@ -40,11 +43,18 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
+#include "utils/tqual.h"
 
 
 static char * LocalGroupIdUpdateCommand(uint32 groupId);
 static void MarkNodeHasMetadata(char *nodeName, int32 nodePort, bool hasMetadata);
+static List * SequenceDDLCommandsForTable(Oid relationId);
+static void EnsureSupportedSequenceColumnType(Oid sequenceOid);
+static Oid TypeOfColumn(Oid tableId, int16 columnId);
 static char * TruncateTriggerCreateCommand(Oid relationId);
+static char * OwnerName(Oid objectId);
+static bool HasMetadataWorkers(void);
 
 
 PG_FUNCTION_INFO_V1(start_metadata_sync_to_node);
@@ -53,11 +63,11 @@ PG_FUNCTION_INFO_V1(stop_metadata_sync_to_node);
 
 /*
  * start_metadata_sync_to_node function creates the metadata in a worker for preparing the
- * worker for accepting MX-table queries. The function first sets the localGroupId of the
- * worker so that the worker knows which tuple in pg_dist_node table represents itself.
- * After that, SQL statetemens for re-creating metadata about mx distributed
- * tables are sent to the worker. Finally, the hasmetadata column of the target node in
- * pg_dist_node is marked as true.
+ * worker for accepting queries. The function first sets the localGroupId of the worker
+ * so that the worker knows which tuple in pg_dist_node table represents itself. After
+ * that, SQL statetemens for re-creating metadata of MX-eligible distributed tables are
+ * sent to the worker. Finally, the hasmetadata column of the target node in pg_dist_node
+ * is marked as true.
  */
 Datum
 start_metadata_sync_to_node(PG_FUNCTION_ARGS)
@@ -73,6 +83,7 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	List *dropMetadataCommandList = NIL;
 	List *createMetadataCommandList = NIL;
 
+	EnsureCoordinator();
 	EnsureSuperUser();
 
 	PreventTransactionChain(true, "start_metadata_sync_to_node");
@@ -86,6 +97,8 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 						errhint("First, add the node with SELECT master_add_node(%s,%d)",
 								nodeNameString, nodePort)));
 	}
+
+	MarkNodeHasMetadata(nodeNameString, nodePort, true);
 
 	/* generate and add the local group id's update query */
 	localGroupIdUpdateCommand = LocalGroupIdUpdateCommand(workerNode->groupId);
@@ -112,8 +125,6 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	SendCommandListToWorkerInSingleTransaction(nodeNameString, nodePort, extensionOwner,
 											   recreateMetadataSnapshotCommandList);
 
-	MarkNodeHasMetadata(nodeNameString, nodePort, true);
-
 	PG_RETURN_VOID();
 }
 
@@ -121,7 +132,7 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 /*
  * stop_metadata_sync_to_node function sets the hasmetadata column of the specified node
  * to false in pg_dist_node table, thus indicating that the specified worker node does not
- * receive DDL changes anymore and cannot be used for issuing mx queries.
+ * receive DDL changes anymore and cannot be used for issuing queries.
  */
 Datum
 stop_metadata_sync_to_node(PG_FUNCTION_ARGS)
@@ -131,6 +142,7 @@ stop_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	char *nodeNameString = text_to_cstring(nodeName);
 	WorkerNode *workerNode = NULL;
 
+	EnsureCoordinator();
 	EnsureSuperUser();
 
 	workerNode = FindWorkerNode(nodeNameString, nodePort);
@@ -147,19 +159,24 @@ stop_metadata_sync_to_node(PG_FUNCTION_ARGS)
 
 
 /*
- * ShouldSyncTableMetadata checks if a distributed table has streaming replication model
- * and hash distribution. In that case the distributed table is considered an MX table,
- * and its metadata is required to exist on the worker nodes.
+ * ShouldSyncTableMetadata checks if the metadata of a distributed table should be
+ * propagated to metadata workers, i.e. the table is an MX table or reference table.
+ * Tables with streaming replication model (which means RF=1) and hash distribution are
+ * considered as MX tables while tables with none distribution are reference tables.
  */
 bool
 ShouldSyncTableMetadata(Oid relationId)
 {
 	DistTableCacheEntry *tableEntry = DistributedTableCacheEntry(relationId);
-	bool usesHashDistribution = (tableEntry->partitionMethod == DISTRIBUTE_BY_HASH);
-	bool usesStreamingReplication =
+
+	bool hashDistributed = (tableEntry->partitionMethod == DISTRIBUTE_BY_HASH);
+	bool streamingReplicated =
 		(tableEntry->replicationModel == REPLICATION_MODEL_STREAMING);
 
-	if (usesStreamingReplication && usesHashDistribution)
+	bool mxTable = (streamingReplicated && hashDistributed);
+	bool referenceTable = (tableEntry->partitionMethod == DISTRIBUTE_BY_NONE);
+
+	if (mxTable || referenceTable)
 	{
 		return true;
 	}
@@ -187,7 +204,7 @@ MetadataCreateCommands(void)
 {
 	List *metadataSnapshotCommandList = NIL;
 	List *distributedTableList = DistributedTableList();
-	List *mxTableList = NIL;
+	List *propagatedTableList = NIL;
 	List *workerNodeList = WorkerNodeList();
 	ListCell *distributedTableCell = NULL;
 	char *nodeListInsertCommand = NULL;
@@ -197,35 +214,38 @@ MetadataCreateCommands(void)
 	metadataSnapshotCommandList = lappend(metadataSnapshotCommandList,
 										  nodeListInsertCommand);
 
-	/* create the list of mx tables */
+	/* create the list of tables whose metadata will be created */
 	foreach(distributedTableCell, distributedTableList)
 	{
 		DistTableCacheEntry *cacheEntry =
 			(DistTableCacheEntry *) lfirst(distributedTableCell);
 		if (ShouldSyncTableMetadata(cacheEntry->relationId))
 		{
-			mxTableList = lappend(mxTableList, cacheEntry);
+			propagatedTableList = lappend(propagatedTableList, cacheEntry);
 		}
 	}
 
-	/* create the mx tables, but not the metadata */
-	foreach(distributedTableCell, mxTableList)
+	/* create the tables, but not the metadata */
+	foreach(distributedTableCell, propagatedTableList)
 	{
 		DistTableCacheEntry *cacheEntry =
 			(DistTableCacheEntry *) lfirst(distributedTableCell);
 		Oid relationId = cacheEntry->relationId;
 
-		List *commandList = GetTableDDLEvents(relationId);
+		List *workerSequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
+		List *ddlCommandList = GetTableDDLEvents(relationId);
 		char *tableOwnerResetCommand = TableOwnerResetCommand(relationId);
 
 		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
-												  commandList);
+												  workerSequenceDDLCommands);
+		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
+												  ddlCommandList);
 		metadataSnapshotCommandList = lappend(metadataSnapshotCommandList,
 											  tableOwnerResetCommand);
 	}
 
 	/* construct the foreign key constraints after all tables are created */
-	foreach(distributedTableCell, mxTableList)
+	foreach(distributedTableCell, propagatedTableList)
 	{
 		DistTableCacheEntry *cacheEntry =
 			(DistTableCacheEntry *) lfirst(distributedTableCell);
@@ -238,7 +258,7 @@ MetadataCreateCommands(void)
 	}
 
 	/* after all tables are created, create the metadata */
-	foreach(distributedTableCell, mxTableList)
+	foreach(distributedTableCell, propagatedTableList)
 	{
 		DistTableCacheEntry *cacheEntry =
 			(DistTableCacheEntry *) lfirst(distributedTableCell);
@@ -286,12 +306,19 @@ GetDistributedTableDDLEvents(Oid relationId)
 	List *commandList = NIL;
 	List *foreignConstraintCommands = NIL;
 	List *shardMetadataInsertCommandList = NIL;
+	List *sequenceDDLCommands = NIL;
+	List *tableDDLCommands = NIL;
 	char *tableOwnerResetCommand = NULL;
 	char *metadataCommand = NULL;
 	char *truncateTriggerCreateCommand = NULL;
 
+	/* commands to create sequences */
+	sequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
+	commandList = list_concat(commandList, sequenceDDLCommands);
+
 	/* commands to create the table */
-	commandList = GetTableDDLEvents(relationId);
+	tableDDLCommands = GetTableDDLEvents(relationId);
+	commandList = list_concat(commandList, tableDDLCommands);
 
 	/* command to reset the table owner */
 	tableOwnerResetCommand = TableOwnerResetCommand(relationId);
@@ -301,7 +328,7 @@ GetDistributedTableDDLEvents(Oid relationId)
 	metadataCommand = DistributionCreateCommand(cacheEntry);
 	commandList = lappend(commandList, metadataCommand);
 
-	/* commands to create the truncate trigger of the mx table */
+	/* commands to create the truncate trigger of the table */
 	truncateTriggerCreateCommand = TruncateTriggerCreateCommand(relationId);
 	commandList = lappend(commandList, truncateTriggerCreateCommand);
 
@@ -382,12 +409,12 @@ NodeListInsertCommand(List *workerNodeList)
 		char *hasMetadaString = workerNode->hasMetadata ? "TRUE" : "FALSE";
 
 		appendStringInfo(nodeListInsertCommand,
-						 "(%d, %d, %s, %d, '%s', %s)",
+						 "(%d, %d, %s, %d, %s, %s)",
 						 workerNode->nodeId,
 						 workerNode->groupId,
 						 quote_literal_cstr(workerNode->workerName),
 						 workerNode->workerPort,
-						 workerNode->workerRack,
+						 quote_literal_cstr(workerNode->workerRack),
 						 hasMetadaString);
 
 		processedWorkerNodeCount++;
@@ -414,19 +441,30 @@ DistributionCreateCommand(DistTableCacheEntry *cacheEntry)
 	char *partitionKeyString = cacheEntry->partitionKeyString;
 	char *qualifiedRelationName =
 		generate_qualified_relation_name(relationId);
-	char *partitionKeyColumnName = ColumnNameToColumn(relationId, partitionKeyString);
 	uint32 colocationId = cacheEntry->colocationId;
 	char replicationModel = cacheEntry->replicationModel;
+	StringInfo tablePartitionKeyString = makeStringInfo();
+
+	if (distributionMethod == DISTRIBUTE_BY_NONE)
+	{
+		appendStringInfo(tablePartitionKeyString, "NULL");
+	}
+	else
+	{
+		char *partitionKeyColumnName = ColumnNameToColumn(relationId, partitionKeyString);
+		appendStringInfo(tablePartitionKeyString, "column_name_to_column(%s,%s)",
+						 quote_literal_cstr(qualifiedRelationName),
+						 quote_literal_cstr(partitionKeyColumnName));
+	}
 
 	appendStringInfo(insertDistributionCommand,
 					 "INSERT INTO pg_dist_partition "
 					 "(logicalrelid, partmethod, partkey, colocationid, repmodel) "
 					 "VALUES "
-					 "(%s::regclass, '%c', column_name_to_column(%s,%s), %d, '%c')",
+					 "(%s::regclass, '%c', %s, %d, '%c')",
 					 quote_literal_cstr(qualifiedRelationName),
 					 distributionMethod,
-					 quote_literal_cstr(qualifiedRelationName),
-					 quote_literal_cstr(partitionKeyColumnName),
+					 tablePartitionKeyString->data,
 					 colocationId,
 					 replicationModel);
 
@@ -475,7 +513,7 @@ TableOwnerResetCommand(Oid relationId)
 
 
 /*
- * ShardListInsertCommand generates a singe command that can be
+ * ShardListInsertCommand generates a single command that can be
  * executed to replicate shard and shard placement metadata for the
  * given shard intervals. The function assumes that each shard has a
  * single placement, and asserts this information.
@@ -489,20 +527,12 @@ ShardListInsertCommand(List *shardIntervalList)
 	StringInfo insertShardCommand = makeStringInfo();
 	int shardCount = list_length(shardIntervalList);
 	int processedShardCount = 0;
-	int processedShardPlacementCount = 0;
 
 	/* if there are no shards, return empty list */
 	if (shardCount == 0)
 	{
 		return commandList;
 	}
-
-	/* generate the shard placement query without any values yet */
-	appendStringInfo(insertPlacementCommand,
-					 "INSERT INTO pg_dist_shard_placement "
-					 "(shardid, shardstate, shardlength,"
-					 " nodename, nodeport, placementid) "
-					 "VALUES ");
 
 	/* add placements to insertPlacementCommand */
 	foreach(shardIntervalCell, shardIntervalList)
@@ -511,25 +541,33 @@ ShardListInsertCommand(List *shardIntervalList)
 		uint64 shardId = shardInterval->shardId;
 
 		List *shardPlacementList = FinalizedShardPlacementList(shardId);
-		ShardPlacement *placement = NULL;
+		ListCell *shardPlacementCell = NULL;
 
-		/* the function only handles single placement per shard */
-		Assert(list_length(shardPlacementList) == 1);
-
-		placement = (ShardPlacement *) linitial(shardPlacementList);
-
-		appendStringInfo(insertPlacementCommand,
-						 "(%lu, 1, %lu, %s, %d, %lu)",
-						 shardId,
-						 placement->shardLength,
-						 quote_literal_cstr(placement->nodeName),
-						 placement->nodePort,
-						 placement->placementId);
-
-		processedShardPlacementCount++;
-		if (processedShardPlacementCount != shardCount)
+		foreach(shardPlacementCell, shardPlacementList)
 		{
-			appendStringInfo(insertPlacementCommand, ",");
+			ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+
+			if (insertPlacementCommand->len == 0)
+			{
+				/* generate the shard placement query without any values yet */
+				appendStringInfo(insertPlacementCommand,
+								 "INSERT INTO pg_dist_shard_placement "
+								 "(shardid, shardstate, shardlength,"
+								 " nodename, nodeport, placementid) "
+								 "VALUES ");
+			}
+			else
+			{
+				appendStringInfo(insertPlacementCommand, ",");
+			}
+
+			appendStringInfo(insertPlacementCommand,
+							 "(%lu, 1, %lu, %s, %d, %lu)",
+							 shardId,
+							 placement->shardLength,
+							 quote_literal_cstr(placement->nodeName),
+							 placement->nodePort,
+							 placement->placementId);
 		}
 	}
 
@@ -551,17 +589,36 @@ ShardListInsertCommand(List *shardIntervalList)
 		Oid distributedRelationId = shardInterval->relationId;
 		char *qualifiedRelationName = generate_qualified_relation_name(
 			distributedRelationId);
+		StringInfo minHashToken = makeStringInfo();
+		StringInfo maxHashToken = makeStringInfo();
 
-		int minHashToken = DatumGetInt32(shardInterval->minValue);
-		int maxHashToken = DatumGetInt32(shardInterval->maxValue);
+		if (shardInterval->minValueExists)
+		{
+			appendStringInfo(minHashToken, "'%d'", DatumGetInt32(
+								 shardInterval->minValue));
+		}
+		else
+		{
+			appendStringInfo(minHashToken, "NULL");
+		}
+
+		if (shardInterval->maxValueExists)
+		{
+			appendStringInfo(maxHashToken, "'%d'", DatumGetInt32(
+								 shardInterval->maxValue));
+		}
+		else
+		{
+			appendStringInfo(maxHashToken, "NULL");
+		}
 
 		appendStringInfo(insertShardCommand,
-						 "(%s::regclass, %lu, '%c', '%d', '%d')",
+						 "(%s::regclass, %lu, '%c', %s, %s)",
 						 quote_literal_cstr(qualifiedRelationName),
 						 shardId,
 						 shardInterval->storageType,
-						 minHashToken,
-						 maxHashToken);
+						 minHashToken->data,
+						 maxHashToken->data);
 
 		processedShardCount++;
 		if (processedShardCount != shardCount)
@@ -572,6 +629,37 @@ ShardListInsertCommand(List *shardIntervalList)
 
 	/* finally add the command to the list that we'll return */
 	commandList = lappend(commandList, insertShardCommand->data);
+
+	return commandList;
+}
+
+
+/*
+ * ShardListDeleteCommand generates a command list that can be executed to delete
+ * shard and shard placement metadata for the given shard.
+ */
+List *
+ShardDeleteCommandList(ShardInterval *shardInterval)
+{
+	uint64 shardId = shardInterval->shardId;
+	List *commandList = NIL;
+	StringInfo deletePlacementCommand = NULL;
+	StringInfo deleteShardCommand = NULL;
+
+	/* create command to delete shard placements */
+	deletePlacementCommand = makeStringInfo();
+	appendStringInfo(deletePlacementCommand,
+					 "DELETE FROM pg_dist_shard_placement WHERE shardid = %lu",
+					 shardId);
+
+	commandList = lappend(commandList, deletePlacementCommand->data);
+
+	/* create command to delete shard */
+	deleteShardCommand = makeStringInfo();
+	appendStringInfo(deleteShardCommand,
+					 "DELETE FROM pg_dist_shard WHERE shardid = %lu", shardId);
+
+	commandList = lappend(commandList, deleteShardCommand->data);
 
 	return commandList;
 }
@@ -608,6 +696,24 @@ ColocationIdUpdateCommand(Oid relationId, uint32 colocationId)
 							  "SET colocationid = %d "
 							  "WHERE logicalrelid = %s::regclass",
 					 colocationId, quote_literal_cstr(qualifiedRelationName));
+
+	return command->data;
+}
+
+
+/*
+ * PlacementUpsertCommand creates a SQL command for upserting a pg_dist_shard_placment
+ * entry with the given properties. In the case of a conflict on placementId, the command
+ * updates all properties (excluding the placementId) with the given ones.
+ */
+char *
+PlacementUpsertCommand(uint64 shardId, uint64 placementId, int shardState,
+					   uint64 shardLength, char *nodeName, uint32 nodePort)
+{
+	StringInfo command = makeStringInfo();
+
+	appendStringInfo(command, UPSERT_PLACEMENT, shardId, shardState, shardLength,
+					 quote_literal_cstr(nodeName), nodePort, placementId);
 
 	return command->data;
 }
@@ -687,6 +793,132 @@ MarkNodeHasMetadata(char *nodeName, int32 nodePort, bool hasMetadata)
 
 
 /*
+ * SequenceDDLCommandsForTable returns a list of commands which create sequences (and
+ * their schemas) to run on workers before creating the relation. The sequence creation
+ * commands are wrapped with a `worker_apply_sequence_command` call, which sets the
+ * sequence space uniquely for each worker. Notice that this function is relevant only
+ * during metadata propagation to workers and adds nothing to the list of sequence
+ * commands if none of the workers is marked as receiving metadata changes.
+ */
+List *
+SequenceDDLCommandsForTable(Oid relationId)
+{
+	List *sequenceDDLList = NIL;
+	List *ownedSequences = getOwnedSequences(relationId);
+	ListCell *listCell;
+	char *ownerName = TableOwner(relationId);
+
+	foreach(listCell, ownedSequences)
+	{
+		Oid sequenceOid = (Oid) lfirst_oid(listCell);
+		char *sequenceDef = pg_get_sequencedef_string(sequenceOid);
+		char *escapedSequenceDef = quote_literal_cstr(sequenceDef);
+		StringInfo wrappedSequenceDef = makeStringInfo();
+		StringInfo sequenceGrantStmt = makeStringInfo();
+		Oid schemaId = InvalidOid;
+		char *createSchemaCommand = NULL;
+		char *sequenceName = generate_qualified_relation_name(sequenceOid);
+
+		EnsureSupportedSequenceColumnType(sequenceOid);
+
+		/* create schema if needed */
+		schemaId = get_rel_namespace(sequenceOid);
+		createSchemaCommand = CreateSchemaDDLCommand(schemaId);
+		if (createSchemaCommand != NULL)
+		{
+			sequenceDDLList = lappend(sequenceDDLList, createSchemaCommand);
+		}
+
+		appendStringInfo(wrappedSequenceDef,
+						 WORKER_APPLY_SEQUENCE_COMMAND,
+						 escapedSequenceDef);
+
+		appendStringInfo(sequenceGrantStmt,
+						 "ALTER SEQUENCE %s OWNER TO %s", sequenceName,
+						 quote_identifier(ownerName));
+
+		sequenceDDLList = lappend(sequenceDDLList, wrappedSequenceDef->data);
+		sequenceDDLList = lappend(sequenceDDLList, sequenceGrantStmt->data);
+	}
+
+	return sequenceDDLList;
+}
+
+
+/*
+ * CreateSchemaDDLCommand returns a "CREATE SCHEMA..." SQL string for creating the given
+ * schema if not exists and with proper authorization.
+ */
+char *
+CreateSchemaDDLCommand(Oid schemaId)
+{
+	char *schemaName = get_namespace_name(schemaId);
+	StringInfo schemaNameDef = NULL;
+	char *ownerName = NULL;
+
+	if (strncmp(schemaName, "public", NAMEDATALEN) == 0)
+	{
+		return NULL;
+	}
+
+	schemaNameDef = makeStringInfo();
+	ownerName = OwnerName(schemaId);
+	appendStringInfo(schemaNameDef, CREATE_SCHEMA_COMMAND, schemaName, ownerName);
+
+	return schemaNameDef->data;
+}
+
+
+/*
+ * EnsureSupportedSequenceColumnType looks at the column which depends on this sequence
+ * (which it Assert's exists) and makes sure its type is suitable for use in a disributed
+ * manner.
+ *
+ * Any column which depends on a sequence (and will therefore be replicated) but which is
+ * not a bigserial cannot be used for an mx table, because there aren't enough values to
+ * ensure that generated numbers are globally unique.
+ */
+static void
+EnsureSupportedSequenceColumnType(Oid sequenceOid)
+{
+	Oid tableId = InvalidOid;
+	Oid columnType = InvalidOid;
+	int32 columnId = 0;
+	bool shouldSyncMetadata = false;
+	bool hasMetadataWorkers = HasMetadataWorkers();
+
+	/* call sequenceIsOwned in order to get the tableId and columnId */
+	sequenceIsOwned(sequenceOid, &tableId, &columnId);
+
+	shouldSyncMetadata = ShouldSyncTableMetadata(tableId);
+
+	columnType = TypeOfColumn(tableId, (int16) columnId);
+
+	if (columnType != INT8OID && shouldSyncMetadata && hasMetadataWorkers)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create an mx table with a serial or smallserial "
+							   "column "),
+						errdetail("Only bigserial is supported in mx tables.")));
+	}
+}
+
+
+/*
+ * TypeOfColumn returns the Oid of the type of the provided column of the provided table.
+ */
+static Oid
+TypeOfColumn(Oid tableId, int16 columnId)
+{
+	Relation tableRelation = relation_open(tableId, NoLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(tableRelation);
+	Form_pg_attribute attrForm = tupleDescriptor->attrs[columnId - 1];
+	relation_close(tableRelation, NoLock);
+	return attrForm->atttypid;
+}
+
+
+/*
  * TruncateTriggerCreateCommand creates a SQL query calling worker_create_truncate_trigger
  * function, which creates the truncate trigger on the worker.
  */
@@ -701,4 +933,80 @@ TruncateTriggerCreateCommand(Oid relationId)
 					 quote_literal_cstr(tableName));
 
 	return triggerCreateCommand->data;
+}
+
+
+/*
+ * OwnerName returns the name of the owner of the specified object.
+ */
+static char *
+OwnerName(Oid objectId)
+{
+	HeapTuple tuple = NULL;
+	Oid ownerId = InvalidOid;
+	char *ownerName = NULL;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(objectId));
+	if (HeapTupleIsValid(tuple))
+	{
+		ownerId = ((Form_pg_class) GETSTRUCT(tuple))->relowner;
+	}
+	else
+	{
+		ownerId = GetUserId();
+	}
+
+	ownerName = GetUserNameFromId(ownerId, false);
+
+	return ownerName;
+}
+
+
+/*
+ * HasMetadataWorkers returns true if any of the workers in the cluster has its
+ * hasmetadata column set to true, which happens when start_metadata_sync_to_node
+ * command is run.
+ */
+static bool
+HasMetadataWorkers(void)
+{
+	List *workerNodeList = WorkerNodeList();
+	ListCell *workerNodeCell = NULL;
+
+	foreach(workerNodeCell, workerNodeList)
+	{
+		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
+		if (workerNode->hasMetadata)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * CreateTableMetadataOnWorkers creates the list of commands needed to create the
+ * given distributed table and sends these commands to all metadata workers i.e. workers
+ * with hasmetadata=true. Before sending the commands, in order to prevent recursive
+ * propagation, DDL propagation on workers are disabled with a
+ * `SET citus.enable_ddl_propagation TO off;` command.
+ */
+void
+CreateTableMetadataOnWorkers(Oid relationId)
+{
+	List *commandList = GetDistributedTableDDLEvents(relationId);
+	ListCell *commandCell = NULL;
+
+	/* prevent recursive propagation */
+	SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
+
+	/* send the commands one by one */
+	foreach(commandCell, commandList)
+	{
+		char *command = (char *) lfirst(commandCell);
+
+		SendCommandToWorkers(WORKERS_WITH_METADATA, command);
+	}
 }

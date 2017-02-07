@@ -23,6 +23,7 @@
 #include "distributed/connection_management.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/hash_helpers.h"
+#include "distributed/placement_connection.h"
 #include "mb/pg_wchar.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -163,7 +164,6 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, 
 	ConnectionHashKey key;
 	ConnectionHashEntry *entry = NULL;
 	MultiConnection *connection;
-	MemoryContext oldContext;
 	bool found;
 
 	/* do some minimal input checks */
@@ -234,10 +234,8 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, 
 	 */
 	connection = StartConnectionEstablishment(&key);
 
-	oldContext = MemoryContextSwitchTo(ConnectionContext);
 	dlist_push_tail(entry->connections, &connection->connectionNode);
-
-	MemoryContextSwitchTo(oldContext);
+	ResetShardPlacementAssociation(connection);
 
 	if (flags & SESSION_LIFESPAN)
 	{
@@ -309,11 +307,11 @@ GetConnectionFromPGconn(struct pg_conn *pqConn)
 
 
 /*
- * CloseNodeConnections closes all the connections to a particular node.
- * This is mainly used when a worker leaves the cluster
+ * CloseNodeConnectionsAfterTransaction sets the sessionLifespan flag of the connections
+ * to a particular node as false. This is mainly used when a worker leaves the cluster.
  */
 void
-CloseNodeConnections(char *nodeName, int nodePort)
+CloseNodeConnectionsAfterTransaction(char *nodeName, int nodePort)
 {
 	HASH_SEQ_STATUS status;
 	ConnectionHashEntry *entry;
@@ -321,25 +319,21 @@ CloseNodeConnections(char *nodeName, int nodePort)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
 	{
-		dlist_head *connections = entry->connections;
+		dlist_iter iter;
+		dlist_head *connections = NULL;
 
 		if (strcmp(entry->key.hostname, nodeName) != 0 || entry->key.port != nodePort)
 		{
 			continue;
 		}
 
-		while (!dlist_is_empty(connections))
+		connections = entry->connections;
+		dlist_foreach(iter, connections)
 		{
-			dlist_node *currentNode = dlist_pop_head_node(connections);
-
 			MultiConnection *connection =
-				dlist_container(MultiConnection, connectionNode, currentNode);
+				dlist_container(MultiConnection, connectionNode, iter.cur);
 
-			/* same for transaction state */
-			CloseRemoteTransaction(connection);
-
-			/* we leave the per-host entry alive */
-			pfree(connection);
+			connection->sessionLifespan = false;
 		}
 	}
 }
@@ -370,8 +364,9 @@ CloseConnection(MultiConnection *connection)
 		/* unlink from list of open connections */
 		dlist_delete(&connection->connectionNode);
 
-		/* same for transaction state */
+		/* same for transaction state and shard/placement machinery */
 		CloseRemoteTransaction(connection);
+		CloseShardPlacementAssociation(connection);
 
 		/* we leave the per-host entry alive */
 		pfree(connection);
@@ -404,6 +399,27 @@ CloseConnectionByPGconn(PGconn *pqConn)
 	else
 	{
 		ereport(WARNING, (errmsg("could not find connection to close")));
+	}
+}
+
+
+/*
+ * FinishConnectionListEstablishment is a wrapper around FinishConnectionEstablishment.
+ * The function iterates over the multiConnectionList and finishes the connection
+ * establishment for each multi connection.
+ */
+void
+FinishConnectionListEstablishment(List *multiConnectionList)
+{
+	ListCell *multiConnectionCell = NULL;
+
+	foreach(multiConnectionCell, multiConnectionList)
+	{
+		MultiConnection *multiConnection = (MultiConnection *) lfirst(
+			multiConnectionCell);
+
+		/* TODO: consider making connection establishment fully in parallel */
+		FinishConnectionEstablishment(multiConnection);
 	}
 }
 
@@ -580,7 +596,7 @@ ConnectionHashCompare(const void *a, const void *b, Size keysize)
 	ConnectionHashKey *ca = (ConnectionHashKey *) a;
 	ConnectionHashKey *cb = (ConnectionHashKey *) b;
 
-	if (strncmp(ca->hostname, cb->hostname, NAMEDATALEN) != 0 ||
+	if (strncmp(ca->hostname, cb->hostname, MAX_NODE_LENGTH) != 0 ||
 		ca->port != cb->port ||
 		strncmp(ca->user, cb->user, NAMEDATALEN) != 0 ||
 		strncmp(ca->database, cb->database, NAMEDATALEN) != 0)
@@ -675,6 +691,7 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 		{
 			/* reset per-transaction state */
 			ResetRemoteTransaction(connection);
+			ResetShardPlacementAssociation(connection);
 
 			UnclaimConnection(connection);
 		}

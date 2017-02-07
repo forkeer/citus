@@ -17,15 +17,21 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
-#include "catalog/pg_type.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
+#include "commands/extension.h"
+#include "distributed/connection_management.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_optimizer.h"
+#include "distributed/pg_dist_colocation.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/pg_dist_shard_placement.h"
@@ -47,6 +53,10 @@
 
 /* Local functions forward declarations */
 static uint64 * AllocateUint64(uint64 value);
+static void RecordDistributedRelationDependencies(Oid distributedRelationId,
+												  Node *distributionKey);
+static ShardPlacement * TupleToShardPlacement(TupleDesc tupleDesc,
+											  HeapTuple heapTuple);
 
 
 /* exports for SQL callable functions */
@@ -233,6 +243,24 @@ CopyShardInterval(ShardInterval *srcInterval, ShardInterval *destInterval)
 
 
 /*
+ * CopyShardPlacement copies the values of the source placement into the
+ * target placement.
+ */
+void
+CopyShardPlacement(ShardPlacement *srcPlacement, ShardPlacement *destPlacement)
+{
+	/* first copy all by-value fields */
+	memcpy(destPlacement, srcPlacement, sizeof(ShardPlacement));
+
+	/* and then the fields pointing to external values */
+	if (srcPlacement->nodeName)
+	{
+		destPlacement->nodeName = pstrdup(srcPlacement->nodeName);
+	}
+}
+
+
+/*
  * ShardLength finds shard placements for the given shardId, extracts the length
  * of a finalized shard, and returns the shard's length. This function errors
  * out if we cannot find any finalized shard placements for the given shardId.
@@ -323,13 +351,47 @@ FinalizedShardPlacementList(uint64 shardId)
 
 
 /*
- * ShardPlacementList finds shard placements for the given shardId from system
- * catalogs, converts these placements to their in-memory representation, and
- * returns the converted shard placements in a new list.
+ * FinalizedShardPlacement finds a shard placement for the given shardId from
+ * system catalog, chooses a placement that is in finalized state and returns
+ * that shard placement. If this function cannot find a healthy shard placement
+ * and missingOk is set to false it errors out.
+ */
+ShardPlacement *
+FinalizedShardPlacement(uint64 shardId, bool missingOk)
+{
+	List *finalizedPlacementList = FinalizedShardPlacementList(shardId);
+	ShardPlacement *shardPlacement = NULL;
+
+	if (list_length(finalizedPlacementList) == 0)
+	{
+		if (!missingOk)
+		{
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("could not find any healthy placement for shard "
+								   UINT64_FORMAT, shardId)));
+		}
+
+		return shardPlacement;
+	}
+
+	shardPlacement = (ShardPlacement *) linitial(finalizedPlacementList);
+
+	return shardPlacement;
+}
+
+
+/*
+ * BuildShardPlacementList finds shard placements for the given shardId from
+ * system catalogs, converts these placements to their in-memory
+ * representation, and returns the converted shard placements in a new list.
+ *
+ * This probably only should be called from metadata_cache.c.  Resides here
+ * because it shares code with other routines in this file.
  */
 List *
-ShardPlacementList(uint64 shardId)
+BuildShardPlacementList(ShardInterval *shardInterval)
 {
+	int64 shardId = shardInterval->shardId;
 	List *shardPlacementList = NIL;
 	Relation pgShardPlacement = NULL;
 	SysScanDesc scanDescriptor = NULL;
@@ -361,13 +423,6 @@ ShardPlacementList(uint64 shardId)
 	systable_endscan(scanDescriptor);
 	heap_close(pgShardPlacement, AccessShareLock);
 
-	/* if no shard placements are found, warn the user */
-	if (shardPlacementList == NIL)
-	{
-		ereport(WARNING, (errmsg("could not find any shard placements for shardId "
-								 UINT64_FORMAT, shardId)));
-	}
-
 	return shardPlacementList;
 }
 
@@ -377,7 +432,7 @@ ShardPlacementList(uint64 shardId)
  * and converts this tuple to in-memory struct. The function assumes the
  * caller already has locks on the tuple, and doesn't perform any locking.
  */
-ShardPlacement *
+static ShardPlacement *
 TupleToShardPlacement(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 {
 	ShardPlacement *shardPlacement = NULL;
@@ -512,6 +567,99 @@ InsertShardPlacementRow(uint64 shardId, uint64 placementId,
 
 	CommandCounterIncrement();
 	heap_close(pgDistShardPlacement, RowExclusiveLock);
+}
+
+
+/*
+ * InsertIntoPgDistPartition inserts a new tuple into pg_dist_partition.
+ */
+void
+InsertIntoPgDistPartition(Oid relationId, char distributionMethod,
+						  Var *distributionColumn, uint32 colocationId,
+						  char replicationModel)
+{
+	Relation pgDistPartition = NULL;
+	char *distributionColumnString = NULL;
+
+	HeapTuple newTuple = NULL;
+	Datum newValues[Natts_pg_dist_partition];
+	bool newNulls[Natts_pg_dist_partition];
+
+	/* open system catalog and insert new tuple */
+	pgDistPartition = heap_open(DistPartitionRelationId(), RowExclusiveLock);
+
+	/* form new tuple for pg_dist_partition */
+	memset(newValues, 0, sizeof(newValues));
+	memset(newNulls, false, sizeof(newNulls));
+
+	newValues[Anum_pg_dist_partition_logicalrelid - 1] =
+		ObjectIdGetDatum(relationId);
+	newValues[Anum_pg_dist_partition_partmethod - 1] =
+		CharGetDatum(distributionMethod);
+	newValues[Anum_pg_dist_partition_colocationid - 1] = UInt32GetDatum(colocationId);
+	newValues[Anum_pg_dist_partition_repmodel - 1] = CharGetDatum(replicationModel);
+
+	/* set partkey column to NULL for reference tables */
+	if (distributionMethod != DISTRIBUTE_BY_NONE)
+	{
+		distributionColumnString = nodeToString((Node *) distributionColumn);
+
+		newValues[Anum_pg_dist_partition_partkey - 1] =
+			CStringGetTextDatum(distributionColumnString);
+	}
+	else
+	{
+		newValues[Anum_pg_dist_partition_partkey - 1] = PointerGetDatum(NULL);
+		newNulls[Anum_pg_dist_partition_partkey - 1] = true;
+	}
+
+	newTuple = heap_form_tuple(RelationGetDescr(pgDistPartition), newValues, newNulls);
+
+	/* finally insert tuple, build index entries & register cache invalidation */
+	simple_heap_insert(pgDistPartition, newTuple);
+	CatalogUpdateIndexes(pgDistPartition, newTuple);
+	CitusInvalidateRelcacheByRelid(relationId);
+
+	RecordDistributedRelationDependencies(relationId, (Node *) distributionColumn);
+
+	CommandCounterIncrement();
+	heap_close(pgDistPartition, NoLock);
+}
+
+
+/*
+ * RecordDistributedRelationDependencies creates the dependency entries
+ * necessary for a distributed relation in addition to the preexisting ones
+ * for a normal relation.
+ *
+ * We create one dependency from the (now distributed) relation to the citus
+ * extension to prevent the extension from being dropped while distributed
+ * tables exist. Furthermore a dependency from pg_dist_partition's
+ * distribution clause to the underlying columns is created, but it's marked
+ * as being owned by the relation itself. That means the entire table can be
+ * dropped, but the column itself can't. Neither can the type of the
+ * distribution column be changed (c.f. ATExecAlterColumnType).
+ */
+static void
+RecordDistributedRelationDependencies(Oid distributedRelationId, Node *distributionKey)
+{
+	ObjectAddress relationAddr = { 0, 0, 0 };
+	ObjectAddress citusExtensionAddr = { 0, 0, 0 };
+
+	relationAddr.classId = RelationRelationId;
+	relationAddr.objectId = distributedRelationId;
+	relationAddr.objectSubId = 0;
+
+	citusExtensionAddr.classId = ExtensionRelationId;
+	citusExtensionAddr.objectId = get_extension_oid("citus", false);
+	citusExtensionAddr.objectSubId = 0;
+
+	/* dependency from table entry to extension */
+	recordDependencyOn(&relationAddr, &citusExtensionAddr, DEPENDENCY_NORMAL);
+
+	/* make sure the distribution key column/expression does not just go away */
+	recordDependencyOnSingleRelExpr(&relationAddr, distributionKey, distributedRelationId,
+									DEPENDENCY_NORMAL, DEPENDENCY_NORMAL);
 }
 
 
@@ -738,6 +886,69 @@ UpdateShardPlacementState(uint64 placementId, char shardState)
 
 
 /*
+ * UpdateColocationGroupReplicationFactor finds colocation group record for given
+ * colocationId and updates its replication factor to given replicationFactor value.
+ * Since we do not cache pg_dist_colocation table, we do not need to invalidate the
+ * cache after updating replication factor.
+ */
+void
+UpdateColocationGroupReplicationFactor(uint32 colocationId, int replicationFactor)
+{
+	Relation pgDistColocation = NULL;
+	SysScanDesc scanDescriptor = NULL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	bool indexOK = true;
+	HeapTuple heapTuple = NULL;
+	HeapTuple newHeapTuple = NULL;
+	TupleDesc tupleDescriptor = NULL;
+
+	Datum values[Natts_pg_dist_colocation];
+	bool isnull[Natts_pg_dist_colocation];
+	bool replace[Natts_pg_dist_colocation];
+
+	/* we first search for colocation group by its colocation id */
+	pgDistColocation = heap_open(DistColocationRelationId(), RowExclusiveLock);
+	tupleDescriptor = RelationGetDescr(pgDistColocation);
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_colocation_colocationid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(colocationId));
+
+	scanDescriptor = systable_beginscan(pgDistColocation,
+										DistColocationColocationidIndexId(), indexOK,
+										NULL, scanKeyCount, scanKey);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	if (!HeapTupleIsValid(heapTuple))
+	{
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("could not find valid entry for colocation group "
+							   "%d", colocationId)));
+	}
+
+	/* after we find colocation group, we update it with new values */
+	memset(replace, false, sizeof(replace));
+	memset(isnull, false, sizeof(isnull));
+	memset(values, 0, sizeof(values));
+
+	values[Anum_pg_dist_colocation_replicationfactor - 1] = Int32GetDatum(
+		replicationFactor);
+	replace[Anum_pg_dist_colocation_replicationfactor - 1] = true;
+
+	newHeapTuple = heap_modify_tuple(heapTuple, tupleDescriptor, values, isnull, replace);
+	simple_heap_update(pgDistColocation, &newHeapTuple->t_self, newHeapTuple);
+
+	CatalogUpdateIndexes(pgDistColocation, newHeapTuple);
+
+	CommandCounterIncrement();
+
+	heap_freetuple(newHeapTuple);
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgDistColocation, NoLock);
+}
+
+
+/*
  * Check that the current user has `mode` permissions on relationId, error out
  * if not. Superusers always have such permissions.
  */
@@ -943,4 +1154,52 @@ master_stage_shard_placement_row(PG_FUNCTION_ARGS)
 	heap_close(pgDistShard, NoLock);
 
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * TableReferenced function checks whether given table is referenced by another table
+ * via foreign constraints. If it is referenced, this function returns true. To check
+ * that, this function searches given relation at pg_constraints system catalog. However
+ * since there is no index for the column we searched, this function performs sequential
+ * search, therefore call this function with caution.
+ */
+bool
+TableReferenced(Oid relationId)
+{
+	Relation pgConstraint = NULL;
+	HeapTuple heapTuple = NULL;
+	SysScanDesc scanDescriptor = NULL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	Oid scanIndexId = InvalidOid;
+	bool useIndex = false;
+
+	pgConstraint = heap_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_constraint_confrelid, BTEqualStrategyNumber, F_OIDEQ,
+				relationId);
+	scanDescriptor = systable_beginscan(pgConstraint, scanIndexId, useIndex, NULL,
+										scanKeyCount, scanKey);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_constraint constraintForm = (Form_pg_constraint) GETSTRUCT(heapTuple);
+
+		if (constraintForm->contype == CONSTRAINT_FOREIGN)
+		{
+			systable_endscan(scanDescriptor);
+			heap_close(pgConstraint, NoLock);
+
+			return true;
+		}
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgConstraint, NoLock);
+
+	return false;
 }

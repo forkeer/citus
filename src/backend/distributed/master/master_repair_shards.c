@@ -19,7 +19,7 @@
 
 #include "catalog/pg_class.h"
 #include "distributed/colocation_utils.h"
-#include "distributed/connection_cache.h"
+#include "distributed/connection_management.h"
 #include "distributed/listutils.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
@@ -45,13 +45,6 @@ static void RepairShardPlacement(int64 shardId, char *sourceNodeName,
 static void EnsureShardCanBeRepaired(int64 shardId, char *sourceNodeName,
 									 int32 sourceNodePort, char *targetNodeName,
 									 int32 targetNodePort);
-static ShardPlacement * SearchShardPlacementInList(List *shardPlacementList,
-												   char *nodeName, uint32 nodePort,
-												   bool missingOk);
-static List * CopyShardCommandList(ShardInterval *shardInterval, char *sourceNodeName,
-								   int32 sourceNodePort);
-static List * CopyShardForeignConstraintCommandList(ShardInterval *shardInterval);
-static char * ConstructQualifiedShardName(ShardInterval *shardInterval);
 static List * RecreateTableDDLCommandList(Oid relationId);
 
 /* declarations for dynamic loading */
@@ -89,6 +82,8 @@ master_copy_shard_placement(PG_FUNCTION_ARGS)
 							   "with do not repair functionality "
 							   "is only supported on Citus Enterprise")));
 	}
+
+	EnsureCoordinator();
 
 	/* RepairShardPlacement function repairs only given shard */
 	RepairShardPlacement(shardId, sourceNodeName, sourceNodePort, targetNodeName,
@@ -208,7 +203,7 @@ EnsureShardCanBeRepaired(int64 shardId, char *sourceNodeName, int32 sourceNodePo
  * specified node name and port. If missingOk is set to true, this function returns NULL
  * if no such placement exists in the provided list, otherwise it throws an error.
  */
-static ShardPlacement *
+ShardPlacement *
 SearchShardPlacementInList(List *shardPlacementList, char *nodeName, uint32 nodePort, bool
 						   missingOk)
 {
@@ -248,7 +243,7 @@ SearchShardPlacementInList(List *shardPlacementList, char *nodeName, uint32 node
  * CopyShardCommandList generates command list to copy the given shard placement
  * from the source node to the target node.
  */
-static List *
+List *
 CopyShardCommandList(ShardInterval *shardInterval,
 					 char *sourceNodeName, int32 sourceNodePort)
 {
@@ -291,7 +286,7 @@ CopyShardCommandList(ShardInterval *shardInterval,
  * CopyShardForeignConstraintCommandList generates command list to create foreign
  * constraints existing in source shard after copying it to the other node.
  */
-static List *
+List *
 CopyShardForeignConstraintCommandList(ShardInterval *shardInterval)
 {
 	List *copyShardForeignConstraintCommandList = NIL;
@@ -354,10 +349,8 @@ CopyShardForeignConstraintCommandList(ShardInterval *shardInterval)
 /*
  * ConstuctQualifiedShardName creates the fully qualified name string of the
  * given shard in <schema>.<table_name>_<shard_id> format.
- *
- * FIXME: Copied from Citus-MX, should be removed once those changes checked-in to Citus.
  */
-static char *
+char *
 ConstructQualifiedShardName(ShardInterval *shardInterval)
 {
 	Oid schemaId = get_rel_namespace(shardInterval->relationId);

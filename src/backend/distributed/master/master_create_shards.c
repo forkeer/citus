@@ -26,10 +26,10 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
-#include "distributed/connection_cache.h"
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
@@ -50,10 +50,6 @@
 #include "utils/palloc.h"
 
 
-/* local function forward declarations */
-static text * IntegerToText(int32 value);
-
-
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(master_create_worker_shards);
 
@@ -70,6 +66,9 @@ master_create_worker_shards(PG_FUNCTION_ARGS)
 	int32 replicationFactor = PG_GETARG_INT32(2);
 
 	Oid distributedTableId = ResolveRelationId(tableNameText);
+
+	EnsureCoordinator();
+
 	CreateShardsWithRoundRobinPolicy(distributedTableId, shardCount, replicationFactor);
 
 	PG_RETURN_VOID();
@@ -415,7 +414,7 @@ CheckHashPartitionedTable(Oid distributedTableId)
 
 
 /* Helper function to convert an integer value to a text type */
-static text *
+text *
 IntegerToText(int32 value)
 {
 	text *valueText = NULL;

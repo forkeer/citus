@@ -96,6 +96,13 @@ if (defined $bindir)
     $ENV{PATH} = ($ENV{PATH} || '').":$bindir";
 }
 
+
+# Most people are used to unified diffs these days, rather than the
+# context diffs pg_regress defaults to.  Change default to avoid
+# everyone having to (re-)learn how to change that setting.  Also add
+# a bit more context to make it easier to locate failed test sections.
+$ENV{PG_REGRESS_DIFF_OPTS} = '-dU10';
+
 my $plainRegress = "$pgxsdir/src/test/regress/pg_regress";
 my $isolationRegress = "${postgresBuilddir}/src/test/isolation/pg_isolation_regress";
 if ($isolationtester && ! -f "$isolationRegress")
@@ -212,6 +219,7 @@ push(@pgOptions, '-c', "citus.max_running_tasks_per_node=4");
 push(@pgOptions, '-c', "citus.expire_cached_shards=on");
 push(@pgOptions, '-c', "citus.task_tracker_delay=10ms");
 push(@pgOptions, '-c', "citus.remote_task_check_interval=1ms");
+push(@pgOptions, '-c', "citus.shard_replication_factor=2");
 
 # Add externally added options last, so they overwrite the default ones above
 for my $option (@userPgOptions)
@@ -256,6 +264,7 @@ sysopen my $fh, "tmp_check/tmp-bin/psql", O_CREAT|O_TRUNC|O_RDWR, 0700
 print $fh "#!/bin/bash\n";
 print $fh "exec psql ";
 print $fh "--variable=master_port=$masterPort ";
+print $fh "--variable=default_user=$user ";
 print $fh "--variable=SHOW_CONTEXT=always ";
 for my $workeroff (0 .. $#workerPorts)
 {

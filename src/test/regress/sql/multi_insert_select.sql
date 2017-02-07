@@ -706,8 +706,8 @@ INSERT INTO raw_events_first SELECT * FROM raw_events_second WHERE user_id = 100
 ROLLBACK;
 
 -- Insert after copy is currently disallowed because of the way the 
--- transaction modification state is currently handled. Copy still
--- goes through despite rollback.
+-- transaction modification state is currently handled. Copy is also
+-- rolled back.
 BEGIN;
 COPY raw_events_second (user_id, value_1) FROM STDIN DELIMITER ',';
 100,100
@@ -716,9 +716,7 @@ INSERT INTO raw_events_first SELECT * FROM raw_events_second;
 ROLLBACK;
 
 -- Insert after copy is currently allowed for single-shard operation.
--- Since the COPY commits immediately, the result is visible in the
--- next operation. Copy goes through despite rollback, while insert
--- rolls back.
+-- Both insert and copy are rolled back successfully.
 BEGIN;
 COPY raw_events_second (user_id, value_1) FROM STDIN DELIMITER ',';
 101,101
@@ -727,9 +725,7 @@ INSERT INTO raw_events_first SELECT * FROM raw_events_second WHERE user_id = 101
 SELECT user_id FROM raw_events_first WHERE user_id = 101;
 ROLLBACK;
 
--- Copy after insert is disallowed since the insert is not immediately
--- committed and the copy uses different connections that will not yet
--- see the result of the insert.
+-- Copy after insert is currently disallowed.
 BEGIN;
 INSERT INTO raw_events_first SELECT * FROM raw_events_second;
 COPY raw_events_first (user_id, value_1) FROM STDIN DELIMITER ',';
@@ -744,9 +740,19 @@ COPY raw_events_first (user_id, value_1) FROM STDIN DELIMITER ',';
 \.
 ROLLBACK;
 
--- Views does not work
+-- selecting from views works
 CREATE VIEW test_view AS SELECT * FROM raw_events_first;
+INSERT INTO raw_events_first (user_id, time, value_1, value_2, value_3, value_4) VALUES
+                         (16, now(), 60, 600, 6000.1, 60000);
+SELECT count(*) FROM raw_events_second;
 INSERT INTO raw_events_second SELECT * FROM test_view;
+INSERT INTO raw_events_first (user_id, time, value_1, value_2, value_3, value_4) VALUES
+                         (17, now(), 60, 600, 6000.1, 60000);
+INSERT INTO raw_events_second SELECT * FROM test_view WHERE user_id = 17 GROUP BY 1,2,3,4,5,6;
+SELECT count(*) FROM raw_events_second;
+
+-- inserting into views does not
+INSERT INTO test_view SELECT * FROM raw_events_second;
 
 -- we need this in our next test
 truncate raw_events_first;
@@ -935,9 +941,41 @@ FROM
 GROUP BY
   store_id;
 
+-- do some more error/error message checks
+SET citus.shard_count TO 4;
+SET citus.shard_replication_factor TO 1;
+CREATE TABLE text_table (part_col text, val int);
+CREATE TABLE char_table (part_col char[], val int);
+create table table_with_starts_with_defaults (a int DEFAULT 5, b int, c int);
+SELECT create_distributed_table('text_table', 'part_col');
+SELECT create_distributed_table('char_table','part_col');
+SELECT create_distributed_table('table_with_starts_with_defaults', 'c');
+
+INSERT INTO text_table (part_col) 
+  SELECT 
+    CASE WHEN part_col = 'onder' THEN 'marco'
+      END 
+FROM text_table ;
+
+
+
+INSERT INTO text_table (part_col) SELECT COALESCE(part_col, 'onder') FROM text_table;
+INSERT INTO text_table (part_col) SELECT GREATEST(part_col, 'jason') FROM text_table;
+INSERT INTO text_table (part_col) SELECT LEAST(part_col, 'andres') FROM text_table;
+INSERT INTO text_table (part_col) SELECT NULLIF(part_col, 'metin') FROM text_table;
+INSERT INTO text_table (part_col) SELECT part_col isnull FROM text_table;
+INSERT INTO text_table (part_col) SELECT part_col::text from char_table;
+INSERT INTO text_table (part_col) SELECT (part_col = 'burak') is true FROM text_table;
+INSERT INTO text_table (part_col) SELECT val FROM text_table;
+INSERT INTO text_table (part_col) SELECT val::text FROM text_table;
+insert into table_with_starts_with_defaults (b,c) select b,c FROM table_with_starts_with_defaults;
+
 DROP TABLE raw_events_first CASCADE;
 DROP TABLE raw_events_second;
 DROP TABLE reference_table;
 DROP TABLE agg_events;
 DROP TABLE table_with_defaults;
 DROP TABLE table_with_serial;
+DROP TABLE text_table;
+DROP TABLE char_table;
+DROP TABLE table_with_starts_with_defaults;

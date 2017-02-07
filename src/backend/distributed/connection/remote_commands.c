@@ -125,46 +125,59 @@ ReportConnectionError(MultiConnection *connection, int elevel)
 void
 ReportResultError(MultiConnection *connection, PGresult *result, int elevel)
 {
-	char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
-	char *messagePrimary = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
-	char *messageDetail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
-	char *messageHint = PQresultErrorField(result, PG_DIAG_MESSAGE_HINT);
-	char *messageContext = PQresultErrorField(result, PG_DIAG_CONTEXT);
-
-	char *nodeName = connection->hostname;
-	int nodePort = connection->port;
-	int sqlState = ERRCODE_INTERNAL_ERROR;
-
-	if (sqlStateString != NULL)
+	/* we release PQresult when throwing an error because the caller can't */
+	PG_TRY();
 	{
-		sqlState = MAKE_SQLSTATE(sqlStateString[0], sqlStateString[1], sqlStateString[2],
-								 sqlStateString[3], sqlStateString[4]);
-	}
+		char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+		char *messagePrimary = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
+		char *messageDetail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
+		char *messageHint = PQresultErrorField(result, PG_DIAG_MESSAGE_HINT);
+		char *messageContext = PQresultErrorField(result, PG_DIAG_CONTEXT);
 
-	/*
-	 * If the PGresult did not contain a message, the connection may provide a
-	 * suitable top level one. At worst, this is an empty string.
-	 */
-	if (messagePrimary == NULL)
-	{
-		char *lastNewlineIndex = NULL;
+		char *nodeName = connection->hostname;
+		int nodePort = connection->port;
+		int sqlState = ERRCODE_INTERNAL_ERROR;
 
-		messagePrimary = PQerrorMessage(connection->pgConn);
-		lastNewlineIndex = strrchr(messagePrimary, '\n');
-
-		/* trim trailing newline, if any */
-		if (lastNewlineIndex != NULL)
+		if (sqlStateString != NULL)
 		{
-			*lastNewlineIndex = '\0';
+			sqlState = MAKE_SQLSTATE(sqlStateString[0],
+									 sqlStateString[1],
+									 sqlStateString[2],
+									 sqlStateString[3],
+									 sqlStateString[4]);
 		}
-	}
 
-	ereport(elevel, (errcode(sqlState), errmsg("%s", messagePrimary),
-					 messageDetail ? errdetail("%s", messageDetail) : 0,
-					 messageHint ? errhint("%s", messageHint) : 0,
-					 messageContext ? errcontext("%s", messageContext) : 0,
-					 errcontext("while executing command on %s:%d",
-								nodeName, nodePort)));
+		/*
+		 * If the PGresult did not contain a message, the connection may provide a
+		 * suitable top level one. At worst, this is an empty string.
+		 */
+		if (messagePrimary == NULL)
+		{
+			char *lastNewlineIndex = NULL;
+
+			messagePrimary = PQerrorMessage(connection->pgConn);
+			lastNewlineIndex = strrchr(messagePrimary, '\n');
+
+			/* trim trailing newline, if any */
+			if (lastNewlineIndex != NULL)
+			{
+				*lastNewlineIndex = '\0';
+			}
+		}
+
+		ereport(elevel, (errcode(sqlState), errmsg("%s", messagePrimary),
+						 messageDetail ? errdetail("%s", messageDetail) : 0,
+						 messageHint ? errhint("%s", messageHint) : 0,
+						 messageContext ? errcontext("%s", messageContext) : 0,
+						 errcontext("while executing command on %s:%d",
+									nodeName, nodePort)));
+	}
+	PG_CATCH();
+	{
+		PQclear(result);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 
@@ -213,6 +226,42 @@ ExecuteCriticalRemoteCommand(MultiConnection *connection, const char *command)
 
 	PQclear(result);
 	ForgetResults(connection);
+}
+
+
+/*
+ * ExecuteOptionalRemoteCommand executes a remote command. If the command fails a WARNING
+ * is emitted but execution continues.
+ *
+ * could return 0, QUERY_SEND_FAILED, or RESPONSE_NOT_OKAY
+ * result is only set if there was no error
+ */
+int
+ExecuteOptionalRemoteCommand(MultiConnection *connection, const char *command,
+							 PGresult **result)
+{
+	int querySent = 0;
+	PGresult *localResult = NULL;
+	bool raiseInterrupts = true;
+
+	querySent = SendRemoteCommand(connection, command);
+	if (querySent == 0)
+	{
+		ReportConnectionError(connection, WARNING);
+		return QUERY_SEND_FAILED;
+	}
+
+	localResult = GetRemoteCommandResult(connection, raiseInterrupts);
+	if (!IsResponseOK(localResult))
+	{
+		ReportResultError(connection, localResult, WARNING);
+		PQclear(localResult);
+		ForgetResults(connection);
+		return RESPONSE_NOT_OKAY;
+	}
+
+	*result = localResult;
+	return 0;
 }
 
 
@@ -266,7 +315,7 @@ SendRemoteCommand(MultiConnection *connection, const char *command)
 
 
 /*
- * GetCommandResult is a wrapper around PQgetResult() that handles interrupts.
+ * GetRemoteCommandResult is a wrapper around PQgetResult() that handles interrupts.
  *
  * If raiseInterrupts is true and an interrupt arrives, e.g. the query is
  * being cancelled, CHECK_FOR_INTERRUPTS() will be called, which then throws

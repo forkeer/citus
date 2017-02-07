@@ -17,6 +17,7 @@
 #include "postgres.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "libpq-fe.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -24,6 +25,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
@@ -31,7 +33,10 @@
 #include "distributed/multi_join_order.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
+#include "distributed/placement_connection.h"
+#include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/transaction_management.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "utils/builtins.h"
@@ -44,7 +49,7 @@
 
 
 /* Local functions forward declarations */
-static bool WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId,
+static bool WorkerShardStats(ShardPlacement *placement, Oid relationId,
 							 char *shardName, uint64 *shardSize,
 							 text **shardMinValue, text **shardMaxValue);
 
@@ -121,6 +126,8 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 						errdetail("We currently don't support creating shards "
 								  "on reference tables")));
 	}
+
+	EnsureReplicationSettings(relationId);
 
 	/* generate new and unique shardId from sequence */
 	shardId = GetNextShardId();
@@ -202,10 +209,7 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 	char *shardTableName = NULL;
 	char *shardQualifiedName = NULL;
 	List *shardPlacementList = NIL;
-	List *succeededPlacementList = NIL;
-	List *failedPlacementList = NIL;
 	ListCell *shardPlacementCell = NULL;
-	ListCell *failedPlacementCell = NULL;
 	uint64 newShardSize = 0;
 	uint64 shardMaxSizeInBytes = 0;
 	float4 shardFillLevel = 0.0;
@@ -257,13 +261,16 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 						errhint("Try running master_create_empty_shard() first")));
 	}
 
+	BeginOrContinueCoordinatedTransaction();
+
 	/* issue command to append table to each shard placement */
 	foreach(shardPlacementCell, shardPlacementList)
 	{
 		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(shardPlacementCell);
-		char *workerName = shardPlacement->nodeName;
-		uint32 workerPort = shardPlacement->nodePort;
-		List *queryResultList = NIL;
+		MultiConnection *connection = GetPlacementConnection(FOR_DML, shardPlacement,
+															 NULL);
+		PGresult *queryResult = NULL;
+		int executeResult = 0;
 
 		StringInfo workerAppendQuery = makeStringInfo();
 		appendStringInfo(workerAppendQuery, WORKER_APPEND_TABLE_TO_SHARD,
@@ -271,43 +278,20 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 						 quote_literal_cstr(sourceTableName),
 						 quote_literal_cstr(sourceNodeName), sourceNodePort);
 
-		/* inserting data should be performed by the current user */
-		queryResultList = ExecuteRemoteQuery(workerName, workerPort, NULL,
-											 workerAppendQuery);
-		if (queryResultList != NIL)
+		RemoteTransactionBeginIfNecessary(connection);
+
+		executeResult = ExecuteOptionalRemoteCommand(connection, workerAppendQuery->data,
+													 &queryResult);
+		PQclear(queryResult);
+		ForgetResults(connection);
+
+		if (executeResult != 0)
 		{
-			succeededPlacementList = lappend(succeededPlacementList, shardPlacement);
-		}
-		else
-		{
-			failedPlacementList = lappend(failedPlacementList, shardPlacement);
+			MarkRemoteTransactionFailed(connection, false);
 		}
 	}
 
-	/* before updating metadata, check that we appended to at least one shard */
-	if (succeededPlacementList == NIL)
-	{
-		ereport(ERROR, (errmsg("could not append table to any shard placement")));
-	}
-
-	/* make sure we don't process cancel signals */
-	HOLD_INTERRUPTS();
-
-	/* mark shard placements that we couldn't append to as inactive */
-	foreach(failedPlacementCell, failedPlacementList)
-	{
-		ShardPlacement *placement = (ShardPlacement *) lfirst(failedPlacementCell);
-		uint64 placementId = placement->placementId;
-		char *workerName = placement->nodeName;
-		uint32 workerPort = placement->nodePort;
-
-		UpdateShardPlacementState(placementId, FILE_INACTIVE);
-
-		ereport(WARNING, (errmsg("could not append table to shard \"%s\" on node "
-								 "\"%s:%u\"", shardQualifiedName, workerName,
-								 workerPort),
-						  errdetail("Marking this shard placement as inactive")));
-	}
+	MarkFailedShardPlacements();
 
 	/* update shard statistics and get new shard size */
 	newShardSize = UpdateShardStatistics(shardId);
@@ -315,8 +299,6 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 	/* calculate ratio of current shard size compared to shard max size */
 	shardMaxSizeInBytes = (int64) ShardMaxSize * 1024L;
 	shardFillLevel = ((float4) newShardSize / (float4) shardMaxSizeInBytes);
-
-	RESUME_INTERRUPTS();
 
 	PG_RETURN_FLOAT4(shardFillLevel);
 }
@@ -570,10 +552,8 @@ UpdateShardStatistics(int64 shardId)
 	foreach(shardPlacementCell, shardPlacementList)
 	{
 		ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
-		char *workerName = placement->nodeName;
-		uint32 workerPort = placement->nodePort;
 
-		statsOK = WorkerShardStats(workerName, workerPort, relationId, shardQualifiedName,
+		statsOK = WorkerShardStats(placement, relationId, shardQualifiedName,
 								   &shardSize, &minValue, &maxValue);
 		if (statsOK)
 		{
@@ -636,7 +616,7 @@ UpdateShardStatistics(int64 shardId)
  * we assume have changed after new table data have been appended to the shard.
  */
 static bool
-WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardName,
+WorkerShardStats(ShardPlacement *placement, Oid relationId, char *shardName,
 				 uint64 *shardSize, text **shardMinValue, text **shardMaxValue)
 {
 	char *quotedShardName = NULL;
@@ -649,11 +629,7 @@ WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardNam
 	char *partitionColumnName = NULL;
 	StringInfo partitionValueQuery = makeStringInfo();
 
-	int32 connectionId = -1;
-	bool queryOK = false;
-	void *queryResult = NULL;
-	int rowCount = 0;
-	int columnCount = 0;
+	PGresult *queryResult = NULL;
 	const int minValueIndex = 0;
 	const int maxValueIndex = 1;
 
@@ -663,15 +639,15 @@ WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardNam
 	bool minValueIsNull = false;
 	bool maxValueIsNull = false;
 
+	int connectionFlags = 0;
+	int executeCommand = 0;
+
+	MultiConnection *connection = GetPlacementConnection(connectionFlags, placement,
+														 NULL);
+
 	*shardSize = 0;
 	*shardMinValue = NULL;
 	*shardMaxValue = NULL;
-
-	connectionId = MultiClientConnect(nodeName, nodePort, NULL, NULL);
-	if (connectionId == INVALID_CONNECTION_ID)
-	{
-		return false;
-	}
 
 	quotedShardName = quote_literal_cstr(shardName);
 
@@ -685,18 +661,18 @@ WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardNam
 		appendStringInfo(tableSizeQuery, SHARD_TABLE_SIZE_QUERY, quotedShardName);
 	}
 
-	queryOK = MultiClientExecute(connectionId, tableSizeQuery->data,
-								 &queryResult, &rowCount, &columnCount);
-	if (!queryOK)
+	executeCommand = ExecuteOptionalRemoteCommand(connection, tableSizeQuery->data,
+												  &queryResult);
+	if (executeCommand != 0)
 	{
-		MultiClientDisconnect(connectionId);
 		return false;
 	}
 
-	tableSizeString = MultiClientGetValue(queryResult, 0, 0);
+	tableSizeString = PQgetvalue(queryResult, 0, 0);
 	if (tableSizeString == NULL)
 	{
-		MultiClientDisconnect(connectionId);
+		PQclear(queryResult);
+		ForgetResults(connection);
 		return false;
 	}
 
@@ -704,20 +680,19 @@ WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardNam
 	tableSize = strtoull(tableSizeString, &tableSizeStringEnd, 0);
 	if (errno != 0 || (*tableSizeStringEnd) != '\0')
 	{
-		MultiClientClearResult(queryResult);
-		MultiClientDisconnect(connectionId);
+		PQclear(queryResult);
+		ForgetResults(connection);
 		return false;
 	}
 
 	*shardSize = tableSize;
 
-	MultiClientClearResult(queryResult);
+	PQclear(queryResult);
+	ForgetResults(connection);
 
 	if (partitionType != DISTRIBUTE_BY_APPEND)
 	{
 		/* we don't need min/max for non-append distributed tables */
-		MultiClientDisconnect(connectionId);
-
 		return true;
 	}
 
@@ -728,28 +703,27 @@ WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardNam
 	appendStringInfo(partitionValueQuery, SHARD_RANGE_QUERY,
 					 partitionColumnName, partitionColumnName, shardName);
 
-	queryOK = MultiClientExecute(connectionId, partitionValueQuery->data,
-								 &queryResult, &rowCount, &columnCount);
-	if (!queryOK)
+	executeCommand = ExecuteOptionalRemoteCommand(connection, partitionValueQuery->data,
+												  &queryResult);
+	if (executeCommand != 0)
 	{
-		MultiClientDisconnect(connectionId);
 		return false;
 	}
 
-	minValueIsNull = MultiClientValueIsNull(queryResult, 0, minValueIndex);
-	maxValueIsNull = MultiClientValueIsNull(queryResult, 0, maxValueIndex);
+	minValueIsNull = PQgetisnull(queryResult, 0, minValueIndex);
+	maxValueIsNull = PQgetisnull(queryResult, 0, maxValueIndex);
 
 	if (!minValueIsNull && !maxValueIsNull)
 	{
-		char *minValueResult = MultiClientGetValue(queryResult, 0, minValueIndex);
-		char *maxValueResult = MultiClientGetValue(queryResult, 0, maxValueIndex);
+		char *minValueResult = PQgetvalue(queryResult, 0, minValueIndex);
+		char *maxValueResult = PQgetvalue(queryResult, 0, maxValueIndex);
 
 		*shardMinValue = cstring_to_text(minValueResult);
 		*shardMaxValue = cstring_to_text(maxValueResult);
 	}
 
-	MultiClientClearResult(queryResult);
-	MultiClientDisconnect(connectionId);
+	PQclear(queryResult);
+	ForgetResults(connection);
 
 	return true;
 }

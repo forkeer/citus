@@ -44,6 +44,7 @@
 #include "distributed/listutils.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/worker_manager.h"
 #include "foreign/foreign.h"
@@ -63,13 +64,12 @@
 
 /* Shard related configuration */
 int ShardCount = 32;
-int ShardReplicationFactor = 2; /* desired replication factor for shards */
+int ShardReplicationFactor = 1; /* desired replication factor for shards */
 int ShardMaxSize = 1048576;     /* maximum size in KB one shard can grow to */
 int ShardPlacementPolicy = SHARD_PLACEMENT_ROUND_ROBIN;
 
 
 static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor);
-static char * SchemaOwner(Oid schemaId);
 
 
 /* exports for SQL callable functions */
@@ -261,8 +261,13 @@ master_get_table_ddl_events(PG_FUNCTION_ARGS)
 Datum
 master_get_new_shardid(PG_FUNCTION_ARGS)
 {
-	uint64 shardId = GetNextShardId();
-	Datum shardIdDatum = Int64GetDatum(shardId);
+	uint64 shardId = 0;
+	Datum shardIdDatum = 0;
+
+	EnsureCoordinator();
+
+	shardId = GetNextShardId();
+	shardIdDatum = Int64GetDatum(shardId);
 
 	PG_RETURN_DATUM(shardIdDatum);
 }
@@ -302,10 +307,9 @@ GetNextShardId()
 
 
 /*
- * master_get_new_placementid allocates and returns a unique placementId for
- * the placement to be created. This allocation occurs both in shared memory
- * and in write ahead logs; writing to logs avoids the risk of having shardId
- * collisions.
+ * master_get_new_placementid is a user facing wrapper function around
+ * GetNextPlacementId() which allocates and returns a unique placement id for the
+ * placement to be created.
  *
  * NB: This can be called by any user; for now we have decided that that's
  * ok. We might want to restrict this to users part of a specific role or such
@@ -314,22 +318,50 @@ GetNextShardId()
 Datum
 master_get_new_placementid(PG_FUNCTION_ARGS)
 {
+	uint64 placementId = 0;
+	Datum placementIdDatum = 0;
+
+	EnsureCoordinator();
+
+	placementId = GetNextPlacementId();
+	placementIdDatum = Int64GetDatum(placementId);
+
+	PG_RETURN_DATUM(placementIdDatum);
+}
+
+
+/*
+ * GetNextPlacementId allocates and returns a unique placementId for
+ * the placement to be created. This allocation occurs both in shared memory
+ * and in write ahead logs; writing to logs avoids the risk of having shardId
+ * collisions.
+ *
+ * NB: This can be called by any user; for now we have decided that that's
+ * ok. We might want to restrict this to users part of a specific role or such
+ * at some later point.
+ */
+uint64
+GetNextPlacementId(void)
+{
 	text *sequenceName = cstring_to_text(PLACEMENTID_SEQUENCE_NAME);
 	Oid sequenceId = ResolveRelationId(sequenceName);
 	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
-	Datum shardIdDatum = 0;
+	Datum placementIdDatum = 0;
+	uint64 placementId = 0;
 
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 
-	/* generate new and unique shardId from sequence */
-	shardIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
+	/* generate new and unique placement id from sequence */
+	placementIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
-	PG_RETURN_DATUM(shardIdDatum);
+	placementId = DatumGetInt64(placementIdDatum);
+
+	return placementId;
 }
 
 
@@ -610,7 +642,7 @@ GetTableDDLEvents(Oid relationId)
 	ListCell *sequenceIdCell;
 	char *tableSchemaDef = NULL;
 	char *tableColumnOptionsDef = NULL;
-	char *schemaName = NULL;
+	char *createSchemaCommand = NULL;
 	Oid schemaId = InvalidOid;
 
 	Relation pgIndex = NULL;
@@ -645,14 +677,10 @@ GetTableDDLEvents(Oid relationId)
 
 	/* create schema if the table is not in the default namespace (public) */
 	schemaId = get_rel_namespace(relationId);
-	schemaName = get_namespace_name(schemaId);
-	if (strncmp(schemaName, "public", NAMEDATALEN) != 0)
+	createSchemaCommand = CreateSchemaDDLCommand(schemaId);
+	if (createSchemaCommand != NULL)
 	{
-		StringInfo schemaNameDef = makeStringInfo();
-		char *ownerName = SchemaOwner(schemaId);
-		appendStringInfo(schemaNameDef, CREATE_SCHEMA_COMMAND, schemaName, ownerName);
-
-		tableDDLEventList = lappend(tableDDLEventList, schemaNameDef->data);
+		tableDDLEventList = lappend(tableDDLEventList, createSchemaCommand);
 	}
 
 	/* create sequences if needed */
@@ -848,11 +876,11 @@ ShardStorageType(Oid relationId)
 
 
 /*
- * SchemaNode function returns true if this node is identified as the
+ * IsCoordinator function returns true if this node is identified as the
  * schema/coordinator/master node of the cluster.
  */
 bool
-SchemaNode(void)
+IsCoordinator(void)
 {
 	return (GetLocalGroupId() == 0);
 }
@@ -882,48 +910,4 @@ WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor)
 	workerNodeDatum = HeapTupleGetDatum(workerNodeTuple);
 
 	return workerNodeDatum;
-}
-
-
-/*
- * SchemaOwner returns the name of the owner of the specified schema.
- */
-char *
-SchemaOwner(Oid schemaId)
-{
-	const int scanKeyCount = 1;
-
-	Relation namespaceRelation = heap_open(NamespaceRelationId, AccessShareLock);
-	ScanKeyData scanKeyData[scanKeyCount];
-	SysScanDesc scanDescriptor = NULL;
-	HeapTuple tuple = NULL;
-	char *ownerName = NULL;
-
-	/* start scan */
-	ScanKeyInit(&scanKeyData[0],
-				ObjectIdAttributeNumber,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(schemaId));
-
-	scanDescriptor = systable_beginscan(namespaceRelation, NamespaceOidIndexId, true,
-										SnapshotSelf, 1, &scanKeyData[0]);
-	tuple = systable_getnext(scanDescriptor);
-
-	if (HeapTupleIsValid(tuple))
-	{
-		Form_pg_namespace nsptup = (Form_pg_namespace) GETSTRUCT(tuple);
-		Oid ownerId = nsptup->nspowner;
-
-		ownerName = GetUserNameFromId(ownerId, false);
-	}
-	else
-	{
-		/* if the schema is not found, then return the name of current user */
-		ownerName = GetUserNameFromId(GetUserId(), false);
-	}
-
-	systable_endscan(scanDescriptor);
-	heap_close(namespaceRelation, NoLock);
-
-	return ownerName;
 }

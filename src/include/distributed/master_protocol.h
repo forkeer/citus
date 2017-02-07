@@ -18,7 +18,9 @@
 #include "c.h"
 #include "fmgr.h"
 
+#include "distributed/shardinterval_utils.h"
 #include "nodes/pg_list.h"
+#include "distributed/master_metadata_utility.h"
 
 
 /*
@@ -69,7 +71,7 @@
 #define CREATE_SCHEMA_COMMAND "CREATE SCHEMA IF NOT EXISTS %s AUTHORIZATION %s"
 #define CREATE_EMPTY_SHARD_QUERY "SELECT master_create_empty_shard('%s')"
 #define FINALIZED_SHARD_PLACEMENTS_QUERY \
-	"SELECT nodename, nodeport FROM pg_dist_shard_placement WHERE shardstate = 1 AND shardid = %ld"
+	"SELECT placementid, nodename, nodeport FROM pg_dist_shard_placement WHERE shardstate = 1 AND shardid = %ld"
 #define UPDATE_SHARD_STATISTICS_QUERY \
 	"SELECT master_update_shard_statistics(%ld)"
 #define PARTITION_METHOD_QUERY "SELECT part_method FROM master_get_table_metadata('%s');"
@@ -91,11 +93,12 @@ extern int ShardMaxSize;
 extern int ShardPlacementPolicy;
 
 
-extern bool SchemaNode(void);
+extern bool IsCoordinator(void);
 
 /* Function declarations local to the distributed module */
 extern bool CStoreTable(Oid relationId);
 extern uint64 GetNextShardId(void);
+extern uint64 GetNextPlacementId(void);
 extern Oid ResolveRelationId(text *relationName);
 extern List * GetTableDDLEvents(Oid relationId);
 extern List * GetTableForeignConstraintCommands(Oid relationId);
@@ -116,6 +119,7 @@ extern Oid ForeignConstraintGetReferencedTableId(char *queryString);
 extern void CheckHashPartitionedTable(Oid distributedTableId);
 extern void CheckTableSchemaNameForDrop(Oid relationId, char **schemaName,
 										char **tableName);
+extern text * IntegerToText(int32 value);
 
 /* Function declarations for generating metadata for shard and placement creation */
 extern Datum master_get_table_metadata(PG_FUNCTION_ARGS);
@@ -137,9 +141,17 @@ extern Datum master_drop_all_shards(PG_FUNCTION_ARGS);
 
 /* function declarations for shard creation functionality */
 extern Datum master_create_worker_shards(PG_FUNCTION_ARGS);
+extern Datum isolate_tenant_to_new_shard(PG_FUNCTION_ARGS);
 
 /* function declarations for shard repair functionality */
 extern Datum master_copy_shard_placement(PG_FUNCTION_ARGS);
 
+/* function declarations for shard copy functinality */
+extern List * CopyShardCommandList(ShardInterval *shardInterval, char *sourceNodeName,
+								   int32 sourceNodePort);
+extern List * CopyShardForeignConstraintCommandList(ShardInterval *shardInterval);
+extern ShardPlacement * SearchShardPlacementInList(List *shardPlacementList,
+												   char *nodeName, uint32 nodePort,
+												   bool missingOk);
 
 #endif   /* MASTER_PROTOCOL_H */

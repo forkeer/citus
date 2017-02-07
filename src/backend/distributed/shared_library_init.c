@@ -20,8 +20,8 @@
 #include "executor/executor.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/connection_management.h"
-#include "distributed/commit_protocol.h"
 #include "distributed/connection_management.h"
+#include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_executor.h"
@@ -33,6 +33,8 @@
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/multi_utility.h"
+#include "distributed/pg_dist_partition.h"
+#include "distributed/placement_connection.h"
 #include "distributed/remote_commands.h"
 #include "distributed/task_tracker.h"
 #include "distributed/transaction_management.h"
@@ -60,6 +62,12 @@ static const struct config_enum_entry task_assignment_policy_options[] = {
 	{ "greedy", TASK_ASSIGNMENT_GREEDY, false },
 	{ "first-replica", TASK_ASSIGNMENT_FIRST_REPLICA, false },
 	{ "round-robin", TASK_ASSIGNMENT_ROUND_ROBIN, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry replication_model_options[] = {
+	{ "statement", REPLICATION_MODEL_COORDINATOR, false },
+	{ "streaming", REPLICATION_MODEL_STREAMING, false },
 	{ NULL, 0, false }
 };
 
@@ -160,6 +168,7 @@ _PG_init(void)
 	/* initialize coordinated transaction management */
 	InitializeTransactionManagement();
 	InitializeConnectionManagement();
+	InitPlacementConnectionManagement();
 
 	/* enable modification of pg_catalog tables during pg_upgrade */
 	if (IsBinaryUpgrade)
@@ -294,30 +303,6 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		"citus.explain_multi_logical_plan",
-		gettext_noop("Enables Explain to print out distributed logical plans."),
-		gettext_noop("We use this private configuration entry as a debugging aid. "
-					 "If enabled, the Explain command prints out the optimized "
-					 "logical plan for distributed queries."),
-		&ExplainMultiLogicalPlan,
-		false,
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.explain_multi_physical_plan",
-		gettext_noop("Enables Explain to print out distributed physical plans."),
-		gettext_noop("We use this private configuration entry as a debugging aid. "
-					 "If enabled, the Explain command prints out the physical "
-					 "plan for distributed queries."),
-		&ExplainMultiPhysicalPlan,
-		false,
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
 		"citus.explain_distributed_queries",
 		gettext_noop("Enables Explain for distributed queries."),
 		gettext_noop("When enabled, the Explain command shows remote and local "
@@ -350,6 +335,19 @@ RegisterCitusConfigVariables(void)
 		false,
 		PGC_USERSET,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_deadlock_prevention",
+		gettext_noop("Prevents transactions from expanding to multiple nodes"),
+		gettext_noop("When enabled, consecutive DML statements that write to "
+					 "shards on different nodes are prevented to avoid creating "
+					 "undetectable distributed deadlocks when performed "
+					 "concurrently."),
+		&EnableDeadlockPrevention,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -391,7 +389,7 @@ RegisterCitusConfigVariables(void)
 					 "configuration value at sharded table creation time, "
 					 "and later reuse the initially read value."),
 		&ShardReplicationFactor,
-		2, 1, 100,
+		1, 1, 100,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -579,6 +577,20 @@ RegisterCitusConfigVariables(void)
 		task_assignment_policy_options,
 		PGC_USERSET,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.replication_model",
+		gettext_noop("Sets the replication model to be used for distributed tables."),
+		gettext_noop("Depending upon the execution environment, statement- or streaming-"
+					 "based replication modes may be employed. Though most Citus deploy-"
+					 "ments will simply use statement replication, hosted and MX-style"
+					 "deployments should set this parameter to 'streaming'."),
+		&ReplicationModel,
+		REPLICATION_MODEL_COORDINATOR,
+		replication_model_options,
+		PGC_SUSET,
+		GUC_SUPERUSER_ONLY,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(

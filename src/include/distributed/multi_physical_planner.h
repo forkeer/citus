@@ -19,6 +19,7 @@
 
 #include "datatype/timestamp.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/errormessage.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/multi_logical_planner.h"
 #include "lib/stringinfo.h"
@@ -81,7 +82,8 @@ typedef enum
 	MAP_OUTPUT_FETCH_TASK = 5,
 	MERGE_FETCH_TASK = 6,
 	MODIFY_TASK = 7,
-	ROUTER_TASK = 8
+	ROUTER_TASK = 8,
+	DDL_TASK = 9
 } TaskType;
 
 
@@ -146,6 +148,11 @@ typedef struct MapMergeJob
  * fetch tasks. We also forward declare the task execution struct here to avoid
  * including the executor header files.
  *
+ * We currently do not take replication model into account for tasks other
+ * than modifications. When it is set to REPLICATION_MODEL_2PC, the execution
+ * of the modification task is done with two-phase commit. Set it to
+ * REPLICATION_MODEL_INVALID if it is not relevant for the task.
+ *
  * NB: Changing this requires also changing _outTask in citus_outfuncs and _readTask
  * in citus_readfuncs to correctly (de)serialize this struct.
  */
@@ -169,6 +176,7 @@ typedef struct Task
 	uint64 shardId;                /* only applies to shard fetch tasks */
 	TaskExecution *taskExecution;  /* used by task tracker executor */
 	bool upsertQuery;              /* only applies to modify tasks */
+	char replicationModel;         /* only applies to modify tasks */
 
 	bool insertSelectQuery;
 	List *relationShardList;       /* only applies INSERT/SELECT tasks */
@@ -209,6 +217,13 @@ typedef struct MultiPlan
 	Query *masterQuery;
 	char *masterTableName;
 	bool routerExecutable;
+
+	/*
+	 * NULL if this a valid plan, an error description otherwise. This will
+	 * e.g. be set if SQL features are present that a planner doesn't support,
+	 * or if prepared statement parameters prevented successful planning.
+	 */
+	DeferredErrorMessage *planningError;
 } MultiPlan;
 
 
