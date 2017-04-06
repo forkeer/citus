@@ -39,7 +39,7 @@ INSERT INTO raw_events_first (user_id, time, value_1, value_2, value_3, value_4)
 INSERT INTO raw_events_first (user_id, time, value_1, value_2, value_3, value_4) VALUES
                          (6, now(), 60, 600, 6000.1, 60000);
 
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- raw table to raw table
 INSERT INTO raw_events_second  SELECT * FROM raw_events_first;
@@ -144,7 +144,7 @@ INSERT INTO raw_events_first (user_id, time) VALUES
                          (7, now());
 
 -- try a single shard query
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 INSERT INTO raw_events_second (user_id, time) SELECT user_id, time FROM raw_events_first WHERE user_id = 7;
 
 
@@ -156,7 +156,7 @@ INSERT INTO raw_events_first (user_id, time, value_1, value_2, value_3, value_4)
 
 
 -- reorder columns
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 INSERT INTO raw_events_second (value_2, value_1, value_3, value_4, user_id, time) 
 SELECT 
    value_2, value_1, value_3, value_4, user_id, time 
@@ -191,7 +191,7 @@ INSERT INTO raw_events_first (user_id, time, value_1, value_2, value_3, value_4)
 
 
 -- show that RETURNING also works
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 INSERT INTO raw_events_second (user_id, value_1, value_3) 
 SELECT 
    user_id, value_1, value_3
@@ -326,6 +326,57 @@ WHERE  user_id IN (SELECT user_id
                    FROM   raw_events_second
                    WHERE  user_id = 2);
 
+INSERT INTO raw_events_second
+             (user_id)
+SELECT user_id
+FROM   raw_events_first
+WHERE  user_id IN (SELECT user_id
+                   FROM   raw_events_second
+                   WHERE  user_id != 2 AND value_1 = 2000)
+ON conflict (user_id, value_1) DO NOTHING;
+
+INSERT INTO raw_events_second
+            (user_id)
+SELECT user_id
+FROM   raw_events_first
+WHERE  user_id IN (SELECT user_id
+                   FROM  raw_events_second WHERE false);
+
+INSERT INTO raw_events_second
+            (user_id)
+SELECT user_id
+FROM   raw_events_first
+WHERE  user_id IN (SELECT user_id
+                  FROM   raw_events_second
+                   WHERE value_1 = 1000 OR value_1 = 2000 OR value_1 = 3000);
+
+-- lets mix subqueries in FROM clause and subqueries in WHERE
+INSERT INTO agg_events
+            (user_id)
+SELECT f2.id FROM
+
+(SELECT
+      id
+FROM   (SELECT reference_table.user_id      AS id
+        FROM   raw_events_first,
+               reference_table
+        WHERE  raw_events_first.user_id = reference_table.user_id ) AS foo) as f
+INNER JOIN
+(SELECT v4,
+       v1,
+       id
+FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
+               SUM(raw_events_first.value_1) AS v1,
+               raw_events_second.user_id      AS id
+        FROM   raw_events_first,
+               raw_events_second
+        WHERE  raw_events_first.user_id = raw_events_second.user_id
+        GROUP  BY raw_events_second.user_id
+        HAVING SUM(raw_events_second.value_4) > 1000) AS foo2 ) as f2
+ON (f.id = f2.id)
+WHERE f.id IN (SELECT user_id
+               FROM   raw_events_second);
+
 -- some UPSERTS
 INSERT INTO agg_events AS ae 
             (
@@ -411,7 +462,7 @@ SELECT t1.user_id AS col1,
   ORDER  BY t1.user_id,
             t2.user_id;
 
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 -- we insert 10 rows since we filtered out
 -- NULL partition column values
 INSERT INTO agg_events (user_id, value_1_agg)
@@ -433,7 +484,7 @@ ORDER BY
 -- we don't want to see constraint vialotions, so truncate first
 SET client_min_messages TO INFO;
 TRUNCATE agg_events;
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- DISTINCT clause
 INSERT INTO agg_events (value_1_agg, user_id)
@@ -445,7 +496,7 @@ INSERT INTO agg_events (value_1_agg, user_id)
 -- we don't want to see constraint vialotions, so truncate first
 SET client_min_messages TO INFO;
 truncate agg_events;
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- we do not support DISTINCT ON clauses
 INSERT INTO agg_events (value_1_agg, user_id)
@@ -496,7 +547,191 @@ FROM
   ((SELECT user_id FROM raw_events_first WHERE user_id = 15) EXCEPT
    (SELECT user_id FROM raw_events_second where user_id = 17)) as foo;
 
--- unsupported JOIN
+-- some supported LEFT joins
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first  LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id;
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_second.user_id
+ FROM
+   reference_table LEFT JOIN raw_events_second ON reference_table.user_id = raw_events_second.user_id;
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id
+   WHERE raw_events_first.user_id = 10;
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id
+   WHERE raw_events_second.user_id = 10 OR raw_events_second.user_id = 11;
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id
+   WHERE raw_events_first.user_id = 10 AND raw_events_first.user_id = 20;
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id
+   WHERE raw_events_first.user_id = 10 AND raw_events_second.user_id = 20;
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id
+   WHERE raw_events_first.user_id IN (19, 20, 21);
+ 
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.user_id
+   WHERE raw_events_second.user_id IN (19, 20, 21);
+ 
+ -- the following is a very tricky query for Citus
+ -- although we do not support pushing down JOINs on non-partition
+ -- columns here it is safe to push it down given that we're looking for
+ -- a specific value (i.e., value_1 = 12) on the joining column.
+ -- Note that the query always hits the same shard on raw_events_second
+ -- and this query wouldn't have worked if we're to use different worker
+ -- count or shard replication factor
+ INSERT INTO agg_events 
+             (user_id) 
+ SELECT raw_events_first.user_id 
+ FROM   raw_events_first, 
+        raw_events_second 
+ WHERE  raw_events_second.user_id = raw_events_first.value_1 
+        AND raw_events_first.value_1 = 12; 
+ 
+ -- some unsupported LEFT/INNER JOINs
+ -- JOIN on one table with partition column other is not
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.value_1;
+ 
+ -- same as the above with INNER JOIN
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.value_1;
+ 
+ -- a not meaningful query
+ INSERT INTO agg_events 
+             (user_id) 
+ SELECT raw_events_second.user_id 
+ FROM   raw_events_first, 
+        raw_events_second 
+ WHERE  raw_events_first.user_id = raw_events_first.value_1; 
+ 
+ -- both tables joined on non-partition columns
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first LEFT JOIN raw_events_second ON raw_events_first.value_1 = raw_events_second.value_1;
+ 
+ -- same as the above with INNER JOIN
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.value_1 = raw_events_second.value_1;
+ 
+-- even if there is a filter on the partition key, since the join is not on the partition key we reject
+-- this query
+INSERT INTO agg_events (user_id)
+SELECT
+  raw_events_first.user_id
+FROM
+  raw_events_first LEFT JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.value_1
+WHERE 
+  raw_events_first.user_id = 10;
+ 
+ -- same as the above with INNER JOIN
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.value_1
+ WHERE raw_events_first.user_id = 10;
+ 
+ -- make things a bit more complicate with IN clauses
+ INSERT INTO agg_events (user_id)
+ SELECT
+   raw_events_first.user_id
+ FROM
+   raw_events_first INNER JOIN raw_events_second ON raw_events_first.user_id = raw_events_second.value_1
+   WHERE raw_events_first.value_1 IN (10, 11,12) OR raw_events_second.user_id IN (1,2,3,4);
+ 
+ -- implicit join on non partition column should also not be pushed down
+ INSERT INTO agg_events 
+             (user_id) 
+ SELECT raw_events_first.user_id 
+ FROM   raw_events_first, 
+        raw_events_second 
+ WHERE  raw_events_second.user_id = raw_events_first.value_1; 
+ 
+ -- the following is again a tricky query for Citus
+ -- if the given filter was on value_1 as shown in the above, Citus could
+ -- push it down. But here the query is refused
+ INSERT INTO agg_events 
+             (user_id) 
+ SELECT raw_events_first.user_id 
+ FROM   raw_events_first, 
+        raw_events_second 
+ WHERE  raw_events_second.user_id = raw_events_first.value_1 
+        AND raw_events_first.value_2 = 12;
+ 
+ -- lets do some unsupported query tests with subqueries
+ -- foo is not joined on the partition key so the query is not 
+ -- pushed down
+ INSERT INTO agg_events
+             (user_id, value_4_agg)
+ SELECT
+   outer_most.id, max(outer_most.value)
+ FROM
+ (
+   SELECT f2.id as id, f2.v4 as value FROM
+     (SELECT
+           id
+       FROM   (SELECT reference_table.user_id      AS id
+                FROM   raw_events_first LEFT JOIN
+                       reference_table
+             ON (raw_events_first.value_1 = reference_table.user_id)) AS foo) as f
+   INNER JOIN
+     (SELECT v4,
+           v1,
+           id
+     FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
+                SUM(raw_events_first.value_1) AS v1,
+                raw_events_second.user_id      AS id
+             FROM   raw_events_first,
+                     raw_events_second
+             WHERE  raw_events_first.user_id = raw_events_second.user_id
+             GROUP  BY raw_events_second.user_id
+             HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
+ ON (f.id = f2.id)) as outer_most
+ GROUP BY
+   outer_most.id;
+
+
 INSERT INTO agg_events
             (value_4_agg,
              value_1_agg,
@@ -619,7 +854,8 @@ ON (f.id = f2.id);
 
 
 -- the second part of the query is not routable since
--- no GROUP BY on the partition column
+-- GROUP BY not on the partition column (i.e., value_1) and thus join
+-- on f.id = f2.id is not on the partition key (instead on the sum of partition key)
 INSERT INTO agg_events
             (user_id)
 SELECT f.id FROM
@@ -671,6 +907,163 @@ outer_most.id, max(outer_most.value)
             HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
 ON (f.id != f2.id)) as outer_most
 GROUP BY outer_most.id;
+
+
+-- cannot pushdown since foo2 is not join on partition key
+INSERT INTO agg_events
+            (user_id, value_4_agg)
+SELECT
+  outer_most.id, max(outer_most.value)
+FROM
+(
+  SELECT f2.id as id, f2.v4 as value FROM
+    (SELECT
+          id
+      FROM   (SELECT reference_table.user_id      AS id
+               FROM   raw_events_first,
+                      reference_table
+            WHERE  raw_events_first.user_id = reference_table.user_id ) AS foo) as f
+  INNER JOIN
+    (SELECT v4,
+          v1,
+          id
+    FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
+               SUM(raw_events_first.value_1) AS v1,
+               raw_events_second.user_id      AS id
+            FROM   raw_events_first,
+                    raw_events_second
+            WHERE  raw_events_first.user_id = raw_events_second.value_1
+            GROUP  BY raw_events_second.user_id
+            HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
+ON (f.id = f2.id)) as outer_most
+GROUP BY
+  outer_most.id;
+
+-- cannot push down since foo doesn't have en equi join
+INSERT INTO agg_events
+            (user_id, value_4_agg)
+SELECT
+  outer_most.id, max(outer_most.value)
+FROM
+(
+  SELECT f2.id as id, f2.v4 as value FROM
+    (SELECT
+          id
+      FROM   (SELECT reference_table.user_id      AS id
+               FROM   raw_events_first,
+                      reference_table
+            WHERE  raw_events_first.user_id != reference_table.user_id ) AS foo) as f
+  INNER JOIN
+    (SELECT v4,
+          v1,
+          id
+    FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
+               SUM(raw_events_first.value_1) AS v1,
+               raw_events_second.user_id      AS id
+            FROM   raw_events_first,
+                    raw_events_second
+            WHERE  raw_events_first.user_id = raw_events_second.user_id
+            GROUP  BY raw_events_second.user_id
+            HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
+ON (f.id = f2.id)) as outer_most
+GROUP BY
+  outer_most.id;
+
+
+-- some unsupported LATERAL JOINs
+-- join on averages is not on the partition key
+INSERT INTO agg_events (user_id, value_4_agg)
+SELECT
+  averages.user_id, avg(averages.value_4)
+FROM
+    (SELECT
+      raw_events_second.user_id
+    FROM
+      reference_table JOIN raw_events_second on (reference_table.user_id = raw_events_second.user_id)
+    ) reference_ids
+  JOIN LATERAL
+    (SELECT
+      user_id, value_4
+    FROM
+      raw_events_first WHERE
+      value_4 = reference_ids.user_id) as averages ON true
+    GROUP BY averages.user_id;
+
+-- join among reference_ids and averages is not on the partition key
+INSERT INTO agg_events (user_id, value_4_agg)
+SELECT
+  averages.user_id, avg(averages.value_4)
+FROM
+    (SELECT
+      raw_events_second.user_id
+    FROM
+      reference_table JOIN raw_events_second on (reference_table.user_id = raw_events_second.user_id)
+    ) reference_ids
+  JOIN LATERAL
+    (SELECT
+      user_id, value_4
+    FROM
+      raw_events_first) as averages ON averages.value_4 = reference_ids.user_id
+    GROUP BY averages.user_id;
+
+-- join among the agg_ids and averages is not on the partition key
+INSERT INTO agg_events (user_id, value_4_agg)
+SELECT
+  averages.user_id, avg(averages.value_4)
+FROM
+    (SELECT
+      raw_events_second.user_id
+    FROM
+      reference_table JOIN raw_events_second on (reference_table.user_id = raw_events_second.user_id)
+    ) reference_ids
+  JOIN LATERAL
+    (SELECT
+      user_id, value_4
+    FROM
+      raw_events_first) as averages ON averages.user_id = reference_ids.user_id
+JOIN LATERAL
+    (SELECT user_id, value_4 FROM agg_events) as agg_ids ON (agg_ids.value_4 = averages.user_id)
+    GROUP BY averages.user_id;
+
+-- not supported subqueries in WHERE clause
+-- since the selected value in the WHERE is not
+-- partition key  
+INSERT INTO raw_events_second
+            (user_id)
+SELECT user_id
+FROM   raw_events_first
+WHERE  user_id IN (SELECT value_1
+                   FROM   raw_events_second);
+
+-- same as above but slightly more complex
+-- since it also includes subquery in FROM as well
+INSERT INTO agg_events
+            (user_id)
+SELECT f2.id FROM
+
+(SELECT
+      id
+FROM   (SELECT reference_table.user_id      AS id
+        FROM   raw_events_first,
+               reference_table
+        WHERE  raw_events_first.user_id = reference_table.user_id ) AS foo) as f
+INNER JOIN
+(SELECT v4,
+       v1,
+       id
+FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
+               SUM(raw_events_first.value_1) AS v1,
+               raw_events_second.user_id      AS id
+        FROM   raw_events_first,
+               raw_events_second
+        WHERE  raw_events_first.user_id = raw_events_second.user_id
+        GROUP  BY raw_events_second.user_id
+        HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
+ON (f.id = f2.id)
+WHERE f.id IN (SELECT value_1
+               FROM   raw_events_second);
+
+
 
 -- we currently not support grouping sets
 INSERT INTO agg_events
@@ -757,14 +1150,14 @@ INSERT INTO test_view SELECT * FROM raw_events_second;
 -- we need this in our next test
 truncate raw_events_first;
 
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- first show that the query works now
 INSERT INTO raw_events_first SELECT * FROM raw_events_second;
 
 SET client_min_messages TO INFO;
 truncate raw_events_first;
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- now show that it works for a single shard query as well
 INSERT INTO raw_events_first SELECT * FROM raw_events_second WHERE user_id = 5;
@@ -774,7 +1167,7 @@ SET client_min_messages TO INFO;
 -- if a single shard of the SELECT is unhealty, the query should fail
 UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 13300004 AND nodeport = :worker_1_port;
 truncate raw_events_first;
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- this should fail
 INSERT INTO raw_events_first SELECT * FROM raw_events_second;
@@ -793,14 +1186,14 @@ UPDATE pg_dist_shard_placement SET shardstate = 1 WHERE shardid = 13300004 AND n
 -- now that we should show that it works if one of the target shard interval is not healthy
 UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 13300000 AND nodeport = :worker_1_port;
 truncate raw_events_first;
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- this should work
 INSERT INTO raw_events_first SELECT * FROM raw_events_second;
 
 SET client_min_messages TO INFO;
 truncate raw_events_first;
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- this should also work
 INSERT INTO raw_events_first SELECT * FROM raw_events_second WHERE user_id = 5;
@@ -824,7 +1217,7 @@ SET citus.shard_count = 2;
 SELECT create_distributed_table('table_with_defaults', 'store_id');
 
 -- let's see the queries
-SET client_min_messages TO DEBUG4;
+SET client_min_messages TO DEBUG2;
 
 -- a very simple query
 INSERT INTO table_with_defaults SELECT * FROM table_with_defaults;

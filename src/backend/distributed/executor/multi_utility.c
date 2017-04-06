@@ -24,9 +24,11 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/index.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
+#include "citus_version.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/prepare.h"
@@ -81,7 +83,6 @@
 
 bool EnableDDLPropagation = true; /* ddl propagation is enabled */
 
-
 /*
  * This struct defines the state for the callback for drop statements.
  * It is copied as it is from commands/tablecmds.c in Postgres source.
@@ -94,6 +95,10 @@ struct DropRelationCallbackState
 };
 
 
+/* Local functions forward declarations for deciding when to perform processing/checks */
+static bool SkipCitusProcessingForUtility(Node *parsetree);
+static bool IsCitusExtensionStmt(Node *parsetree);
+
 /* Local functions forward declarations for Transmit statement */
 static bool IsTransmitStmt(Node *parsetree);
 static void VerifyTransmitStmt(CopyStmt *copyStatement);
@@ -101,17 +106,16 @@ static void VerifyTransmitStmt(CopyStmt *copyStatement);
 /* Local functions forward declarations for processing distributed table commands */
 static Node * ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag,
 							  bool *commandMustRunAsOwner);
-static Node * ProcessIndexStmt(IndexStmt *createIndexStatement,
-							   const char *createIndexCommand, bool isTopLevel);
-static Node * ProcessDropIndexStmt(DropStmt *dropIndexStatement,
-								   const char *dropIndexCommand, bool isTopLevel);
-static Node * ProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
-									const char *alterTableCommand, bool isTopLevel);
+static List * PlanIndexStmt(IndexStmt *createIndexStatement,
+							const char *createIndexCommand);
+static List * PlanDropIndexStmt(DropStmt *dropIndexStatement,
+								const char *dropIndexCommand);
+static List * PlanAlterTableStmt(AlterTableStmt *alterTableStatement,
+								 const char *alterTableCommand);
 static Node * WorkerProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
 										  const char *alterTableCommand);
-static Node * ProcessAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
-										   const char *alterObjectSchemaCommand,
-										   bool isTopLevel);
+static List * PlanAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
+										const char *alterObjectSchemaCommand);
 static void ProcessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand);
 static bool IsSupportedDistributedVacuumStmt(Oid relationId, VacuumStmt *vacuumStmt);
 static List * VacuumTaskList(Oid relationId, VacuumStmt *vacuumStmt);
@@ -120,6 +124,7 @@ static char * DeparseVacuumColumnNames(List *columnNameList);
 
 
 /* Local functions forward declarations for unsupported command checks */
+static void ErrorIfUnstableCreateOrAlterExtensionStmt(Node *parsetree);
 static void ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement);
 static void ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement);
 static void ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement);
@@ -130,37 +135,34 @@ static bool OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId);
 static void ErrorIfDistributedRenameStmt(RenameStmt *renameStatement);
 
 /* Local functions forward declarations for helper functions */
+static char * ExtractNewExtensionVersion(Node *parsetree);
 static void CreateLocalTable(RangeVar *relation, char *nodeName, int32 nodePort);
 static bool IsAlterTableRenameStmt(RenameStmt *renameStatement);
-static void ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString,
-										 bool isTopLevel);
-static void ExecuteDistributedForeignKeyCommand(Oid leftRelationId, Oid rightRelationId,
-												const char *ddlCommandString,
-												bool isTopLevel);
+static void ExecuteDistributedDDLJob(DDLJob *ddlJob);
 static void ShowNoticeIfNotUsing2PC(void);
 static List * DDLTaskList(Oid relationId, const char *commandString);
+static List * CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt);
+static List * DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt);
 static List * ForeignKeyTaskList(Oid leftRelationId, Oid rightRelationId,
 								 const char *commandString);
 static void RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 										 void *arg);
 static void CheckCopyPermissions(CopyStmt *copyStatement);
 static List * CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
+static void PostProcessUtility(Node *parsetree);
 
 
 static bool warnedUserAbout2PC = false;
 
 
 /*
- * Utility for handling citus specific concerns around utility statements.
- *
- * There's two basic types of concerns here:
- * 1) Intercept utility statements that run after distributed query
- *    execution. At this stage, the Create Table command for the master node's
- *    temporary table has been executed, and this table's relationId is
- *    visible to us. We can therefore update the relationId in master node's
- *    select query.
- * 2) Handle utility statements on distributed tables that the core code can't
- *    handle.
+ * multi_ProcessUtility is the main entry hook for implementing Citus-specific
+ * utility behavior. Its primary responsibilities are intercepting COPY and DDL
+ * commands and augmenting the coordinator's command with corresponding tasks
+ * to be run on worker nodes, after suitably ensuring said commands' options
+ * are fully supported by Citus. Much of the DDL behavior is toggled by Citus'
+ * enable_ddl_propagation GUC. In addition to DDL and COPY, utilities such as
+ * TRUNCATE and VACUUM are also supported.
  */
 void
 multi_ProcessUtility(Node *parsetree,
@@ -173,17 +175,20 @@ multi_ProcessUtility(Node *parsetree,
 	bool commandMustRunAsOwner = false;
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
+	List *ddlJobs = NIL;
+	bool skipCitusProcessing = SkipCitusProcessingForUtility(parsetree);
 
-	if (IsA(parsetree, TransactionStmt))
+	if (skipCitusProcessing)
 	{
-		/*
-		 * Transaction statements (e.g. ABORT, COMMIT) can be run in aborted
-		 * transactions in which case a lot of checks cannot be done safely in
-		 * that state. Since we never need to intercept transaction statements,
-		 * skip our checks and immediately fall into standard_ProcessUtility.
-		 */
+		bool checkExtensionVersion = IsCitusExtensionStmt(parsetree);
+
 		standard_ProcessUtility(parsetree, queryString, context,
 								params, dest, completionTag);
+
+		if (EnableVersionChecks && checkExtensionVersion)
+		{
+			ErrorIfUnstableCreateOrAlterExtensionStmt(parsetree);
+		}
 
 		return;
 	}
@@ -236,6 +241,8 @@ multi_ProcessUtility(Node *parsetree,
 		}
 	}
 
+	/* we're mostly in DDL (and VACUUM/TRUNCATE) territory at this point... */
+
 	if (IsA(parsetree, CreateSeqStmt))
 	{
 		ErrorIfUnsupportedSeqStmt((CreateSeqStmt *) parsetree);
@@ -251,18 +258,12 @@ multi_ProcessUtility(Node *parsetree,
 		ErrorIfUnsupportedTruncateStmt((TruncateStmt *) parsetree);
 	}
 
-	/*
-	 * DDL commands are propagated to workers only if EnableDDLPropagation is
-	 * set to true and the current node is the coordinator
-	 */
+	/* only generate worker DDLJobs if propagation is enabled */
 	if (EnableDDLPropagation)
 	{
-		bool isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
-
 		if (IsA(parsetree, IndexStmt))
 		{
-			parsetree = ProcessIndexStmt((IndexStmt *) parsetree, queryString,
-										 isTopLevel);
+			ddlJobs = PlanIndexStmt((IndexStmt *) parsetree, queryString);
 		}
 
 		if (IsA(parsetree, DropStmt))
@@ -270,7 +271,7 @@ multi_ProcessUtility(Node *parsetree,
 			DropStmt *dropStatement = (DropStmt *) parsetree;
 			if (dropStatement->removeType == OBJECT_INDEX)
 			{
-				parsetree = ProcessDropIndexStmt(dropStatement, queryString, isTopLevel);
+				ddlJobs = PlanDropIndexStmt(dropStatement, queryString);
 			}
 		}
 
@@ -279,8 +280,7 @@ multi_ProcessUtility(Node *parsetree,
 			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parsetree;
 			if (alterTableStmt->relkind == OBJECT_TABLE)
 			{
-				parsetree = ProcessAlterTableStmt(alterTableStmt, queryString,
-												  isTopLevel);
+				ddlJobs = PlanAlterTableStmt(alterTableStmt, queryString);
 			}
 		}
 
@@ -304,8 +304,7 @@ multi_ProcessUtility(Node *parsetree,
 		if (IsA(parsetree, AlterObjectSchemaStmt))
 		{
 			AlterObjectSchemaStmt *setSchemaStmt = (AlterObjectSchemaStmt *) parsetree;
-			parsetree = ProcessAlterObjectSchemaStmt(setSchemaStmt, queryString,
-													 isTopLevel);
+			ddlJobs = PlanAlterObjectSchemaStmt(setSchemaStmt, queryString);
 		}
 
 		/*
@@ -344,7 +343,8 @@ multi_ProcessUtility(Node *parsetree,
 				 * Therefore, we check whether the given ALTER TABLE statement is a
 				 * FOREIGN KEY constraint and if so disable the validation step.
 				 * Note that validation is done on the shard level when DDL
-				 * propagation is enabled.
+				 * propagation is enabled. Unlike the preceeding Plan* calls, the
+				 * following eagerly executes some tasks on workers.
 				 */
 				parsetree = WorkerProcessAlterTableStmt(alterTableStmt, queryString);
 			}
@@ -369,73 +369,123 @@ multi_ProcessUtility(Node *parsetree,
 								 " necessary users and roles.")));
 	}
 
-	/* due to an explain-hook limitation we have to special-case EXPLAIN EXECUTE */
-	if (IsA(parsetree, ExplainStmt) && IsA(((ExplainStmt *) parsetree)->query, Query))
-	{
-		ExplainStmt *explainStmt = (ExplainStmt *) parsetree;
-		Query *query = (Query *) explainStmt->query;
-
-		if (query->commandType == CMD_UTILITY &&
-			IsA(query->utilityStmt, ExecuteStmt))
-		{
-			ExecuteStmt *execstmt = (ExecuteStmt *) query->utilityStmt;
-			PreparedStatement *entry = FetchPreparedStatement(execstmt->name, true);
-			CachedPlanSource *plansource = entry->plansource;
-			Node *parseTreeCopy;
-			Query *originalQuery;
-
-			/* copied from ExplainExecuteQuery, will never trigger if you used PREPARE */
-			if (!plansource->fixed_result)
-			{
-				ereport(ERROR, (errmsg("EXPLAIN EXECUTE does not support variable-result"
-									   " cached plans")));
-			}
-
-			parseTreeCopy = copyObject(plansource->raw_parse_tree);
-
-			originalQuery = parse_analyze(parseTreeCopy,
-										  plansource->query_string,
-										  plansource->param_types,
-										  plansource->num_params);
-
-			if (ExtractFirstDistributedTableId(originalQuery) != InvalidOid)
-			{
-				/*
-				 * since pg no longer sees EXECUTE it will use the explain hook we've
-				 * installed
-				 */
-				explainStmt->query = (Node *) originalQuery;
-				standard_ProcessUtility(parsetree, plansource->query_string, context,
-										params, dest, completionTag);
-				return;
-			}
-
-			/* if this is a normal query fall through to the usual executor */
-		}
-	}
-
+	/* set user if needed and go ahead and run local utility using standard hook */
 	if (commandMustRunAsOwner)
 	{
 		GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 		SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 	}
 
-	/* now drop into standard process utility */
 	standard_ProcessUtility(parsetree, queryString, context,
 							params, dest, completionTag);
+
+	PostProcessUtility(parsetree);
 
 	if (commandMustRunAsOwner)
 	{
 		SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 	}
 
-	/* we run VacuumStmt after standard hook to benefit from its checks and locking */
+	/* after local command has completed, finish by executing worker DDLJobs, if any */
+	if (ddlJobs != NIL)
+	{
+		ListCell *ddlJobCell = NULL;
+
+		foreach(ddlJobCell, ddlJobs)
+		{
+			DDLJob *ddlJob = (DDLJob *) lfirst(ddlJobCell);
+
+			ExecuteDistributedDDLJob(ddlJob);
+		}
+	}
+
+	/* TODO: fold VACUUM's processing into the above block */
 	if (IsA(parsetree, VacuumStmt))
 	{
 		VacuumStmt *vacuumStmt = (VacuumStmt *) parsetree;
 
 		ProcessVacuumStmt(vacuumStmt, queryString);
 	}
+}
+
+
+/*
+ * SkipCitusProcessingForUtility simply returns whether a given utility should
+ * bypass Citus processing and checks and be handled exclusively by standard
+ * PostgreSQL utility processing. At present, CREATE/ALTER/DROP EXTENSION,
+ * ABORT, COMMIT, ROLLBACK, and SET (GUC) statements are exempt from Citus.
+ */
+static bool
+SkipCitusProcessingForUtility(Node *parsetree)
+{
+	switch (parsetree->type)
+	{
+		/*
+		 * In the CitusHasBeenLoaded check, we compare versions of loaded code,
+		 * the installed extension, and available extension. If they differ, we
+		 * force user to execute ALTER EXTENSION citus UPDATE. To allow this,
+		 * CREATE/DROP/ALTER extension must be omitted from Citus processing.
+		 */
+		case T_DropStmt:
+		{
+			DropStmt *dropStatement = (DropStmt *) parsetree;
+
+			if (dropStatement->removeType != OBJECT_EXTENSION)
+			{
+				return false;
+			}
+		}
+
+		/* no break, fall through */
+
+		case T_CreateExtensionStmt:
+		case T_AlterExtensionStmt:
+
+		/*
+		 * Transaction statements (e.g. ABORT, COMMIT) can be run in aborted
+		 * transactions in which case a lot of checks cannot be done safely in
+		 * that state. Since we never need to intercept transaction statements,
+		 * skip our checks and immediately fall into standard_ProcessUtility.
+		 */
+		case T_TransactionStmt:
+
+		/*
+		 * Skip processing of variable set statements, to allow changing the
+		 * enable_version_checks GUC during testing.
+		 */
+		case T_VariableSetStmt:
+		{
+			return true;
+		}
+
+		default:
+		{
+			return false;
+		}
+	}
+}
+
+
+/*
+ * IsCitusExtensionStmt returns whether a given utility is a CREATE or ALTER
+ * EXTENSION statement which references the citus extension. This function
+ * returns false for all other inputs.
+ */
+static bool
+IsCitusExtensionStmt(Node *parsetree)
+{
+	char *extensionName = "";
+
+	if (IsA(parsetree, CreateExtensionStmt))
+	{
+		extensionName = ((CreateExtensionStmt *) parsetree)->extname;
+	}
+	else if (IsA(parsetree, AlterExtensionStmt))
+	{
+		extensionName = ((AlterExtensionStmt *) parsetree)->extname;
+	}
+
+	return (strcmp(extensionName, "citus") == 0);
 }
 
 
@@ -653,17 +703,18 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, bool *commandMustR
 
 
 /*
- * ProcessIndexStmt processes create index statements for distributed tables.
- * The function first checks if the statement belongs to a distributed table
- * or not. If it does, then it executes distributed logic for the command.
- *
- * The function returns the IndexStmt node for the command to be executed on the
- * master node table.
+ * PlanIndexStmt determines whether a given CREATE INDEX statement involves
+ * a distributed table. If so (and if the statement does not use unsupported
+ * options), it modifies the input statement to ensure proper execution against
+ * the master node table and creates a DDLJob to encapsulate information needed
+ * during the worker node portion of DDL execution before returning that DDLJob
+ * in a List. If no distributed table is involved, this function returns NIL.
  */
-static Node *
-ProcessIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand,
-				 bool isTopLevel)
+static List *
+PlanIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand)
 {
+	List *ddlJobs = NIL;
+
 	/*
 	 * We first check whether a distributed relation is affected. For that, we need to
 	 * open the relation. To prevent race conditions with later lookups, lock the table,
@@ -718,33 +769,33 @@ ProcessIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand
 			/* if index does not exist, send the command to workers */
 			if (!OidIsValid(indexRelationId))
 			{
-				ExecuteDistributedDDLCommand(relationId, createIndexCommand, isTopLevel);
-			}
-			else if (!createIndexStatement->if_not_exists)
-			{
-				/* if the index exists and there is no IF NOT EXISTS clause, error */
-				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE),
-								errmsg("relation \"%s\" already exists", indexName)));
+				DDLJob *ddlJob = palloc0(sizeof(DDLJob));
+				ddlJob->targetRelationId = relationId;
+				ddlJob->concurrentIndexCmd = createIndexStatement->concurrent;
+				ddlJob->commandString = createIndexCommand;
+				ddlJob->taskList = CreateIndexTaskList(relationId, createIndexStatement);
+
+				ddlJobs = list_make1(ddlJob);
 			}
 		}
 	}
 
-	return (Node *) createIndexStatement;
+	return ddlJobs;
 }
 
 
 /*
- * ProcessDropIndexStmt processes drop index statements for distributed tables.
- * The function first checks if the statement belongs to a distributed table
- * or not. If it does, then it executes distributed logic for the command.
- *
- * The function returns the DropStmt node for the command to be executed on the
- * master node table.
+ * PlanDropIndexStmt determines whether a given DROP INDEX statement involves
+ * a distributed table. If so (and if the statement does not use unsupported
+ * options), it modifies the input statement to ensure proper execution against
+ * the master node table and creates a DDLJob to encapsulate information needed
+ * during the worker node portion of DDL execution before returning that DDLJob
+ * in a List. If no distributed table is involved, this function returns NIL.
  */
-static Node *
-ProcessDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand,
-					 bool isTopLevel)
+static List *
+PlanDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand)
 {
+	List *ddlJobs = NIL;
 	ListCell *dropObjectCell = NULL;
 	Oid distributedIndexId = InvalidOid;
 	Oid distributedRelationId = InvalidOid;
@@ -809,28 +860,36 @@ ProcessDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand,
 
 	if (OidIsValid(distributedIndexId))
 	{
+		DDLJob *ddlJob = palloc0(sizeof(DDLJob));
+
 		ErrorIfUnsupportedDropIndexStmt(dropIndexStatement);
 
-		/* if it is supported, go ahead and execute the command */
-		ExecuteDistributedDDLCommand(distributedRelationId, dropIndexCommand, isTopLevel);
+		ddlJob->targetRelationId = distributedRelationId;
+		ddlJob->concurrentIndexCmd = dropIndexStatement->concurrent;
+		ddlJob->commandString = dropIndexCommand;
+		ddlJob->taskList = DropIndexTaskList(distributedRelationId, distributedIndexId,
+											 dropIndexStatement);
+
+		ddlJobs = list_make1(ddlJob);
 	}
 
-	return (Node *) dropIndexStatement;
+	return ddlJobs;
 }
 
 
 /*
- * ProcessAlterTableStmt processes alter table statements for distributed tables.
- * The function first checks if the statement belongs to a distributed table
- * or not. If it does, then it executes distributed logic for the command.
- *
- * The function returns the AlterTableStmt node for the command to be executed on the
- * master node table.
+ * PlanAlterTableStmt determines whether a given ALTER TABLE statement involves
+ * a distributed table. If so (and if the statement does not use unsupported
+ * options), it modifies the input statement to ensure proper execution against
+ * the master node table and creates a DDLJob to encapsulate information needed
+ * during the worker node portion of DDL execution before returning that DDLJob
+ * in a List. If no distributed table is involved, this function returns NIL.
  */
-static Node *
-ProcessAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCommand,
-					  bool isTopLevel)
+static List *
+PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCommand)
 {
+	List *ddlJobs = NIL;
+	DDLJob *ddlJob = NULL;
 	LOCKMODE lockmode = 0;
 	Oid leftRelationId = InvalidOid;
 	Oid rightRelationId = InvalidOid;
@@ -841,20 +900,20 @@ ProcessAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTabl
 	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
 	{
-		return (Node *) alterTableStatement;
+		return NIL;
 	}
 
 	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
 	leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 	if (!OidIsValid(leftRelationId))
 	{
-		return (Node *) alterTableStatement;
+		return NIL;
 	}
 
 	isDistributedRelation = IsDistributedTable(leftRelationId);
 	if (!isDistributedRelation)
 	{
-		return (Node *) alterTableStatement;
+		return NIL;
 	}
 
 	ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
@@ -899,17 +958,26 @@ ProcessAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTabl
 		}
 	}
 
+	ddlJob = palloc0(sizeof(DDLJob));
+	ddlJob->targetRelationId = leftRelationId;
+	ddlJob->concurrentIndexCmd = false;
+	ddlJob->commandString = alterTableCommand;
+
 	if (rightRelationId)
 	{
-		ExecuteDistributedForeignKeyCommand(leftRelationId, rightRelationId,
-											alterTableCommand, isTopLevel);
+		/* if foreign key related, use specialized task list function ... */
+		ddlJob->taskList = ForeignKeyTaskList(leftRelationId, rightRelationId,
+											  alterTableCommand);
 	}
 	else
 	{
-		ExecuteDistributedDDLCommand(leftRelationId, alterTableCommand, isTopLevel);
+		/* ... otherwise use standard DDL task list function */
+		ddlJob->taskList = DDLTaskList(leftRelationId, alterTableCommand);
 	}
 
-	return (Node *) alterTableStatement;
+	ddlJobs = list_make1(ddlJob);
+
+	return ddlJobs;
 }
 
 
@@ -976,21 +1044,21 @@ WorkerProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
 
 
 /*
- * ProcessAlterObjectSchemaStmt processes ALTER ... SET SCHEMA statements for distributed
- * objects. The function first checks if the statement belongs to a distributed objects
- * or not. If it does, then it checks whether given object is a table. If it is, we warn
- * out, since we do not support ALTER ... SET SCHEMA
+ * PlanAlterObjectSchemaStmt determines whether a given ALTER ... SET SCHEMA
+ * statement involves a distributed table and issues a warning if so. Because
+ * we do not support distributed ALTER ... SET SCHEMA, this function always
+ * returns NIL.
  */
-static Node *
-ProcessAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
-							 const char *alterObjectSchemaCommand, bool isTopLevel)
+static List *
+PlanAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
+						  const char *alterObjectSchemaCommand)
 {
 	Oid relationId = InvalidOid;
 	bool noWait = false;
 
 	if (alterObjectSchemaStmt->relation == NULL)
 	{
-		return (Node *) alterObjectSchemaStmt;
+		return NIL;
 	}
 
 	relationId = RangeVarGetRelidExtended(alterObjectSchemaStmt->relation,
@@ -1001,16 +1069,16 @@ ProcessAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
 	/* first check whether a distributed relation is affected */
 	if (!OidIsValid(relationId) || !IsDistributedTable(relationId))
 	{
-		return (Node *) alterObjectSchemaStmt;
+		return NIL;
 	}
 
-	/* warn out if a distributed relation is affected */
+	/* emit a warning if a distributed relation is affected */
 	ereport(WARNING, (errmsg("not propagating ALTER ... SET SCHEMA commands to "
 							 "worker nodes"),
 					  errhint("Connect to worker nodes directly to manually "
 							  "change schemas of affected objects.")));
 
-	return (Node *) alterObjectSchemaStmt;
+	return NIL;
 }
 
 
@@ -1277,6 +1345,83 @@ DeparseVacuumColumnNames(List *columnNameList)
 
 
 /*
+ * ErrorIfUnstableCreateOrAlterExtensionStmt compares CITUS_EXTENSIONVERSION
+ * and version given CREATE/ALTER EXTENSION statement will create/update to. If
+ * they are not same in major or minor version numbers, this function errors
+ * out. It ignores the schema version.
+ */
+static void
+ErrorIfUnstableCreateOrAlterExtensionStmt(Node *parsetree)
+{
+	char *newExtensionVersion = ExtractNewExtensionVersion(parsetree);
+
+	if (newExtensionVersion != NULL)
+	{
+		/*  explicit version provided in CREATE or ALTER EXTENSION UPDATE; verify */
+		if (!MajorVersionsCompatible(newExtensionVersion, CITUS_EXTENSIONVERSION))
+		{
+			ereport(ERROR, (errmsg("specified version incompatible with loaded "
+								   "Citus library"),
+							errdetail("Loaded library requires %s, but %s was specified.",
+									  CITUS_MAJORVERSION, newExtensionVersion),
+							errhint("If a newer library is present, restart the database "
+									"and try the command again.")));
+		}
+	}
+	else
+	{
+		/*
+		 * No version was specified, so PostgreSQL will use the default_version
+		 * from the citus.control file. In case a new default is available, we
+		 * will force a compatibility check of the latest available version.
+		 */
+		availableExtensionVersion = NULL;
+		ErrorIfAvailableVersionMismatch();
+	}
+}
+
+
+/*
+ * ExtractNewExtensionVersion returns the new extension version specified by
+ * a CREATE or ALTER EXTENSION statement. Other inputs are not permitted. This
+ * function returns NULL for statements with no explicit version specified.
+ */
+static char *
+ExtractNewExtensionVersion(Node *parsetree)
+{
+	char *newVersion = NULL;
+	List *optionsList = NIL;
+	ListCell *optionsCell = NULL;
+
+	if (IsA(parsetree, CreateExtensionStmt))
+	{
+		optionsList = ((CreateExtensionStmt *) parsetree)->options;
+	}
+	else if (IsA(parsetree, AlterExtensionStmt))
+	{
+		optionsList = ((AlterExtensionStmt *) parsetree)->options;
+	}
+	else
+	{
+		/* input must be one of the two above types */
+		Assert(false);
+	}
+
+	foreach(optionsCell, optionsList)
+	{
+		DefElem *defElement = (DefElem *) lfirst(optionsCell);
+		if (strncmp(defElement->defname, "new_version", NAMEDATALEN) == 0)
+		{
+			newVersion = strVal(defElement->arg);
+			break;
+		}
+	}
+
+	return newVersion;
+}
+
+
+/*
  * ErrorIfUnsupportedIndexStmt checks if the corresponding index statement is
  * supported for distributed tables and errors out if it is not.
  */
@@ -1295,13 +1440,6 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("specifying tablespaces with CREATE INDEX statements is "
-							   "currently unsupported")));
-	}
-
-	if (createIndexStatement->concurrent)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("creating indexes concurrently on distributed tables is "
 							   "currently unsupported")));
 	}
 
@@ -1381,13 +1519,6 @@ ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement)
 							   "single command"),
 						errhint("Try dropping each object in a separate DROP "
 								"command.")));
-	}
-
-	if (dropIndexStatement->concurrent)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("dropping indexes concurrently on distributed tables is "
-							   "currently unsupported")));
 	}
 }
 
@@ -1680,8 +1811,10 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 			}
 
 			case AT_DropConstraint:
+			case AT_EnableTrigAll:
+			case AT_DisableTrigAll:
 			{
-				/* we will no perform any special check for ALTER TABLE DROP CONSTRAINT */
+				/* we will not perform any special checks for these ALTER TABLE types */
 				break;
 			}
 
@@ -1996,19 +2129,17 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 
 
 /*
- * ExecuteDistributedDDLCommand applies a given DDL command to the given
- * distributed table in a distributed transaction. If the multi shard commit protocol is
+ * ExecuteDistributedDDLJob simply executes a provided DDLJob in a distributed trans-
+ * action, including metadata sync if needed. If the multi shard commit protocol is
  * in its default value of '1pc', then a notice message indicating that '2pc' might be
  * used for extra safety. In the commit protocol, a BEGIN is sent after connection to
  * each shard placement and COMMIT/ROLLBACK is handled by
  * CompleteShardPlacementTransactions function.
  */
 static void
-ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString,
-							 bool isTopLevel)
+ExecuteDistributedDDLJob(DDLJob *ddlJob)
 {
-	List *taskList = NIL;
-	bool shouldSyncMetadata = ShouldSyncTableMetadata(relationId);
+	bool shouldSyncMetadata = ShouldSyncTableMetadata(ddlJob->targetRelationId);
 
 	if (XactModificationLevel == XACT_MODIFICATION_DATA)
 	{
@@ -2019,65 +2150,49 @@ ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString,
 	}
 
 	EnsureCoordinator();
-	ShowNoticeIfNotUsing2PC();
 
-	if (shouldSyncMetadata)
+	if (!ddlJob->concurrentIndexCmd)
 	{
-		SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
-		SendCommandToWorkers(WORKERS_WITH_METADATA, (char *) ddlCommandString);
+		ShowNoticeIfNotUsing2PC();
+
+		if (shouldSyncMetadata)
+		{
+			SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
+			SendCommandToWorkers(WORKERS_WITH_METADATA, (char *) ddlJob->commandString);
+		}
+
+		ExecuteModifyTasksWithoutResults(ddlJob->taskList);
 	}
-
-	taskList = DDLTaskList(relationId, ddlCommandString);
-
-	ExecuteModifyTasksWithoutResults(taskList);
-}
-
-
-/*
- * ExecuteDistributedForeignKeyCommand applies a given foreign key command to the given
- * distributed table in a distributed transaction. If the multi shard commit protocol is
- * in its default value of '1pc', then a notice message indicating that '2pc' might be
- * used for extra safety. In the commit protocol, a BEGIN is sent after connection to
- * each shard placement and COMMIT/ROLLBACK is handled by
- * CompleteShardPlacementTransactions function.
- *
- * leftRelationId is the relation id of actual distributed table which given foreign key
- * command is applied. rightRelationId is the relation id of distributed table which
- * foreign key refers to.
- */
-static void
-ExecuteDistributedForeignKeyCommand(Oid leftRelationId, Oid rightRelationId,
-									const char *ddlCommandString, bool isTopLevel)
-{
-	List *taskList = NIL;
-	bool shouldSyncMetadata = false;
-
-	if (XactModificationLevel == XACT_MODIFICATION_DATA)
+	else
 	{
-		ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-						errmsg("distributed DDL commands must not appear within "
-							   "transaction blocks containing single-shard data "
-							   "modifications")));
+		/* save old commit protocol to restore at xact end */
+		Assert(SavedMultiShardCommitProtocol == COMMIT_PROTOCOL_BARE);
+		SavedMultiShardCommitProtocol = MultiShardCommitProtocol;
+		MultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
+
+		PG_TRY();
+		{
+			ExecuteTasksSequentiallyWithoutResults(ddlJob->taskList);
+
+			if (shouldSyncMetadata)
+			{
+				List *commandList = list_make2(DISABLE_DDL_PROPAGATION,
+											   (char *) ddlJob->commandString);
+
+				SendBareCommandListToWorkers(WORKERS_WITH_METADATA, commandList);
+			}
+		}
+		PG_CATCH();
+		{
+			ereport(ERROR,
+					(errmsg("CONCURRENTLY-enabled index command failed"),
+					 errdetail("CONCURRENTLY-enabled index commands can fail partially, "
+							   "leaving behind an INVALID index."),
+					 errhint("Use DROP INDEX CONCURRENTLY IF EXISTS to remove the "
+							 "invalid index, then retry the original command.")));
+		}
+		PG_END_TRY();
 	}
-
-	EnsureCoordinator();
-	ShowNoticeIfNotUsing2PC();
-
-	/*
-	 * It is sufficient to check only one of the tables for metadata syncing on workers,
-	 * since the colocation of two tables implies that either both or none of them have
-	 * metadata on workers.
-	 */
-	shouldSyncMetadata = ShouldSyncTableMetadata(leftRelationId);
-	if (shouldSyncMetadata)
-	{
-		SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
-		SendCommandToWorkers(WORKERS_WITH_METADATA, (char *) ddlCommandString);
-	}
-
-	taskList = ForeignKeyTaskList(leftRelationId, rightRelationId, ddlCommandString);
-
-	ExecuteModifyTasksWithoutResults(taskList);
 }
 
 
@@ -2145,6 +2260,117 @@ DDLTaskList(Oid relationId, const char *commandString)
 		task->taskPlacementList = FinalizedShardPlacementList(shardId);
 
 		taskList = lappend(taskList, task);
+	}
+
+	return taskList;
+}
+
+
+/*
+ * CreateIndexTaskList builds a list of tasks to execute a CREATE INDEX command
+ * against a specified distributed table.
+ */
+static List *
+CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt)
+{
+	List *taskList = NIL;
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+	ListCell *shardIntervalCell = NULL;
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+	StringInfoData ddlString;
+	uint64 jobId = INVALID_JOB_ID;
+	int taskId = 1;
+
+	initStringInfo(&ddlString);
+
+	/* set statement's schema name if it is not set already */
+	if (indexStmt->relation->schemaname == NULL)
+	{
+		indexStmt->relation->schemaname = schemaName;
+	}
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(shardIntervalList, ShareLock);
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		uint64 shardId = shardInterval->shardId;
+		Task *task = NULL;
+
+		deparse_shard_index_statement(indexStmt, relationId, shardId, &ddlString);
+
+		task = CitusMakeNode(Task);
+		task->jobId = jobId;
+		task->taskId = taskId++;
+		task->taskType = DDL_TASK;
+		task->queryString = pstrdup(ddlString.data);
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->dependedTaskList = NULL;
+		task->anchorShardId = shardId;
+		task->taskPlacementList = FinalizedShardPlacementList(shardId);
+
+		taskList = lappend(taskList, task);
+
+		resetStringInfo(&ddlString);
+	}
+
+	return taskList;
+}
+
+
+/*
+ * DropIndexTaskList builds a list of tasks to execute a DROP INDEX command
+ * against a specified distributed table.
+ */
+static List *
+DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt)
+{
+	List *taskList = NIL;
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+	ListCell *shardIntervalCell = NULL;
+	char *indexName = get_rel_name(indexId);
+	Oid schemaId = get_rel_namespace(indexId);
+	char *schemaName = get_namespace_name(schemaId);
+	StringInfoData ddlString;
+	uint64 jobId = INVALID_JOB_ID;
+	int taskId = 1;
+
+	initStringInfo(&ddlString);
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(shardIntervalList, ShareLock);
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		uint64 shardId = shardInterval->shardId;
+		char *shardIndexName = pstrdup(indexName);
+		Task *task = NULL;
+
+		AppendShardIdToName(&shardIndexName, shardId);
+
+		/* deparse shard-specific DROP INDEX command */
+		appendStringInfo(&ddlString, "DROP INDEX %s %s %s %s",
+						 (dropStmt->concurrent ? "CONCURRENTLY" : ""),
+						 (dropStmt->missing_ok ? "IF EXISTS" : ""),
+						 quote_qualified_identifier(schemaName, shardIndexName),
+						 (dropStmt->behavior == DROP_RESTRICT ? "RESTRICT" : "CASCADE"));
+
+		task = CitusMakeNode(Task);
+		task->jobId = jobId;
+		task->taskId = taskId++;
+		task->taskType = DDL_TASK;
+		task->queryString = pstrdup(ddlString.data);
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->dependedTaskList = NULL;
+		task->anchorShardId = shardId;
+		task->taskPlacementList = FinalizedShardPlacementList(shardId);
+
+		taskList = lappend(taskList, task);
+
+		resetStringInfo(&ddlString);
 	}
 
 	return taskList;
@@ -2438,15 +2664,93 @@ CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist)
 
 
 /*
- * ReplicateGrantStmt replicates GRANT/REVOKE command to worker nodes if the
- * the statement affects distributed tables.
+ * PostProcessUtility performs additional tasks after a utility's local portion
+ * has been completed. Right now, the sole use is marking new indexes invalid
+ * if they were created using the CONCURRENTLY flag. This (non-transactional)
+ * change provides the fallback state if an error is raised, otherwise a sub-
+ * sequent change to valid will be committed.
+ */
+static void
+PostProcessUtility(Node *parsetree)
+{
+	IndexStmt *indexStmt = NULL;
+	Relation relation = NULL;
+	Oid indexRelationId = InvalidOid;
+	Relation indexRelation = NULL;
+	Relation pg_index = NULL;
+	HeapTuple indexTuple = NULL;
+	Form_pg_index indexForm = NULL;
+
+	/* only IndexStmts are processed */
+	if (!IsA(parsetree, IndexStmt))
+	{
+		return;
+	}
+
+	/* and even then only if they're CONCURRENT */
+	indexStmt = (IndexStmt *) parsetree;
+	if (!indexStmt->concurrent)
+	{
+		return;
+	}
+
+	/* finally, this logic only applies to the coordinator */
+	if (!IsCoordinator())
+	{
+		return;
+	}
+
+	/* commit the current transaction and start anew */
+	CommitTransactionCommand();
+	StartTransactionCommand();
+
+	/* get the affected relation and index */
+	relation = heap_openrv(indexStmt->relation, ShareUpdateExclusiveLock);
+	indexRelationId = get_relname_relid(indexStmt->idxname,
+										RelationGetNamespace(relation));
+	indexRelation = index_open(indexRelationId, RowExclusiveLock);
+
+	/* close relations but retain locks */
+	heap_close(relation, NoLock);
+	index_close(indexRelation, NoLock);
+
+	/* mark index as invalid, in-place (cannot be rolled back) */
+	index_set_state_flags(indexRelationId, INDEX_DROP_CLEAR_VALID);
+
+	/* re-open a transaction command from here on out */
+	CommitTransactionCommand();
+	StartTransactionCommand();
+
+	/* now, update index's validity in a way that can roll back */
+	pg_index = heap_open(IndexRelationId, RowExclusiveLock);
+
+	indexTuple = SearchSysCacheCopy1(INDEXRELID, ObjectIdGetDatum(indexRelationId));
+	Assert(HeapTupleIsValid(indexTuple)); /* better be present, we have lock! */
+
+	/* mark as valid, save, and update pg_index indexes */
+	indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
+	indexForm->indisvalid = true;
+
+	simple_heap_update(pg_index, &indexTuple->t_self, indexTuple);
+	CatalogUpdateIndexes(pg_index, indexTuple);
+
+	/* clean up; index now marked valid, but ROLLBACK will mark invalid */
+	heap_freetuple(indexTuple);
+	heap_close(pg_index, RowExclusiveLock);
+}
+
+
+/*
+ * PlanGrantStmt determines whether a given GRANT/REVOKE statement involves
+ * a distributed table. If so, it creates DDLJobs to encapsulate information
+ * needed during the worker node portion of DDL execution before returning the
+ * DDLJobs in a List. If no distributed table is involved, this returns NIL.
  *
  * NB: So far column level privileges are not supported.
  */
-void
-ReplicateGrantStmt(Node *parsetree)
+List *
+PlanGrantStmt(GrantStmt *grantStmt)
 {
-	GrantStmt *grantStmt = (GrantStmt *) parsetree;
 	StringInfoData privsString;
 	StringInfoData granteesString;
 	StringInfoData targetString;
@@ -2454,6 +2758,7 @@ ReplicateGrantStmt(Node *parsetree)
 	ListCell *granteeCell = NULL;
 	ListCell *objectCell = NULL;
 	bool isFirst = true;
+	List *ddlJobs = NIL;
 
 	initStringInfo(&privsString);
 	initStringInfo(&granteesString);
@@ -2467,7 +2772,7 @@ ReplicateGrantStmt(Node *parsetree)
 	if (grantStmt->targtype != ACL_TARGET_OBJECT ||
 		grantStmt->objtype != ACL_OBJECT_RELATION)
 	{
-		return;
+		return NIL;
 	}
 
 	/* deparse the privileges */
@@ -2538,7 +2843,7 @@ ReplicateGrantStmt(Node *parsetree)
 		RangeVar *relvar = (RangeVar *) lfirst(objectCell);
 		Oid relOid = RangeVarGetRelid(relvar, NoLock, false);
 		const char *grantOption = "";
-		bool isTopLevel = true;
+		DDLJob *ddlJob = NULL;
 
 		if (!IsDistributedTable(relOid))
 		{
@@ -2571,7 +2876,16 @@ ReplicateGrantStmt(Node *parsetree)
 							 granteesString.data);
 		}
 
-		ExecuteDistributedDDLCommand(relOid, ddlString.data, isTopLevel);
+		ddlJob = palloc0(sizeof(DDLJob));
+		ddlJob->targetRelationId = relOid;
+		ddlJob->concurrentIndexCmd = false;
+		ddlJob->commandString = pstrdup(ddlString.data);
+		ddlJob->taskList = DDLTaskList(relOid, ddlString.data);
+
+		ddlJobs = lappend(ddlJobs, ddlJob);
+
 		resetStringInfo(&ddlString);
 	}
+
+	return ddlJobs;
 }

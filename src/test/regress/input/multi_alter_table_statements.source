@@ -283,12 +283,12 @@ DROP TABLE ddl_commands;
 -- Distributed SELECTs cannot appear after ALTER
 BEGIN;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
-SELECT l_orderkey FROM lineitem_alter LIMIT 0;
+SELECT count(*) FROM lineitem_alter;
 COMMIT;
 
 -- but are allowed before
 BEGIN;
-SELECT l_orderkey FROM lineitem_alter LIMIT 0;
+SELECT count(*) FROM lineitem_alter;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
 COMMIT;
 SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
@@ -368,6 +368,57 @@ SELECT  indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
 \c - - - :worker_1_port
 SELECT  indexname, tablename FROM pg_indexes WHERE tablename like 'lineitem_alter_%';
 \c - - - :master_port
+
+-- verify alter table and drop sequence in the same transaction does not cause deadlock
+CREATE TABLE sequence_deadlock_test (a serial, b serial);
+SELECT create_distributed_table('sequence_deadlock_test', 'a');
+
+BEGIN;
+ALTER TABLE sequence_deadlock_test ADD COLUMN c int;
+DROP SEQUENCE sequence_deadlock_test_b_seq CASCADE;
+END;
+
+DROP TABLE sequence_deadlock_test;
+
+-- verify enable/disable trigger all works
+
+SET citus.shard_replication_factor TO 1;
+SET citus.shard_count TO 1;
+
+CREATE TABLE trigger_table (
+	id int,
+	value text
+);
+
+SELECT create_distributed_table('trigger_table', 'id');
+
+-- first set a trigger on a shard
+\c - - - :worker_1_port
+
+CREATE FUNCTION update_value() RETURNS trigger AS $up$
+    BEGIN
+		NEW.value := 'trigger enabled';
+		RETURN NEW;
+    END;
+$up$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_value
+BEFORE INSERT ON trigger_table_220056
+FOR EACH ROW EXECUTE PROCEDURE update_value();
+
+\c - - - :master_port
+INSERT INTO trigger_table VALUES (1, 'trigger disabled');
+SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
+
+ALTER TABLE trigger_table DISABLE TRIGGER ALL;
+INSERT INTO trigger_table VALUES (1, 'trigger disabled');
+SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
+
+ALTER TABLE trigger_table ENABLE TRIGGER ALL;
+INSERT INTO trigger_table VALUES (1, 'trigger disabled');
+SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
+
+DROP TABLE trigger_table;
 
 -- test ALTER TABLE ALL IN TABLESPACE
 -- we expect that it will warn out

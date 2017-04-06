@@ -24,6 +24,7 @@
 #include "access/tupdesc.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
@@ -33,11 +34,14 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/relay_utility.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "parser/parse_utilcmd.h"
 #include "storage/lock.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -55,6 +59,7 @@
 
 static void AppendOptionListToString(StringInfo stringData, List *options);
 static const char * convert_aclright_to_string(int aclright);
+static bool contain_nextval_expression_walker(Node *node, void *context);
 
 /*
  * pg_get_extensiondef_string finds the foreign data wrapper that corresponds to
@@ -246,9 +251,11 @@ pg_get_sequencedef(Oid sequenceRelationId)
  * definition includes table's schema, default column values, not null and check
  * constraints. The definition does not include constraints that trigger index
  * creations; specifically, unique and primary key constraints are excluded.
+ * When the flag includeSequenceDefaults is set, the function also creates
+ * DEFAULT clauses for columns getting their default values from a sequence.
  */
 char *
-pg_get_tableschemadef_string(Oid tableRelationId)
+pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 {
 	Relation relation = NULL;
 	char *relationName = NULL;
@@ -343,13 +350,23 @@ pg_get_tableschemadef_string(Oid tableRelationId)
 
 				/* convert expression to node tree, and prepare deparse context */
 				defaultNode = (Node *) stringToNode(defaultValue->adbin);
-				defaultContext = deparse_context_for(relationName, tableRelationId);
 
-				/* deparse default value string */
-				defaultString = deparse_expression(defaultNode, defaultContext,
-												   false, false);
+				/*
+				 * if column default value is explicitly requested, or it is
+				 * not set from a sequence then we include DEFAULT clause for
+				 * this column.
+				 */
+				if (includeSequenceDefaults ||
+					!contain_nextval_expression_walker(defaultNode, NULL))
+				{
+					defaultContext = deparse_context_for(relationName, tableRelationId);
 
-				appendStringInfo(&buffer, " DEFAULT %s", defaultString);
+					/* deparse default value string */
+					defaultString = deparse_expression(defaultNode, defaultContext,
+													   false, false);
+
+					appendStringInfo(&buffer, " DEFAULT %s", defaultString);
+				}
 			}
 
 			/* if this column has a not null constraint, append the constraint */
@@ -570,6 +587,104 @@ pg_get_tablecolumnoptionsdef_string(Oid tableRelationId)
 	relation_close(relation, AccessShareLock);
 
 	return (buffer.data);
+}
+
+
+/*
+ * deparse_shard_index_statement uses the provided CREATE INDEX node, dist.
+ * relation, and shard identifier to populate a provided buffer with a string
+ * representation of a shard-extended version of that command.
+ */
+void
+deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
+							  StringInfo buffer)
+{
+	IndexStmt *indexStmt = copyObject(origStmt); /* copy to avoid modifications */
+	char *relationName = indexStmt->relation->relname;
+	char *indexName = indexStmt->idxname;
+	ListCell *indexParameterCell = NULL;
+	List *deparseContext = NULL;
+
+	/* extend relation and index name using shard identifier */
+	AppendShardIdToName(&relationName, shardid);
+	AppendShardIdToName(&indexName, shardid);
+
+	/* use extended shard name and transformed stmt for deparsing */
+	deparseContext = deparse_context_for(relationName, distrelid);
+	indexStmt = transformIndexStmt(distrelid, indexStmt, NULL);
+
+	appendStringInfo(buffer, "CREATE %s INDEX %s %s %s ON %s USING %s ",
+					 (indexStmt->unique ? "UNIQUE" : ""),
+					 (indexStmt->concurrent ? "CONCURRENTLY" : ""),
+					 (indexStmt->if_not_exists ? "IF NOT EXISTS" : ""),
+					 quote_identifier(indexName),
+					 quote_qualified_identifier(indexStmt->relation->schemaname,
+												relationName),
+					 indexStmt->accessMethod);
+
+	/* index column or expression list begins here */
+	appendStringInfoChar(buffer, '(');
+
+	foreach(indexParameterCell, indexStmt->indexParams)
+	{
+		IndexElem *indexElement = (IndexElem *) lfirst(indexParameterCell);
+
+		/* use commas to separate subsequent elements */
+		if (indexParameterCell != list_head(indexStmt->indexParams))
+		{
+			appendStringInfoChar(buffer, ',');
+		}
+
+		if (indexElement->name)
+		{
+			appendStringInfo(buffer, "%s ", quote_identifier(indexElement->name));
+		}
+		else if (indexElement->expr)
+		{
+			appendStringInfo(buffer, "(%s)", deparse_expression(indexElement->expr,
+																deparseContext, false,
+																false));
+		}
+
+		if (indexElement->collation != NIL)
+		{
+			appendStringInfo(buffer, "COLLATE %s ",
+							 NameListToQuotedString(indexElement->collation));
+		}
+
+		if (indexElement->opclass != NIL)
+		{
+			appendStringInfo(buffer, "%s ",
+							 NameListToQuotedString(indexElement->opclass));
+		}
+
+		if (indexElement->ordering != SORTBY_DEFAULT)
+		{
+			bool sortAsc = (indexElement->ordering == SORTBY_ASC);
+			appendStringInfo(buffer, "%s ", (sortAsc ? "ASC" : "DESC"));
+		}
+
+		if (indexElement->nulls_ordering != SORTBY_NULLS_DEFAULT)
+		{
+			bool nullsFirst = (indexElement->nulls_ordering == SORTBY_NULLS_FIRST);
+			appendStringInfo(buffer, "NULLS %s ", (nullsFirst ? "FIRST" : "LAST"));
+		}
+	}
+
+	appendStringInfoString(buffer, ") ");
+
+	if (indexStmt->options != NIL)
+	{
+		appendStringInfoString(buffer, "WITH ");
+		AppendOptionListToString(buffer, indexStmt->options);
+	}
+
+	if (indexStmt->whereClause != NULL)
+	{
+		appendStringInfo(buffer, "WHERE %s", deparse_expression(indexStmt->whereClause,
+																deparseContext, false,
+																false));
+	}
 }
 
 
@@ -860,4 +975,29 @@ convert_aclright_to_string(int aclright)
 			return NULL;
 	}
 	/* *INDENT-ON* */
+}
+
+
+/*
+ * contain_nextval_expression_walker walks over expression tree and returns
+ * true if it contains call to 'nextval' function.
+ */
+static bool
+contain_nextval_expression_walker(Node *node, void *context)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr *funcExpr = (FuncExpr *) node;
+
+		if (funcExpr->funcid == F_NEXTVAL_OID)
+		{
+			return true;
+		}
+	}
+	return expression_tree_walker(node, contain_nextval_expression_walker, context);
 }

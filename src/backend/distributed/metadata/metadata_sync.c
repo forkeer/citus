@@ -76,6 +76,7 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	int32 nodePort = PG_GETARG_INT32(1);
 	char *nodeNameString = text_to_cstring(nodeName);
 	char *extensionOwner = CitusExtensionOwnerName();
+	char *escapedNodeName = quote_literal_cstr(nodeNameString);
 
 	WorkerNode *workerNode = NULL;
 	char *localGroupIdUpdateCommand = NULL;
@@ -94,8 +95,8 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("you cannot sync metadata to a non-existent node"),
-						errhint("First, add the node with SELECT master_add_node(%s,%d)",
-								nodeNameString, nodePort)));
+						errhint("First, add the node with SELECT master_add_node"
+								"(%s,%d)", escapedNodeName, nodePort)));
 	}
 
 	MarkNodeHasMetadata(nodeNameString, nodePort, true);
@@ -208,6 +209,7 @@ MetadataCreateCommands(void)
 	List *workerNodeList = WorkerNodeList();
 	ListCell *distributedTableCell = NULL;
 	char *nodeListInsertCommand = NULL;
+	bool includeSequenceDefaults = true;
 
 	/* generate insert command for pg_dist_node table */
 	nodeListInsertCommand = NodeListInsertCommand(workerNodeList);
@@ -233,7 +235,7 @@ MetadataCreateCommands(void)
 		Oid relationId = cacheEntry->relationId;
 
 		List *workerSequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
-		List *ddlCommandList = GetTableDDLEvents(relationId);
+		List *ddlCommandList = GetTableDDLEvents(relationId, includeSequenceDefaults);
 		char *tableOwnerResetCommand = TableOwnerResetCommand(relationId);
 
 		metadataSnapshotCommandList = list_concat(metadataSnapshotCommandList,
@@ -311,13 +313,14 @@ GetDistributedTableDDLEvents(Oid relationId)
 	char *tableOwnerResetCommand = NULL;
 	char *metadataCommand = NULL;
 	char *truncateTriggerCreateCommand = NULL;
+	bool includeSequenceDefaults = true;
 
 	/* commands to create sequences */
 	sequenceDDLCommands = SequenceDDLCommandsForTable(relationId);
 	commandList = list_concat(commandList, sequenceDDLCommands);
 
 	/* commands to create the table */
-	tableDDLCommands = GetTableDDLEvents(relationId);
+	tableDDLCommands = GetTableDDLEvents(relationId, includeSequenceDefaults);
 	commandList = list_concat(commandList, tableDDLCommands);
 
 	/* command to reset the table owner */

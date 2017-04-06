@@ -16,6 +16,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 
+#include "citus_version.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
 #include "distributed/citus_nodefuncs.h"
@@ -24,7 +25,6 @@
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/multi_copy.h"
-#include "distributed/multi_executor.h"
 #include "distributed/multi_explain.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_optimizer.h"
@@ -48,6 +48,8 @@
 
 /* marks shared object as one loadable by the postgres version compiled against */
 PG_MODULE_MAGIC;
+
+static char *CitusVersion = CITUS_VERSION;
 
 void _PG_init(void);
 
@@ -115,13 +117,7 @@ _PG_init(void)
 	 * (thus as the innermost/last running hook) to be able to do our
 	 * duties. For simplicity insist that all hooks are previously unused.
 	 */
-	if (planner_hook != NULL ||
-		ExplainOneQuery_hook != NULL ||
-		ExecutorStart_hook != NULL ||
-		ExecutorRun_hook != NULL ||
-		ExecutorFinish_hook != NULL ||
-		ExecutorEnd_hook != NULL ||
-		ProcessUtility_hook != NULL)
+	if (planner_hook != NULL || ProcessUtility_hook != NULL)
 	{
 		ereport(ERROR, (errmsg("Citus has to be loaded first"),
 						errhint("Place citus at the beginning of "
@@ -146,15 +142,6 @@ _PG_init(void)
 
 	/* intercept planner */
 	planner_hook = multi_planner;
-
-	/* intercept explain */
-	ExplainOneQuery_hook = MultiExplainOneQuery;
-
-	/* intercept executor */
-	ExecutorStart_hook = multi_ExecutorStart;
-	ExecutorRun_hook = multi_ExecutorRun;
-	ExecutorFinish_hook = multi_ExecutorFinish;
-	ExecutorEnd_hook = multi_ExecutorEnd;
 
 	/* register utility hook */
 	ProcessUtility_hook = multi_ProcessUtility;
@@ -624,6 +611,26 @@ RegisterCitusConfigVariables(void)
 		SHARD_PLACEMENT_ROUND_ROBIN, shard_placement_policy_options,
 		PGC_USERSET,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"citus.version",
+		gettext_noop("Shows the Citus library version"),
+		NULL,
+		&CitusVersion,
+		CITUS_VERSION,
+		PGC_INTERNAL,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_version_checks",
+		gettext_noop("Enables version checks during CREATE/ALTER EXTENSION commands"),
+		NULL,
+		&EnableVersionChecks,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	/* warn about config items in the citus namespace that are not registered above */

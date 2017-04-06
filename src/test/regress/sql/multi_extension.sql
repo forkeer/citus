@@ -24,7 +24,9 @@ WHERE pgd.refclassid = 'pg_extension'::regclass AND
 DROP EXTENSION citus;
 \c
 
--- Create extension in oldest version, test every upgrade step
+SET citus.enable_version_checks TO 'false';
+
+-- Create extension in oldest version
 CREATE EXTENSION citus VERSION '5.0';
 ALTER EXTENSION citus UPDATE TO '5.0-1';
 ALTER EXTENSION citus UPDATE TO '5.0-2';
@@ -75,6 +77,11 @@ ALTER EXTENSION citus UPDATE TO '6.1-14';
 ALTER EXTENSION citus UPDATE TO '6.1-15';
 ALTER EXTENSION citus UPDATE TO '6.1-16';
 ALTER EXTENSION citus UPDATE TO '6.1-17';
+ALTER EXTENSION citus UPDATE TO '6.2-1';
+ALTER EXTENSION citus UPDATE TO '6.2-2';
+
+-- show running version
+SHOW citus.version;
 
 -- ensure no objects were created outside pg_catalog
 SELECT COUNT(*)
@@ -86,7 +93,11 @@ WHERE pgd.refclassid = 'pg_extension'::regclass AND
 	  pge.extname    = 'citus' AND
 	  pgio.schema    NOT IN ('pg_catalog', 'citus');
 
--- drop extension an re-create in newest version
+-- see incompatible version errors out
+RESET citus.enable_version_checks;
 DROP EXTENSION citus;
+CREATE EXTENSION citus VERSION '5.0';
+
+-- re-create in newest version
 \c
 CREATE EXTENSION citus;
