@@ -3,7 +3,6 @@
 --
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 570000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 570000;
 
 -- print major version to make version-specific tests clear
 SELECT substring(version(), '\d+\.\d+') AS major_version;
@@ -36,6 +35,10 @@ BEGIN
   RETURN result;
 END;
 $BODY$ LANGUAGE plpgsql;
+
+-- VACUMM related tables to ensure test outputs are stable
+VACUUM ANALYZE lineitem;
+VACUUM ANALYZE orders;
 
 -- Test Text format
 EXPLAIN (COSTS FALSE, FORMAT TEXT)

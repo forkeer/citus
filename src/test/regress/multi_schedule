@@ -30,6 +30,8 @@ test: multi_create_table_constraints
 test: multi_master_protocol
 test: multi_load_data
 
+test: multi_insert_select_behavioral_analytics_create_table
+test: multi_insert_select_behavioral_analytics_basics multi_insert_select_behavioral_analytics_single_shard_queries multi_insert_select_non_pushable_queries
 test: multi_insert_select
 
 # ----------
@@ -50,7 +52,7 @@ test: multi_partition_pruning
 test: multi_join_pruning multi_hash_pruning
 test: multi_null_minmax_value_pruning
 test: multi_query_directory_cleanup
-test: multi_task_assignment_policy
+test: multi_task_assignment_policy multi_cross_shard
 test: multi_utility_statements
 test: multi_dropped_column_aliases
 test: multi_binary_master_copy_format
@@ -94,6 +96,7 @@ test: multi_shard_modify
 # ----------
 test: multi_index_statements
 test: multi_alter_table_statements
+test: multi_alter_table_add_constraints
 
 # ----------
 # multi_create_schema tests creation, loading, and querying of a table in a new

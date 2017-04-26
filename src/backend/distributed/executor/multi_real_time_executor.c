@@ -82,7 +82,7 @@ MultiRealTimeExecute(Job *job)
 	const char *workerHashName = "Worker node hash";
 	WaitInfo *waitInfo = MultiClientCreateWaitInfo(list_length(taskList));
 
-	workerNodeList = WorkerNodeList();
+	workerNodeList = ActiveWorkerNodeList();
 	workerHash = WorkerHash(workerHashName, workerNodeList);
 
 	/* initialize task execution structures for remote execution */
@@ -225,8 +225,7 @@ MultiRealTimeExecute(Job *job)
 	 */
 	if (taskFailed)
 	{
-		ereport(ERROR, (errmsg("failed to execute job " UINT64_FORMAT, job->jobId),
-						errdetail("Failure due to failed task %u", failedTaskId)));
+		ereport(ERROR, (errmsg("failed to execute task %u", failedTaskId)));
 	}
 	else if (QueryCancelPending)
 	{

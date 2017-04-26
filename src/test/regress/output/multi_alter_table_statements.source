@@ -2,7 +2,6 @@
 -- MULTI_ALTER_TABLE_STATEMENTS
 --
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 220000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 220000;
 -- Check that we can run ALTER TABLE statements on distributed tables.
 -- We set the shardid sequence here so that the shardids in this test
 -- aren't affected by changes to the previous tests.
@@ -254,6 +253,14 @@ SELECT int_column2, pg_typeof(int_column2), count(*) from lineitem_alter GROUP B
 ALTER TABLE lineitem_alter DROP COLUMN int_column1;
 ALTER TABLE lineitem_alter DROP COLUMN float_column;
 ALTER TABLE lineitem_alter DROP COLUMN date_column;
+-- Verify that RENAME COLUMN works
+ALTER TABLE lineitem_alter RENAME COLUMN l_orderkey TO l_orderkey_renamed;
+SELECT SUM(l_orderkey_renamed) FROM lineitem_alter;
+   sum    
+----------
+ 53620791
+(1 row)
+
 -- Verify that IF EXISTS works as expected
 ALTER TABLE non_existent_table ADD COLUMN new_column INTEGER;
 ERROR:  relation "non_existent_table" does not exist
@@ -265,6 +272,14 @@ ERROR:  column "non_existent_column" of relation "lineitem_alter" does not exist
 ALTER TABLE lineitem_alter DROP COLUMN IF EXISTS non_existent_column;
 NOTICE:  column "non_existent_column" of relation "lineitem_alter" does not exist, skipping
 ALTER TABLE lineitem_alter DROP COLUMN IF EXISTS int_column2;
+-- Verify with IF EXISTS for extant table
+ALTER TABLE IF EXISTS lineitem_alter RENAME COLUMN l_orderkey_renamed TO l_orderkey;
+SELECT SUM(l_orderkey) FROM lineitem_alter;
+   sum    
+----------
+ 53620791
+(1 row)
+
 \d lineitem_alter
             Table "public.lineitem_alter"
      Column      |         Type          | Modifiers 
@@ -317,7 +332,7 @@ ALTER TABLE lineitem_alter ADD COLUMN int_column1 INTEGER,
 ALTER TABLE lineitem_alter ADD COLUMN int_column3 INTEGER,
 	ALTER COLUMN int_column1 SET STATISTICS 10;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT FOREIGN KEY and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
 ALTER TABLE lineitem_alter DROP COLUMN int_column1, DROP COLUMN int_column2;
 \d lineitem_alter
             Table "public.lineitem_alter"
@@ -349,12 +364,12 @@ ERROR:  cannot execute ALTER TABLE command involving partition column
 -- Verify that we error out on unsupported statement types
 ALTER TABLE lineitem_alter ALTER COLUMN l_orderkey SET STATISTICS 100;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT FOREIGN KEY and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
 ALTER TABLE lineitem_alter DROP CONSTRAINT IF EXISTS non_existent_contraint;
 NOTICE:  constraint "non_existent_contraint" of relation "lineitem_alter" does not exist, skipping
 ALTER TABLE lineitem_alter SET WITHOUT OIDS;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT FOREIGN KEY and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
 -- Verify that we error out in case of postgres errors on supported statement
 -- types
 ALTER TABLE lineitem_alter ADD COLUMN new_column non_existent_type;
@@ -366,13 +381,11 @@ ERROR:  column "null_column" contains null values
 CONTEXT:  while executing command on localhost:57638
 ALTER TABLE lineitem_alter ALTER COLUMN l_partkey SET DEFAULT 'a';
 ERROR:  invalid input syntax for integer: "a"
--- Verify that we error out on statements involving RENAME
+-- Verify that we error out on non-column RENAME statements
 ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
-ERROR:  renaming distributed tables or their objects is currently unsupported
-ALTER TABLE lineitem_alter RENAME COLUMN l_orderkey TO l_orderkey_renamed;
-ERROR:  renaming distributed tables or their objects is currently unsupported
+ERROR:  renaming distributed tables is currently unsupported
 ALTER TABLE lineitem_alter RENAME CONSTRAINT constraint_a TO constraint_b;
-ERROR:  renaming distributed tables or their objects is currently unsupported
+ERROR:  renaming constraints belonging to distributed tables is currently unsupported
 -- Verify that IF EXISTS works as expected with RENAME statements
 ALTER TABLE non_existent_table RENAME TO non_existent_table_renamed;
 ERROR:  relation "non_existent_table" does not exist
@@ -380,8 +393,6 @@ ALTER TABLE IF EXISTS non_existent_table RENAME TO non_existent_table_renamed;
 NOTICE:  relation "non_existent_table" does not exist, skipping
 ALTER TABLE IF EXISTS non_existent_table RENAME COLUMN column1 TO column2;
 NOTICE:  relation "non_existent_table" does not exist, skipping
-ALTER TABLE IF EXISTS lineitem_alter RENAME l_orderkey TO l_orderkey_renamed;
-ERROR:  renaming distributed tables or their objects is currently unsupported
 -- Verify that none of the failed alter table commands took effect on the master
 -- node
 \d lineitem_alter

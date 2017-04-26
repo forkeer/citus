@@ -5,7 +5,6 @@
 
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1380000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1380000;
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 1380000;
 ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART 1380000;
 ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART 1380000;
@@ -575,7 +574,7 @@ WHERE
 \c - - - :master_port
 
 -- re-add the node for next tests
-SELECT master_add_node('localhost', :worker_2_port);
+SELECT master_activate_node('localhost', :worker_2_port);
 
 
 -- DROP tables to clean workspace

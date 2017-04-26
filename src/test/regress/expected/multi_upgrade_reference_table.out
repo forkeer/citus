@@ -4,7 +4,6 @@
 -- Tests around upgrade_reference_table UDF
 --
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1360000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1360000;
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 1360000;
 -- test with not distributed table
 CREATE TABLE upgrade_reference_table_local(column1 int);
@@ -95,6 +94,7 @@ SELECT create_distributed_table('upgrade_reference_table_composite', 'column1');
 
 UPDATE pg_dist_partition SET repmodel='c' WHERE logicalrelid='upgrade_reference_table_composite'::regclass;
 SELECT upgrade_to_reference_table('upgrade_reference_table_composite');
+NOTICE:  Replicating reference table "upgrade_reference_table_composite" to the node localhost:57638
 ERROR:  type "public.upgrade_test_composite_type" does not exist
 CONTEXT:  while executing command on localhost:57638
 DROP TABLE upgrade_reference_table_composite;
@@ -165,6 +165,7 @@ WHERE shardid IN
 (1 row)
 
 SELECT upgrade_to_reference_table('upgrade_reference_table_append');
+NOTICE:  Replicating reference table "upgrade_reference_table_append" to the node localhost:57638
  upgrade_to_reference_table 
 ----------------------------
  
@@ -277,6 +278,7 @@ WHERE shardid IN
 (1 row)
 
 SELECT upgrade_to_reference_table('upgrade_reference_table_one_worker');
+NOTICE:  Replicating reference table "upgrade_reference_table_one_worker" to the node localhost:57638
  upgrade_to_reference_table 
 ----------------------------
  
@@ -621,6 +623,7 @@ WHERE shardid IN
 
 BEGIN;
 SELECT upgrade_to_reference_table('upgrade_reference_table_transaction_rollback');
+NOTICE:  Replicating reference table "upgrade_reference_table_transaction_rollback" to the node localhost:57638
  upgrade_to_reference_table 
 ----------------------------
  
@@ -733,6 +736,7 @@ WHERE shardid IN
 
 BEGIN;
 SELECT upgrade_to_reference_table('upgrade_reference_table_transaction_commit');
+NOTICE:  Replicating reference table "upgrade_reference_table_transaction_commit" to the node localhost:57638
  upgrade_to_reference_table 
 ----------------------------
  
@@ -980,6 +984,7 @@ ORDER BY nodeport;
 
      
 SELECT upgrade_to_reference_table('upgrade_reference_table_mx');
+NOTICE:  Replicating reference table "upgrade_reference_table_mx" to the node localhost:57638
  upgrade_to_reference_table 
 ----------------------------
  

@@ -21,9 +21,6 @@
 #include "nodes/parsenodes.h"
 
 
-/* reserved parameted id, we chose a negative number since it is not assigned by postgres */
-#define UNINSTANTIATED_PARAMETER_ID INT_MIN
-
 /* reserved alias name for UPSERTs */
 #define CITUS_TABLE_ALIAS "citus_table_alias"
 
@@ -32,9 +29,9 @@ extern bool EnableRouterExecution;
 extern MultiPlan * CreateRouterPlan(Query *originalQuery, Query *query,
 									RelationRestrictionContext *restrictionContext);
 extern MultiPlan * CreateModifyPlan(Query *originalQuery, Query *query,
-									RelationRestrictionContext *restrictionContext);
+									PlannerRestrictionContext *
+									plannerRestrictionContext);
 
-extern void AddUninstantiatedPartitionRestriction(Query *originalQuery);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree);
 extern Query * ReorderInsertSelectTargetLists(Query *originalQuery,
 											  RangeTblEntry *insertRte,
@@ -45,6 +42,8 @@ extern RangeTblEntry * ExtractSelectRangeTableEntry(Query *query);
 extern RangeTblEntry * ExtractInsertRangeTableEntry(Query *query);
 extern void AddShardIntervalRestrictionToSelect(Query *subqery,
 												ShardInterval *shardInterval);
+extern ShardInterval * FindShardForInsert(Query *query,
+										  DeferredErrorMessage **planningError);
 extern ShardInterval * FastShardPruning(Oid distributedTableId, Datum partitionValue);
 
 

@@ -92,6 +92,16 @@ static const struct config_enum_entry multi_shard_commit_protocol_options[] = {
 	{ NULL, 0, false }
 };
 
+static const struct config_enum_entry multi_task_query_log_level_options[] = {
+	{ "off", MULTI_TASK_QUERY_INFO_OFF, false },
+	{ "debug", DEBUG2, false },
+	{ "log", LOG, false },
+	{ "notice", NOTICE, false },
+	{ "warning", WARNING, false },
+	{ "error", ERROR, false },
+	{ NULL, 0, false }
+};
+
 /* *INDENT-ON* */
 
 
@@ -148,6 +158,7 @@ _PG_init(void)
 
 	/* register for planner hook */
 	set_rel_pathlist_hook = multi_relation_restriction_hook;
+	set_join_pathlist_hook = multi_join_restriction_hook;
 
 	/* organize that task tracker is started once server is up */
 	TaskTrackerRegister();
@@ -613,6 +624,16 @@ RegisterCitusConfigVariables(void)
 		0,
 		NULL, NULL, NULL);
 
+	DefineCustomEnumVariable(
+		"citus.multi_task_query_log_level",
+		gettext_noop("Sets the level of multi task query execution log messages"),
+		NULL,
+		&MultiTaskQueryLogLevel,
+		MULTI_TASK_QUERY_INFO_OFF, multi_task_query_log_level_options,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
 	DefineCustomStringVariable(
 		"citus.version",
 		gettext_noop("Shows the Citus library version"),
@@ -631,6 +652,18 @@ RegisterCitusConfigVariables(void)
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_unique_job_ids",
+		gettext_noop("Enables unique job IDs by prepending the local process ID and "
+					 "group ID. This should usually be enabled, but can be disabled "
+					 "for repeatable output in regression tests."),
+		NULL,
+		&EnableUniqueJobIds,
+		true,
+		PGC_USERSET,
+		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	/* warn about config items in the citus namespace that are not registered above */

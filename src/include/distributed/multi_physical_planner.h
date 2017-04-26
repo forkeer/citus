@@ -28,7 +28,6 @@
 
 
 /* Definitions local to the physical planner */
-#define JOBID_SEQUENCE_NAME "pg_dist_jobid_seq"
 #define ARRAY_OUT_FUNC_ID 751
 #define NON_PRUNABLE_JOIN -1
 #define RESERVED_HASHED_COLUMN_ID MaxAttrNumber
@@ -123,6 +122,7 @@ typedef struct Job
 	List *dependedJobList;
 	bool subqueryPushdown;
 	bool requiresMasterEvaluation; /* only applies to modify jobs */
+	bool deferredPruning;
 } Job;
 
 
@@ -244,6 +244,8 @@ typedef struct OperatorCacheEntry
 
 /* Config variable managed via guc.c */
 extern int TaskAssignmentPolicy;
+extern bool EnableUniqueJobIds;
+
 
 /* Function declarations for building physical plans and constructing queries */
 extern MultiPlan * MultiPhysicalPlanCreate(MultiTreeRoot *multiTree);

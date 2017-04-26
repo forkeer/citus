@@ -4,7 +4,6 @@
 
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 420000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 420000;
 
 
 -- Check that we can correctly handle complex expressions and aggregates.
@@ -221,7 +220,7 @@ FROM
 WHERE 
 	li.l_quantity > 25
 ORDER BY
-	li.l_quantity
+	li.l_quantity, li.l_partkey, o.o_custkey
 LIMIT 10 OFFSET 20;
 
 RESET client_min_messages;

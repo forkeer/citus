@@ -7,7 +7,6 @@
 
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1310000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1310000;
 
 SELECT nextval('pg_catalog.pg_dist_shard_placement_placementid_seq') AS last_placement_id
 \gset
@@ -536,7 +535,9 @@ FROM
 	NATURAL JOIN pg_dist_shard
 	NATURAL JOIN pg_dist_shard_placement
 WHERE
-	logicalrelid = 'mx_ref'::regclass;
+	logicalrelid = 'mx_ref'::regclass
+ORDER BY
+ 	nodeport;
 	
 SELECT shardid AS ref_table_shardid FROM pg_dist_shard WHERE logicalrelid='mx_ref'::regclass \gset
 

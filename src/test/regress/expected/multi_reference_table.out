@@ -1,5 +1,4 @@
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1250000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1250000;
 CREATE TABLE reference_table_test (value_1 int, value_2 float, value_3 text, value_4 timestamp);
 -- insert some data, and make sure that cannot be create_distributed_table
 INSERT INTO reference_table_test VALUES (1, 1.0, '1', '2016-12-01');
@@ -1360,10 +1359,10 @@ HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_sh
 \c - - - :master_port
 -- as we expect, renaming and setting WITH OIDS does not work for reference tables
 ALTER TABLE reference_table_ddl RENAME TO reference_table_ddl_test;
-ERROR:  renaming distributed tables or their objects is currently unsupported
+ERROR:  renaming distributed tables is currently unsupported
 ALTER TABLE reference_table_ddl SET WITH OIDS;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT FOREIGN KEY and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
 -- now test reference tables against some helper UDFs that Citus provides
 -- cannot delete / drop shards from a reference table
 SELECT master_apply_delete_command('DELETE FROM reference_table_ddl');

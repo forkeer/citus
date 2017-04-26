@@ -2,7 +2,6 @@
 -- MULTI_COPY
 --
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 560000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 560000;
 -- Create a new hash-partitioned table into which to COPY
 CREATE TABLE customer_copy_hash (
         c_custkey integer,
@@ -740,7 +739,7 @@ SELECT shardid, nodename, nodeport
 
 -- disable the first node
 SELECT master_disable_node('localhost', :worker_1_port);
-NOTICE:  Node localhost:57637 has active shard placements. Some queries may fail after this operation. Use select master_add_node('localhost', 57637) to add this node back.
+NOTICE:  Node localhost:57637 has active shard placements. Some queries may fail after this operation. Use SELECT master_activate_node('localhost', 57637) to activate this node back.
  master_disable_node 
 ---------------------
  
@@ -766,12 +765,12 @@ SELECT shardid, nodename, nodeport
 (6 rows)
 
 -- add the node back
-SELECT master_add_node('localhost', :worker_1_port);
-NOTICE:  Replicating reference table "nation" to all workers
-NOTICE:  Replicating reference table "supplier" to all workers
-         master_add_node         
----------------------------------
- (3,3,localhost,57637,default,f)
+SELECT master_activate_node('localhost', :worker_1_port);
+NOTICE:  Replicating reference table "nation" to the node localhost:57637
+NOTICE:  Replicating reference table "supplier" to the node localhost:57637
+       master_activate_node        
+-----------------------------------
+ (1,1,localhost,57637,default,f,t)
 (1 row)
 
 RESET citus.shard_replication_factor;
@@ -1017,3 +1016,22 @@ SELECT * FROM run_command_on_workers('DROP USER test_user');
 (2 rows)
 
 DROP USER test_user;
+-- Test copy with built-in type without binary output function
+CREATE TABLE test_smgr (
+col1 smgr NOT NULL,
+col2 character varying(255) NOT NULL
+);
+SELECT create_reference_table('test_smgr');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+\COPY test_smgr FROM STDIN WITH (format CSV)
+SELECT * FROM test_smgr;
+     col1      | col2  
+---------------+-------
+ magnetic disk |  test
+(1 row)
+
+DROP TABLE test_smgr;

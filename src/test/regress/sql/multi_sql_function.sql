@@ -3,7 +3,6 @@
 --
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1230000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1230000;
 
 
 CREATE FUNCTION sql_test_no_1() RETURNS bigint AS '
@@ -41,16 +40,6 @@ CREATE FUNCTION sql_test_no_4() RETURNS bigint AS '
 		o_orderkey = l_orderkey;
 ' LANGUAGE SQL;
 
-CREATE FUNCTION sql_test_no_6(integer) RETURNS bigint AS  $$
-	SELECT
-		count(*)
-	FROM
-		orders, lineitem
-	WHERE
-		o_orderkey = l_orderkey AND
-		l_suppkey > $1;
-$$ LANGUAGE SQL RETURNS NULL ON NULL INPUT;
-
 SET citus.task_executor_type TO 'task-tracker';
 SET client_min_messages TO INFO;
 
@@ -67,11 +56,6 @@ SET citus.task_executor_type TO 'real-time';
 -- now, run plain SQL functions
 SELECT sql_test_no_1();
 SELECT sql_test_no_2();
-
--- plain SQL functions with parameters cannot be executed
--- FIXME: temporarily disabled, bad error message - waiting for proper
--- parametrized query support
--- SELECT sql_test_no_6(155);
 
 -- test router executor parameterized sql functions
 CREATE TABLE temp_table (
@@ -126,7 +110,7 @@ SELECT * FROM temp_table ORDER BY key, value;
 
 -- check deletes
 CREATE FUNCTION non_partition_parameter_delete_sql(int) RETURNS void AS $$
-	DELETE FROM prepare_table WHERE key = 0 AND value = $1;
+	DELETE FROM temp_table WHERE key = 0 AND value = $1;
 $$ LANGUAGE SQL;
 
 -- execute 6 times to trigger prepared statement usage
@@ -138,17 +122,34 @@ SELECT non_partition_parameter_delete_sql(52);
 SELECT non_partition_parameter_delete_sql(62);
 
 -- check after deletes
-SELECT * FROM prepare_table ORDER BY key, value;
+SELECT * FROM temp_table ORDER BY key, value;
+
+-- test running parameterized SQL function
+CREATE TABLE test_parameterized_sql(id integer, org_id integer);
+select create_distributed_table('test_parameterized_sql','org_id');
+
+CREATE OR REPLACE FUNCTION test_parameterized_sql_function(org_id_val integer)
+RETURNS TABLE (a bigint)
+AS $$
+    SELECT count(*) AS count_val from test_parameterized_sql where org_id = org_id_val;
+$$ LANGUAGE SQL STABLE;
+
+INSERT INTO test_parameterized_sql VALUES(1, 1);
+
+-- both of them should fail
+SELECT * FROM test_parameterized_sql_function(1);
+SELECT test_parameterized_sql_function(1);
 
 DROP TABLE temp_table;
+DROP TABLE test_parameterized_sql;
 
 -- clean-up functions
 DROP FUNCTION sql_test_no_1();
 DROP FUNCTION sql_test_no_2();
 DROP FUNCTION sql_test_no_3();
 DROP FUNCTION sql_test_no_4();
-DROP FUNCTION sql_test_no_6(int);
 DROP FUNCTION no_parameter_insert_sql();
 DROP FUNCTION non_partition_parameter_insert_sql(int);
 DROP FUNCTION non_partition_parameter_update_sql(int, int);
 DROP FUNCTION non_partition_parameter_delete_sql(int);
+DROP FUNCTION test_parameterized_sql_function(int);
