@@ -22,6 +22,7 @@
 #include "distributed/errormessage.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/multi_logical_planner.h"
+#include "distributed/multi_planner.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "utils/array.h"
@@ -248,15 +249,13 @@ extern bool EnableUniqueJobIds;
 
 
 /* Function declarations for building physical plans and constructing queries */
-extern MultiPlan * MultiPhysicalPlanCreate(MultiTreeRoot *multiTree);
+extern MultiPlan * MultiPhysicalPlanCreate(MultiTreeRoot *multiTree,
+										   PlannerRestrictionContext *
+										   plannerRestrictionContext);
 extern StringInfo ShardFetchQueryString(uint64 shardId);
 extern Task * CreateBasicTask(uint64 jobId, uint32 taskId, TaskType taskType,
 							  char *queryString);
 
-/* Function declarations for shard pruning */
-extern List * PruneShardList(Oid relationId, Index tableId, List *whereClauseList,
-							 List *shardList);
-extern bool ContainsFalseClause(List *whereClauseList);
 extern OpExpr * MakeOpExpression(Var *variable, int16 strategyNumber);
 
 /*

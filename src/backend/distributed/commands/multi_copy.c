@@ -67,6 +67,7 @@
 #include "distributed/placement_connection.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shard_pruning.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "tsearch/ts_locale.h"
@@ -1753,12 +1754,6 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	/* keep the table metadata to avoid looking it up for every tuple */
 	copyDest->tableMetadata = cacheEntry;
 
-	/* determine whether to use binary search */
-	if (partitionMethod != DISTRIBUTE_BY_HASH || !cacheEntry->hasUniformHashDistribution)
-	{
-		copyDest->useBinarySearch = true;
-	}
-
 	if (cacheEntry->replicationModel == REPLICATION_MODEL_2PC)
 	{
 		CoordinatedTransactionUse2PC();
@@ -1835,18 +1830,9 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 {
 	CitusCopyDestReceiver *copyDest = (CitusCopyDestReceiver *) dest;
 
-	DistTableCacheEntry *tableMetadata = copyDest->tableMetadata;
-	char partitionMethod = tableMetadata->partitionMethod;
 	int partitionColumnIndex = copyDest->partitionColumnIndex;
 	TupleDesc tupleDescriptor = copyDest->tupleDescriptor;
 	CopyStmt *copyStatement = copyDest->copyStatement;
-
-	int shardCount = tableMetadata->shardIntervalArrayLength;
-	ShardInterval **shardIntervalCache = tableMetadata->sortedShardIntervalArray;
-
-	bool useBinarySearch = copyDest->useBinarySearch;
-	FmgrInfo *hashFunction = tableMetadata->hashFunction;
-	FmgrInfo *compareFunction = tableMetadata->shardIntervalCompareFunction;
 
 	HTAB *shardConnectionHash = copyDest->shardConnectionHash;
 	CopyOutState copyOutState = copyDest->copyOutState;
@@ -1907,10 +1893,7 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 	 * For reference table, this function blindly returns the tables single
 	 * shard.
 	 */
-	shardInterval = FindShardInterval(partitionColumnValue, shardIntervalCache,
-									  shardCount, partitionMethod,
-									  compareFunction, hashFunction,
-									  useBinarySearch);
+	shardInterval = FindShardInterval(partitionColumnValue, copyDest->tableMetadata);
 	if (shardInterval == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

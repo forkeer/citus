@@ -41,6 +41,7 @@
 #include "distributed/relay_utility.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/shard_pruning.h"
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
@@ -88,13 +89,14 @@ static MultiPlan * CreateSingleTaskRouterPlan(Query *originalQuery,
 static MultiPlan * CreateInsertSelectRouterPlan(Query *originalQuery,
 												PlannerRestrictionContext *
 												plannerRestrictionContext);
+static bool SafeToPushDownSubquery(PlannerRestrictionContext *plannerRestrictionContext,
+								   Query *originalQuery);
 static Task * RouterModifyTaskForShardInterval(Query *originalQuery,
 											   ShardInterval *shardInterval,
 											   RelationRestrictionContext *
 											   restrictionContext,
 											   uint32 taskIdIndex,
 											   bool allRelationsJoinedOnPartitionKey);
-static List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex);
 static bool MasterIrreducibleExpression(Node *expression, bool *varArgument,
 										bool *badCoalesce);
 static bool MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state);
@@ -112,10 +114,6 @@ static Expr * ExtractInsertPartitionValue(Query *query, Var *partitionColumn);
 static Task * RouterSelectTask(Query *originalQuery,
 							   RelationRestrictionContext *restrictionContext,
 							   List **placementList);
-static bool RouterSelectQuery(Query *originalQuery,
-							  RelationRestrictionContext *restrictionContext,
-							  List **placementList, uint64 *anchorShardId,
-							  List **relationShardList, bool replacePrunedQueryWithDummy);
 static bool RelationPrunesToMultipleShards(List *relationShardList);
 static List * TargetShardIntervalsForSelect(Query *query,
 											RelationRestrictionContext *restrictionContext);
@@ -124,8 +122,6 @@ static List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementL
 static Job * RouterQueryJob(Query *query, Task *task, List *placementList);
 static bool MultiRouterPlannableQuery(Query *query,
 									  RelationRestrictionContext *restrictionContext);
-static RelationRestrictionContext * CopyRelationRestrictionContext(
-	RelationRestrictionContext *oldContext);
 static DeferredErrorMessage * InsertSelectQuerySupported(Query *queryTree,
 														 RangeTblEntry *insertRte,
 														 RangeTblEntry *subqueryRte,
@@ -298,7 +294,7 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 	RelationRestrictionContext *relationRestrictionContext =
 		plannerRestrictionContext->relationRestrictionContext;
 	bool allReferenceTables = relationRestrictionContext->allReferenceTables;
-	bool restrictionEquivalenceForPartitionKeys = false;
+	bool safeToPushDownSubquery = false;
 
 	multiPlan->operation = originalQuery->commandType;
 
@@ -314,8 +310,8 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 		return multiPlan;
 	}
 
-	restrictionEquivalenceForPartitionKeys =
-		RestrictionEquivalenceForPartitionKeys(plannerRestrictionContext);
+	safeToPushDownSubquery = SafeToPushDownSubquery(plannerRestrictionContext,
+													originalQuery);
 
 	/*
 	 * Plan select query for each shard in the target table. Do so by replacing the
@@ -335,7 +331,7 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 		modifyTask = RouterModifyTaskForShardInterval(originalQuery, targetShardInterval,
 													  relationRestrictionContext,
 													  taskIdIndex,
-													  restrictionEquivalenceForPartitionKeys);
+													  safeToPushDownSubquery);
 
 		/* add the task if it could be created */
 		if (modifyTask != NULL)
@@ -382,6 +378,36 @@ CreateInsertSelectRouterPlan(Query *originalQuery,
 
 
 /*
+ * SafeToPushDownSubquery returns true if either
+ *    (i)  there exists join in the query and all relations joined on their
+ *         partition keys
+ *    (ii) there exists only union set operations and all relations has
+ *         partition keys in the same ordinal position in the query
+ */
+static bool
+SafeToPushDownSubquery(PlannerRestrictionContext *plannerRestrictionContext,
+					   Query *originalQuery)
+{
+	RelationRestrictionContext *relationRestrictionContext =
+		plannerRestrictionContext->relationRestrictionContext;
+	bool restrictionEquivalenceForPartitionKeys =
+		RestrictionEquivalenceForPartitionKeys(plannerRestrictionContext);
+
+	if (restrictionEquivalenceForPartitionKeys)
+	{
+		return true;
+	}
+
+	if (ContainsUnionSubquery(originalQuery))
+	{
+		return SafeToPushdownUnionSubquery(relationRestrictionContext);
+	}
+
+	return false;
+}
+
+
+/*
  * RouterModifyTaskForShardInterval creates a modify task by
  * replacing the partitioning qual parameter added in multi_planner()
  * with the shardInterval's boundary value. Then perform the normal
@@ -396,7 +422,7 @@ static Task *
 RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInterval,
 								 RelationRestrictionContext *restrictionContext,
 								 uint32 taskIdIndex,
-								 bool allRelationsJoinedOnPartitionKey)
+								 bool safeToPushdownSubquery)
 {
 	Query *copiedQuery = copyObject(originalQuery);
 	RangeTblEntry *copiedInsertRte = ExtractInsertRangeTableEntry(copiedQuery);
@@ -423,8 +449,8 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	bool upsertQuery = false;
 	bool replacePrunedQueryWithDummy = false;
 	bool allReferenceTables = restrictionContext->allReferenceTables;
-	List *hashedOpExpressions = NIL;
-	RestrictInfo *hashedRestrictInfo = NULL;
+	List *shardOpExpressions = NIL;
+	RestrictInfo *shardRestrictionList = NULL;
 
 	/* grab shared metadata lock to stop concurrent placement additions */
 	LockShardDistributionMetadata(shardId, ShareLock);
@@ -436,20 +462,21 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	foreach(restrictionCell, copiedRestrictionContext->relationRestrictionList)
 	{
 		RelationRestriction *restriction = lfirst(restrictionCell);
-		List *originalBaserestrictInfo = restriction->relOptInfo->baserestrictinfo;
+		List *originalBaseRestrictInfo = restriction->relOptInfo->baserestrictinfo;
+		List *extendedBaseRestrictInfo = originalBaseRestrictInfo;
 		Index rteIndex = restriction->index;
 
-		if (!allRelationsJoinedOnPartitionKey || allReferenceTables)
+		if (!safeToPushdownSubquery || allReferenceTables)
 		{
 			continue;
 		}
 
-		hashedOpExpressions = ShardIntervalOpExpressions(shardInterval, rteIndex);
+		shardOpExpressions = ShardIntervalOpExpressions(shardInterval, rteIndex);
+		shardRestrictionList = make_simple_restrictinfo((Expr *) shardOpExpressions);
+		extendedBaseRestrictInfo = lappend(extendedBaseRestrictInfo,
+										   shardRestrictionList);
 
-		hashedRestrictInfo = make_simple_restrictinfo((Expr *) hashedOpExpressions);
-		originalBaserestrictInfo = lappend(originalBaserestrictInfo, hashedRestrictInfo);
-
-		restriction->relOptInfo->baserestrictinfo = originalBaserestrictInfo;
+		restriction->relOptInfo->baserestrictinfo = extendedBaseRestrictInfo;
 	}
 
 	/*
@@ -558,8 +585,10 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
  *
  * The function errors out if the given shard interval does not belong to a hash,
  * range and append distributed tables.
+ *
+ * NB: If you update this, also look at PrunableExpressionsWalker().
  */
-static List *
+List *
 ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex)
 {
 	Oid relationId = shardInterval->relationId;
@@ -575,7 +604,6 @@ ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex)
 			 DISTRIBUTE_BY_APPEND)
 	{
 		Assert(rteIndex > 0);
-
 		partitionColumn = PartitionColumn(relationId, rteIndex);
 	}
 	else
@@ -872,6 +900,15 @@ MultiTaskRouterSelectQuerySupported(Query *query)
 		Query *subquery = (Query *) lfirst(queryCell);
 
 		Assert(subquery->commandType == CMD_SELECT);
+
+		/* pushing down rtes without relations yields (shardCount * expectedRows) */
+		if (subquery->rtable == NIL)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "Subqueries without relations are not allowed in "
+								 "INSERT ... SELECT queries",
+								 NULL, NULL);
+		}
 
 		/* pushing down limit per shard would yield wrong results */
 		if (subquery->limitCount != NULL)
@@ -1974,8 +2011,9 @@ FindShardForInsert(Query *query, DeferredErrorMessage **planningError)
 	if (partitionMethod == DISTRIBUTE_BY_HASH || partitionMethod == DISTRIBUTE_BY_RANGE)
 	{
 		Datum partitionValue = partitionValueConst->constvalue;
-		ShardInterval *shardInterval = FastShardPruning(distributedTableId,
-														partitionValue);
+		DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+		ShardInterval *shardInterval = FindShardInterval(partitionValue, cacheEntry);
+
 		if (shardInterval != NULL)
 		{
 			prunedShardList = list_make1(shardInterval);
@@ -1997,9 +2035,7 @@ FindShardForInsert(Query *query, DeferredErrorMessage **planningError)
 
 		restrictClauseList = list_make1(equalityExpr);
 
-		shardIntervalList = LoadShardIntervalList(distributedTableId);
-		prunedShardList = PruneShardList(distributedTableId, tableId, restrictClauseList,
-										 shardIntervalList);
+		prunedShardList = PruneShards(distributedTableId, tableId, restrictClauseList);
 	}
 
 	prunedShardCount = list_length(prunedShardList);
@@ -2048,50 +2084,6 @@ FindShardForInsert(Query *query, DeferredErrorMessage **planningError)
 
 
 /*
- * FastShardPruning is a higher level API for FindShardInterval function. Given the
- * relationId of the distributed table and partitionValue, FastShardPruning function finds
- * the corresponding shard interval that the partitionValue should be in. FastShardPruning
- * returns NULL if no ShardIntervals exist for the given partitionValue.
- */
-ShardInterval *
-FastShardPruning(Oid distributedTableId, Datum partitionValue)
-{
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
-	int shardCount = cacheEntry->shardIntervalArrayLength;
-	ShardInterval **sortedShardIntervalArray = cacheEntry->sortedShardIntervalArray;
-	bool useBinarySearch = false;
-	char partitionMethod = cacheEntry->partitionMethod;
-	FmgrInfo *shardIntervalCompareFunction = cacheEntry->shardIntervalCompareFunction;
-	bool hasUniformHashDistribution = cacheEntry->hasUniformHashDistribution;
-	FmgrInfo *hashFunction = NULL;
-	ShardInterval *shardInterval = NULL;
-
-	/* determine whether to use binary search */
-	if (partitionMethod != DISTRIBUTE_BY_HASH || !hasUniformHashDistribution)
-	{
-		useBinarySearch = true;
-	}
-
-	/* we only need hash functions for hash distributed tables */
-	if (partitionMethod == DISTRIBUTE_BY_HASH)
-	{
-		hashFunction = cacheEntry->hashFunction;
-	}
-
-	/*
-	 * Call FindShardInterval to find the corresponding shard interval for the
-	 * given partition value.
-	 */
-	shardInterval = FindShardInterval(partitionValue, sortedShardIntervalArray,
-									  shardCount, partitionMethod,
-									  shardIntervalCompareFunction, hashFunction,
-									  useBinarySearch);
-
-	return shardInterval;
-}
-
-
-/*
  * FindShardForUpdateOrDelete finds the shard interval in which an UPDATE or
  * DELETE command should be applied, or sets planningError when the query
  * needs to be applied to multiple or no shards.
@@ -2103,7 +2095,6 @@ FindShardForUpdateOrDelete(Query *query, DeferredErrorMessage **planningError)
 	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
 	char partitionMethod = cacheEntry->partitionMethod;
 	CmdType commandType = query->commandType;
-	List *shardIntervalList = NIL;
 	List *restrictClauseList = NIL;
 	Index tableId = 1;
 	List *prunedShardList = NIL;
@@ -2111,11 +2102,8 @@ FindShardForUpdateOrDelete(Query *query, DeferredErrorMessage **planningError)
 
 	Assert(commandType == CMD_UPDATE || commandType == CMD_DELETE);
 
-	shardIntervalList = LoadShardIntervalList(distributedTableId);
-
 	restrictClauseList = QueryRestrictList(query, partitionMethod);
-	prunedShardList = PruneShardList(distributedTableId, tableId, restrictClauseList,
-									 shardIntervalList);
+	prunedShardList = PruneShards(distributedTableId, tableId, restrictClauseList);
 
 	prunedShardCount = list_length(prunedShardList);
 	if (prunedShardCount != 1)
@@ -2308,7 +2296,7 @@ RouterSelectTask(Query *originalQuery, RelationRestrictionContext *restrictionCo
  * relationShardList is filled with the list of relation-to-shard mappings for
  * the query.
  */
-static bool
+bool
 RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionContext,
 				  List **placementList, uint64 *anchorShardId, List **relationShardList,
 				  bool replacePrunedQueryWithDummy)
@@ -2455,7 +2443,6 @@ TargetShardIntervalsForSelect(Query *query,
 		List *baseRestrictionList = relationRestriction->relOptInfo->baserestrictinfo;
 		List *restrictClauseList = get_all_actual_clauses(baseRestrictionList);
 		List *prunedShardList = NIL;
-		int shardIndex = 0;
 		List *joinInfoList = relationRestriction->relOptInfo->joininfo;
 		List *pseudoRestrictionList = extract_actual_clauses(joinInfoList, true);
 		bool whereFalseQuery = false;
@@ -2471,18 +2458,8 @@ TargetShardIntervalsForSelect(Query *query,
 		whereFalseQuery = ContainsFalseClause(pseudoRestrictionList);
 		if (!whereFalseQuery && shardCount > 0)
 		{
-			List *shardIntervalList = NIL;
-
-			for (shardIndex = 0; shardIndex < shardCount; shardIndex++)
-			{
-				ShardInterval *shardInterval =
-					cacheEntry->sortedShardIntervalArray[shardIndex];
-				shardIntervalList = lappend(shardIntervalList, shardInterval);
-			}
-
-			prunedShardList = PruneShardList(relationId, tableId,
-											 restrictClauseList,
-											 shardIntervalList);
+			prunedShardList = PruneShards(relationId, tableId,
+										  restrictClauseList);
 
 			/*
 			 * Quick bail out. The query can not be router plannable if one
@@ -2962,12 +2939,12 @@ InsertSelectQuery(Query *query)
  * shallowly, for lack of copyObject support.
  *
  * Note that CopyRelationRestrictionContext copies the following fields per relation
- * context: index, relationId, distributedRelation, rte, relOptInfo->baserestrictinfo,
- * relOptInfo->joininfo and prunedShardIntervalList. Also, the function shallowly copies
- * plannerInfo which is read-only. All other parts of the relOptInfo is also shallowly
- * copied.
+ * context: index, relationId, distributedRelation, rte, relOptInfo->baserestrictinfo
+ * and relOptInfo->joininfo. Also, the function shallowly copies plannerInfo and
+ * prunedShardIntervalList which are read-only. All other parts of the relOptInfo
+ * is also shallowly copied.
  */
-static RelationRestrictionContext *
+RelationRestrictionContext *
 CopyRelationRestrictionContext(RelationRestrictionContext *oldContext)
 {
 	RelationRestrictionContext *newContext = (RelationRestrictionContext *)
@@ -3004,8 +2981,7 @@ CopyRelationRestrictionContext(RelationRestrictionContext *oldContext)
 
 		/* not copyable, but readonly */
 		newRestriction->plannerInfo = oldRestriction->plannerInfo;
-		newRestriction->prunedShardIntervalList =
-			copyObject(oldRestriction->prunedShardIntervalList);
+		newRestriction->prunedShardIntervalList = oldRestriction->prunedShardIntervalList;
 
 		newContext->relationRestrictionList =
 			lappend(newContext->relationRestrictionList, newRestriction);

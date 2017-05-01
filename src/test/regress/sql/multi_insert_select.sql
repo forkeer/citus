@@ -96,16 +96,6 @@ FROM
 WHERE
   user_id < 0;
 
--- make sure stable functions in CTEs are evaluated
-INSERT INTO raw_events_second (user_id, value_1)
-WITH sub_cte AS (SELECT evaluate_on_master())
-SELECT
-  user_id, (SELECT * FROM sub_cte)
-FROM
-  raw_events_first
-WHERE
-  user_id < 0;
-
 -- make sure we don't evaluate stable functions with column arguments
 CREATE OR REPLACE FUNCTION evaluate_on_master(x int)
 RETURNS int LANGUAGE plpgsql STABLE
@@ -517,7 +507,7 @@ INSERT INTO agg_events
             FROM
               fist_table_agg;
 
--- We do support some CTEs
+-- We don't support CTEs that consist of const values as well
 INSERT INTO agg_events
   WITH sub_cte AS (SELECT 1)
   SELECT
@@ -733,6 +723,47 @@ WHERE
  GROUP BY
    outer_most.id;
 
+ -- if the given filter was on value_1 as shown in the above, Citus could
+ -- push it down. But here the query is refused
+ INSERT INTO agg_events 
+             (user_id) 
+ SELECT raw_events_first.user_id 
+ FROM   raw_events_first, 
+        raw_events_second 
+ WHERE  raw_events_second.user_id = raw_events_first.value_1 
+        AND raw_events_first.value_2 = 12;
+
+ -- lets do some unsupported query tests with subqueries
+ -- foo is not joined on the partition key so the query is not 
+ -- pushed down
+ INSERT INTO agg_events
+             (user_id, value_4_agg)
+ SELECT
+   outer_most.id, max(outer_most.value)
+ FROM
+ (
+   SELECT f2.id as id, f2.v4 as value FROM
+     (SELECT
+           id
+       FROM   (SELECT reference_table.user_id      AS id
+                FROM   raw_events_first LEFT JOIN
+                       reference_table
+             ON (raw_events_first.value_1 = reference_table.user_id)) AS foo) as f
+   INNER JOIN
+     (SELECT v4,
+           v1,
+           id
+     FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
+                SUM(raw_events_first.value_1) AS v1,
+                raw_events_second.user_id      AS id
+             FROM   raw_events_first,
+                     raw_events_second
+             WHERE  raw_events_first.user_id = raw_events_second.user_id
+             GROUP  BY raw_events_second.user_id
+             HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
+ ON (f.id = f2.id)) as outer_most
+ GROUP BY
+   outer_most.id;
 
 INSERT INTO agg_events
             (value_4_agg,
@@ -1269,6 +1300,30 @@ SET client_min_messages TO INFO;
 
 -- avoid constraint violations
 TRUNCATE raw_events_first;
+
+-- we don't support LIMIT even if it exists in the subqueries 
+-- in where clause
+INSERT INTO agg_events(user_id)
+SELECT user_id 
+FROM   users_table 
+WHERE  user_id 
+  IN (SELECT 
+      user_id 
+        FROM  (
+                (
+                  SELECT 
+                    user_id 
+                    FROM
+                    (
+                      SELECT 
+                        e1.user_id 
+                      FROM 
+                        users_table u1, events_table e1 
+                      WHERE 
+                        e1.user_id = u1.user_id LIMIT 3
+                     ) as f_inner
+                  )
+          ) AS f2); 
 
 -- Altering a table and selecting from it using a multi-shard statement
 -- in the same transaction is allowed because we will use the same

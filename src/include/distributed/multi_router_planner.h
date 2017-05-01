@@ -31,11 +31,18 @@ extern MultiPlan * CreateRouterPlan(Query *originalQuery, Query *query,
 extern MultiPlan * CreateModifyPlan(Query *originalQuery, Query *query,
 									PlannerRestrictionContext *
 									plannerRestrictionContext);
-
+extern bool RouterSelectQuery(Query *originalQuery,
+							  RelationRestrictionContext *restrictionContext,
+							  List **placementList, uint64 *anchorShardId,
+							  List **relationShardList, bool replacePrunedQueryWithDummy);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree);
 extern Query * ReorderInsertSelectTargetLists(Query *originalQuery,
 											  RangeTblEntry *insertRte,
 											  RangeTblEntry *subqueryRte);
+extern List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex);
+extern RelationRestrictionContext * CopyRelationRestrictionContext(
+	RelationRestrictionContext *oldContext);
+
 extern bool InsertSelectQuery(Query *query);
 extern Oid ExtractFirstDistributedTableId(Query *query);
 extern RangeTblEntry * ExtractSelectRangeTableEntry(Query *query);
@@ -44,7 +51,6 @@ extern void AddShardIntervalRestrictionToSelect(Query *subqery,
 												ShardInterval *shardInterval);
 extern ShardInterval * FindShardForInsert(Query *query,
 										  DeferredErrorMessage **planningError);
-extern ShardInterval * FastShardPruning(Oid distributedTableId, Datum partitionValue);
 
 
 #endif /* MULTI_ROUTER_PLANNER_H */
