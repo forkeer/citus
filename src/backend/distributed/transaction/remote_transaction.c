@@ -15,10 +15,12 @@
 #include "miscadmin.h"
 
 #include "access/xact.h"
+#include "distributed/backend_data.h"
 #include "distributed/connection_management.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
 #include "distributed/remote_transaction.h"
+#include "distributed/transaction_identifier.h"
 #include "distributed/transaction_management.h"
 #include "distributed/transaction_recovery.h"
 #include "distributed/worker_manager.h"
@@ -32,12 +34,16 @@ static void WarnAboutLeakedPreparedTransaction(MultiConnection *connection, bool
 
 /*
  * StartRemoteTransactionBeging initiates beginning the remote transaction in
- * a non-blocking manner.
+ * a non-blocking manner. The function sends "BEGIN" followed by
+ * assign_distributed_transaction_id() to assign the distributed transaction
+ * id on the remote node.
  */
 void
 StartRemoteTransactionBegin(struct MultiConnection *connection)
 {
 	RemoteTransaction *transaction = &connection->remoteTransaction;
+	StringInfo beginAndSetDistributedTransactionId = makeStringInfo();
+	DistributedTransactionId *distributedTransactionId = NULL;
 
 	Assert(transaction->transactionState == REMOTE_TRANS_INVALID);
 
@@ -51,8 +57,23 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 	 * side might have been changed, and that would cause problematic
 	 * behaviour.
 	 */
-	if (!SendRemoteCommand(connection,
-						   "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+	appendStringInfoString(beginAndSetDistributedTransactionId,
+						   "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;");
+
+	/*
+	 * Append BEGIN and assign_distributed_transaction_id() statements into a single command
+	 * and send both in one step. The reason is purely performance, we don't want
+	 * seperate roundtrips for these two statements.
+	 */
+	distributedTransactionId = GetCurrentDistributedTransactionId();
+	appendStringInfo(beginAndSetDistributedTransactionId,
+					 "SELECT assign_distributed_transaction_id(%d, %ld, '%s')",
+					 distributedTransactionId->initiatorNodeIdentifier,
+					 distributedTransactionId->transactionNumber,
+					 timestamptz_to_str(distributedTransactionId->timestamp));
+
+
+	if (!SendRemoteCommand(connection, beginAndSetDistributedTransactionId->data))
 	{
 		ReportConnectionError(connection, WARNING);
 		MarkRemoteTransactionFailed(connection, true);
@@ -276,15 +297,20 @@ StartRemoteTransactionAbort(MultiConnection *connection)
 	Assert(transaction->transactionState != REMOTE_TRANS_INVALID);
 
 	/*
-	 * Clear previous results, so we have a better chance to send
-	 * ROLLBACK [PREPARED];
+	 * Clear previous results, so we have a better chance to send ROLLBACK
+	 * [PREPARED]. If we've previously sent a PREPARE TRANSACTION, we always
+	 * want to wait for that result, as that shouldn't take long and will
+	 * reserve resources.  But if there's another query running, we don't want
+	 * to wait, because a longrunning statement may be running, force it to be
+	 * killed in that case.
 	 */
-	ForgetResults(connection);
-
 	if (transaction->transactionState == REMOTE_TRANS_PREPARING ||
 		transaction->transactionState == REMOTE_TRANS_PREPARED)
 	{
 		StringInfoData command;
+
+		/* await PREPARE TRANSACTION results, closing the connection would leave it dangling */
+		ForgetResults(connection);
 
 		initStringInfo(&command);
 		appendStringInfo(&command, "ROLLBACK PREPARED '%s'",
@@ -304,6 +330,14 @@ StartRemoteTransactionAbort(MultiConnection *connection)
 	}
 	else
 	{
+		if (!NonblockingForgetResults(connection))
+		{
+			ShutdownConnection(connection);
+
+			/* FinishRemoteTransactionAbort will emit warning */
+			return;
+		}
+
 		if (!SendRemoteCommand(connection, "ROLLBACK"))
 		{
 			/* no point in reporting a likely redundant message */
@@ -336,16 +370,16 @@ FinishRemoteTransactionAbort(MultiConnection *connection)
 		ReportResultError(connection, result, WARNING);
 		MarkRemoteTransactionFailed(connection, dontRaiseErrors);
 
-		if (transaction->transactionState == REMOTE_TRANS_1PC_ABORTING)
+		if (transaction->transactionState == REMOTE_TRANS_2PC_ABORTING)
 		{
-			ereport(WARNING,
-					(errmsg("failed to abort 2PC transaction \"%s\" on %s:%d",
-							transaction->preparedName, connection->hostname,
-							connection->port)));
+			WarnAboutLeakedPreparedTransaction(connection, isNotCommit);
 		}
 		else
 		{
-			WarnAboutLeakedPreparedTransaction(connection, isNotCommit);
+			ereport(WARNING,
+					(errmsg("failed to abort 1PC transaction \"%s\" on %s:%d",
+							transaction->preparedName, connection->hostname,
+							connection->port)));
 		}
 	}
 
@@ -823,11 +857,27 @@ CheckTransactionHealth(void)
 
 
 /*
- * Assign2PCIdentifier compute the 2PC transaction name to use for a
- * transaction.
+ * Assign2PCIdentifier computes the 2PC transaction name to use for a
+ * transaction. Every prepared transaction should get a new name, i.e. this
+ * function will need to be called again.
  *
- * Every 2PC transaction should get a new name, i.e. this function will need
- * to be called again.
+ * The format of the name is:
+ *
+ * citus_<source group>_<pid>_<distributed transaction number>_<connection number>
+ *
+ * (at most 5+1+10+1+10+20+1+10 = 58 characters, while limit is 64)
+ *
+ * The source group is used to distinguish 2PCs started by different
+ * coordinators. A coordinator will only attempt to recover its own 2PCs.
+ *
+ * The pid is used to distinguish different processes on the coordinator, mainly
+ * to provide some entropy across restarts.
+ *
+ * The distributed transaction number is used to distinguish different
+ * transactions originating from the same node (since restart).
+ *
+ * The connection number is used to distinguish connections made to a node
+ * within the same transaction.
  *
  * NB: we rely on the fact that we don't need to do full escaping on the names
  * generated here.
@@ -835,10 +885,16 @@ CheckTransactionHealth(void)
 static void
 Assign2PCIdentifier(MultiConnection *connection)
 {
-	static uint64 sequence = 0;
+	/* local sequence number used to distinguish different connections */
+	static uint32 connectionNumber = 0;
+
+	/* transaction identifier that is unique across processes */
+	uint64 transactionNumber = CurrentDistributedTransactionNumber();
+
+	/* print all numbers as unsigned to guarantee no minus symbols appear in the name */
 	snprintf(connection->remoteTransaction.preparedName, NAMEDATALEN,
-			 "citus_%d_%d_"UINT64_FORMAT, GetLocalGroupId(),
-			 MyProcPid, sequence++);
+			 "citus_%u_%u_"UINT64_FORMAT "_%u", GetLocalGroupId(), MyProcPid,
+			 transactionNumber, connectionNumber++);
 }
 
 

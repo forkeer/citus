@@ -5,7 +5,6 @@
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 650000;
 
-
 -- Set configuration to print table join order and pruned shards
 
 SET citus.explain_distributed_queries TO off;

@@ -43,15 +43,26 @@ SELECT count(*) FROM pg_dist_transaction;
 (1 row)
 
 \c - - - :worker_1_port
-\d distributed_mx_table
-Table "public.distributed_mx_table"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='distributed_mx_table'::regclass;
  Column | Type  | Modifiers 
 --------+-------+-----------
  key    | text  | not null
  value  | jsonb | 
-Indexes:
-    "distributed_mx_table_pkey" PRIMARY KEY, btree (key)
-    "distributed_mx_table_value_idx" gin (value)
+(2 rows)
+
+\d distributed_mx_table_pkey
+Index "public.distributed_mx_table_pkey"
+ Column | Type | Definition 
+--------+------+------------
+ key    | text | key
+primary key, btree, for table "public.distributed_mx_table"
+
+\d distributed_mx_table_value_idx
+Index "public.distributed_mx_table_value_idx"
+ Column | Type | Definition 
+--------+------+------------
+ value  | text | value
+gin, for table "public.distributed_mx_table"
 
 SELECT repmodel FROM pg_dist_partition
 WHERE logicalrelid = 'distributed_mx_table'::regclass;
@@ -68,15 +79,26 @@ WHERE logicalrelid = 'distributed_mx_table'::regclass;
 (1 row)
 
 \c - - - :worker_2_port
-\d distributed_mx_table
-Table "public.distributed_mx_table"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='distributed_mx_table'::regclass;
  Column | Type  | Modifiers 
 --------+-------+-----------
  key    | text  | not null
  value  | jsonb | 
-Indexes:
-    "distributed_mx_table_pkey" PRIMARY KEY, btree (key)
-    "distributed_mx_table_value_idx" gin (value)
+(2 rows)
+
+\d distributed_mx_table_pkey
+Index "public.distributed_mx_table_pkey"
+ Column | Type | Definition 
+--------+------+------------
+ key    | text | key
+primary key, btree, for table "public.distributed_mx_table"
+
+\d distributed_mx_table_value_idx
+Index "public.distributed_mx_table_value_idx"
+ Column | Type | Definition 
+--------+------+------------
+ value  | text | value
+gin, for table "public.distributed_mx_table"
 
 SELECT repmodel FROM pg_dist_partition
 WHERE logicalrelid = 'distributed_mx_table'::regclass;
@@ -202,11 +224,11 @@ SELECT count(*) FROM pg_tables WHERE tablename = 'objects_for_xacts2' and schema
      0
 (1 row)
 
--- but the shard exists since we do not create shards in a transaction
+-- shard also does not exist since we create shards in a transaction
 SELECT count(*) FROM pg_tables WHERE tablename LIKE 'objects_for_xacts2_%' and schemaname = 'citus_mx_schema_for_xacts';
  count 
 -------
-     1
+     0
 (1 row)
 
 -- make sure that master_drop_all_shards does not work from the worker nodes
@@ -233,8 +255,9 @@ CREATE TABLE should_be_sorted_into_middle (value int);
 PREPARE TRANSACTION 'citus_0_should_be_sorted_into_middle';
 \c - - - :master_port
 -- Add "fake" pg_dist_transaction records and run recovery
-INSERT INTO pg_dist_transaction VALUES (12, 'citus_0_should_commit');
-INSERT INTO pg_dist_transaction VALUES (12, 'citus_0_should_be_forgotten');
+SELECT groupid AS worker_1_group FROM pg_dist_node WHERE nodeport = :worker_1_port \gset
+INSERT INTO pg_dist_transaction VALUES (:worker_1_group, 'citus_0_should_commit');
+INSERT INTO pg_dist_transaction VALUES (:worker_1_group, 'citus_0_should_be_forgotten');
 SELECT recover_prepared_transactions();
 NOTICE:  recovered a prepared transaction on localhost:57637
 CONTEXT:  ROLLBACK PREPARED 'citus_0_should_abort'

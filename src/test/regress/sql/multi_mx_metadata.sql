@@ -27,7 +27,9 @@ SELECT count(*) FROM pg_dist_transaction;
 
 \c - - - :worker_1_port
 
-\d distributed_mx_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='distributed_mx_table'::regclass;
+\d distributed_mx_table_pkey
+\d distributed_mx_table_value_idx
 
 SELECT repmodel FROM pg_dist_partition
 WHERE logicalrelid = 'distributed_mx_table'::regclass;
@@ -37,7 +39,9 @@ WHERE logicalrelid = 'distributed_mx_table'::regclass;
 
 \c - - - :worker_2_port
 
-\d distributed_mx_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='distributed_mx_table'::regclass;
+\d distributed_mx_table_pkey
+\d distributed_mx_table_value_idx
 
 SELECT repmodel FROM pg_dist_partition
 WHERE logicalrelid = 'distributed_mx_table'::regclass;
@@ -124,7 +128,7 @@ SELECT count(*) FROM pg_tables WHERE tablename = 'objects_for_xacts2' and schema
 
 -- the distributed table not exists on the worker node
 SELECT count(*) FROM pg_tables WHERE tablename = 'objects_for_xacts2' and schemaname = 'citus_mx_schema_for_xacts';
--- but the shard exists since we do not create shards in a transaction
+-- shard also does not exist since we create shards in a transaction
 SELECT count(*) FROM pg_tables WHERE tablename LIKE 'objects_for_xacts2_%' and schemaname = 'citus_mx_schema_for_xacts';
 
 -- make sure that master_drop_all_shards does not work from the worker nodes
@@ -150,8 +154,9 @@ PREPARE TRANSACTION 'citus_0_should_be_sorted_into_middle';
 
 \c - - - :master_port
 -- Add "fake" pg_dist_transaction records and run recovery
-INSERT INTO pg_dist_transaction VALUES (12, 'citus_0_should_commit');
-INSERT INTO pg_dist_transaction VALUES (12, 'citus_0_should_be_forgotten');
+SELECT groupid AS worker_1_group FROM pg_dist_node WHERE nodeport = :worker_1_port \gset
+INSERT INTO pg_dist_transaction VALUES (:worker_1_group, 'citus_0_should_commit');
+INSERT INTO pg_dist_transaction VALUES (:worker_1_group, 'citus_0_should_be_forgotten');
 
 SELECT recover_prepared_transactions();
 SELECT count(*) FROM pg_dist_transaction;

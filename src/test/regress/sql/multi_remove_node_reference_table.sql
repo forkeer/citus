@@ -105,6 +105,13 @@ SELECT master_remove_node('localhost', :worker_2_port);
 -- re-add the node for next tests
 SELECT master_add_node('localhost', :worker_2_port);
 
+-- try to disable the node before removing it (this used to crash)
+SELECT master_disable_node('localhost', :worker_2_port);
+SELECT master_remove_node('localhost', :worker_2_port);
+
+-- re-add the node for the next test
+SELECT master_add_node('localhost', :worker_2_port);
+
 -- remove node in a transaction and ROLLBACK
 
 -- status before master_remove_node
@@ -384,7 +391,7 @@ WHERE
 \c - - - :master_port
 
 -- verify table structure is changed
-\d remove_node_reference_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.remove_node_reference_table'::regclass;
 
 -- re-add the node for next tests
 SELECT master_add_node('localhost', :worker_2_port);

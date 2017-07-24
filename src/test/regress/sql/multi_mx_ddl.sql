@@ -20,19 +20,22 @@ ALTER TABLE mx_ddl_table ALTER COLUMN version SET NOT NULL;
 
 
 -- See that the changes are applied on coordinator, worker tables and shards
-\d mx_ddl_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
+\d ddl_test*_index
 
 \c - - - :worker_1_port
 
-\d mx_ddl_table
-
-\d mx_ddl_table_1220088
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
+\d ddl_test*_index
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table_1220088'::regclass;
+\d ddl_test*_index_1220088
 
 \c - - - :worker_2_port
 
-\d mx_ddl_table
-
-\d mx_ddl_table_1220089
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
+\d ddl_test*_index
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table_1220089'::regclass;
+\d ddl_test*_index_1220089
 
 INSERT INTO mx_ddl_table VALUES (37, 78, 2);
 INSERT INTO mx_ddl_table VALUES (38, 78);
@@ -68,19 +71,22 @@ ALTER TABLE mx_ddl_table DROP COLUMN version;
 
 
 -- See that the changes are applied on coordinator, worker tables and shards
-\d mx_ddl_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
+\di ddl_test*_index
 
 \c - - - :worker_1_port
 
-\d mx_ddl_table
-
-\d mx_ddl_table_1220088
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
+\di ddl_test*_index
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table_1220088'::regclass;
+\di ddl_test*_index_1220088
 
 \c - - - :worker_2_port
 
-\d mx_ddl_table
-
-\d mx_ddl_table_1220089
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
+\di ddl_test*_index
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table_1220089'::regclass;
+\di ddl_test*_index_1220089
 
 -- Show that DDL commands are done within a two-phase commit transaction
 \c - - - :master_port
@@ -102,15 +108,17 @@ SELECT create_distributed_table('mx_sequence', 'key');
 
 \c - - - :worker_1_port
 
-SELECT groupid FROM pg_dist_local_group;
-SELECT last_value FROM mx_sequence_value_seq;
+SELECT last_value AS worker_1_lastval FROM mx_sequence_value_seq \gset
 
 \c - - - :worker_2_port
 
-SELECT groupid FROM pg_dist_local_group;
-SELECT last_value FROM mx_sequence_value_seq;
+SELECT last_value AS worker_2_lastval FROM mx_sequence_value_seq \gset
 
 \c - - - :master_port
+
+-- don't look at the actual values because they rely on the groupids of the nodes
+-- which can change depending on the tests which have run before this one
+SELECT :worker_1_lastval = :worker_2_lastval;
 
 -- the type of sequences can't be changed
 ALTER TABLE mx_sequence ALTER value TYPE BIGINT;

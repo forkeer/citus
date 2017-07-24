@@ -35,7 +35,8 @@ static const char *CitusNodeTagNamesD[] = {
 	"ShardInterval",
 	"ShardPlacement",
 	"RelationShard",
-	"DeferredErrorMessage"
+	"DeferredErrorMessage",
+	"GroupShardPlacement"
 };
 
 const char **CitusNodeTagNames = CitusNodeTagNamesD;
@@ -294,6 +295,10 @@ GetRangeTblKind(RangeTblEntry *rte)
 	switch (rte->rtekind)
 	{
 		/* directly rtekind if it's not possibly an extended RTE */
+#if (PG_VERSION_NUM >= 100000)
+		case RTE_TABLEFUNC:
+		case RTE_NAMEDTUPLESTORE:
+#endif
 		case RTE_RELATION:
 		case RTE_SUBQUERY:
 		case RTE_JOIN:
@@ -334,8 +339,6 @@ citus_extradata_container(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
-
-#if (PG_VERSION_NUM >= 90600)
 
 static void
 CopyUnsupportedCitusNode(struct ExtensibleNode *newnode,
@@ -386,6 +389,7 @@ const ExtensibleNodeMethods nodeMethods[] =
 	DEFINE_NODE_METHODS(RelationShard),
 	DEFINE_NODE_METHODS(Task),
 	DEFINE_NODE_METHODS(DeferredErrorMessage),
+	DEFINE_NODE_METHODS(GroupShardPlacement),
 
 	/* nodes with only output support */
 	DEFINE_NODE_METHODS_NO_READ(MultiNode),
@@ -399,12 +403,10 @@ const ExtensibleNodeMethods nodeMethods[] =
 	DEFINE_NODE_METHODS_NO_READ(MultiCartesianProduct),
 	DEFINE_NODE_METHODS_NO_READ(MultiExtendedOp)
 };
-#endif
 
 void
 RegisterNodes(void)
 {
-#if (PG_VERSION_NUM >= 90600)
 	int off;
 
 	StaticAssertExpr(lengthof(nodeMethods) == lengthof(CitusNodeTagNamesD),
@@ -414,5 +416,4 @@ RegisterNodes(void)
 	{
 		RegisterExtensibleNodeMethods(&nodeMethods[off]);
 	}
-#endif
 }

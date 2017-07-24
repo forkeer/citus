@@ -35,15 +35,12 @@ extern bool RouterSelectQuery(Query *originalQuery,
 							  RelationRestrictionContext *restrictionContext,
 							  List **placementList, uint64 *anchorShardId,
 							  List **relationShardList, bool replacePrunedQueryWithDummy);
+extern List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree);
-extern Query * ReorderInsertSelectTargetLists(Query *originalQuery,
-											  RangeTblEntry *insertRte,
-											  RangeTblEntry *subqueryRte);
 extern List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex);
 extern RelationRestrictionContext * CopyRelationRestrictionContext(
 	RelationRestrictionContext *oldContext);
 
-extern bool InsertSelectQuery(Query *query);
 extern Oid ExtractFirstDistributedTableId(Query *query);
 extern RangeTblEntry * ExtractSelectRangeTableEntry(Query *query);
 extern RangeTblEntry * ExtractInsertRangeTableEntry(Query *query);

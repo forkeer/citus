@@ -16,6 +16,7 @@
 
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/insert_select_planner.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_planner.h"
@@ -49,6 +50,11 @@ static CustomScanMethods TaskTrackerCustomScanMethods = {
 static CustomScanMethods RouterCustomScanMethods = {
 	"Citus Router",
 	RouterCreateScan
+};
+
+static CustomScanMethods CoordinatorInsertSelectCustomScanMethods = {
+	"Citus INSERT ... SELECT via coordinator",
+	CoordinatorInsertSelectCreateScan
 };
 
 static CustomScanMethods DelayedErrorCustomScanMethods = {
@@ -225,7 +231,7 @@ IsModifyCommand(Query *query)
 	CmdType commandType = query->commandType;
 
 	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
-		commandType == CMD_DELETE || query->hasModifyingCTE)
+		commandType == CMD_DELETE)
 	{
 		return true;
 	}
@@ -273,9 +279,17 @@ CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery, Query *query
 
 	if (IsModifyCommand(query))
 	{
-		/* modifications are always routed through the same planner/executor */
-		distributedPlan =
-			CreateModifyPlan(originalQuery, query, plannerRestrictionContext);
+		if (InsertSelectIntoDistributedTable(originalQuery))
+		{
+			distributedPlan =
+				CreateInsertSelectPlan(originalQuery, plannerRestrictionContext);
+		}
+		else
+		{
+			/* modifications are always routed through the same planner/executor */
+			distributedPlan =
+				CreateModifyPlan(originalQuery, query, plannerRestrictionContext);
+		}
 
 		Assert(distributedPlan);
 	}
@@ -422,7 +436,7 @@ SerializeMultiPlan(MultiPlan *multiPlan)
 	char *serializedMultiPlan = NULL;
 	Const *multiPlanData = NULL;
 
-	serializedMultiPlan = CitusNodeToString(multiPlan);
+	serializedMultiPlan = nodeToString(multiPlan);
 
 	multiPlanData = makeNode(Const);
 	multiPlanData->consttype = CSTRINGOID;
@@ -450,7 +464,7 @@ DeserializeMultiPlan(Node *node)
 	multiPlanData = (Const *) node;
 	serializedMultiPlan = DatumGetCString(multiPlanData->constvalue);
 
-	multiPlan = (MultiPlan *) CitusStringToNode(serializedMultiPlan);
+	multiPlan = (MultiPlan *) stringToNode(serializedMultiPlan);
 	Assert(CitusIsA(multiPlan, MultiPlan));
 
 	return multiPlan;
@@ -494,6 +508,12 @@ FinalizePlan(PlannedStmt *localPlan, MultiPlan *multiPlan)
 			break;
 		}
 
+		case MULTI_EXECUTOR_COORDINATOR_INSERT_SELECT:
+		{
+			customScan->methods = &CoordinatorInsertSelectCustomScanMethods;
+			break;
+		}
+
 		default:
 		{
 			customScan->methods = &DelayedErrorCustomScanMethods;
@@ -506,7 +526,6 @@ FinalizePlan(PlannedStmt *localPlan, MultiPlan *multiPlan)
 	customScan->custom_private = list_make1(multiPlanData);
 	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
 
-	/* check if we have a master query */
 	if (multiPlan->masterQuery)
 	{
 		finalPlan = FinalizeNonRouterPlan(localPlan, multiPlan, customScan);
@@ -634,14 +653,14 @@ RemoteScanRangeTableEntry(List *columnNameList)
 
 /*
  * CheckNodeIsDumpable checks that the passed node can be dumped using
- * CitusNodeToString(). As this checks is expensive, it's only active when
+ * nodeToString(). As this checks is expensive, it's only active when
  * assertions are enabled.
  */
 static void
 CheckNodeIsDumpable(Node *node)
 {
 #ifdef USE_ASSERT_CHECKING
-	char *out = CitusNodeToString(node);
+	char *out = nodeToString(node);
 	pfree(out);
 #endif
 }

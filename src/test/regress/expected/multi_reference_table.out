@@ -39,7 +39,9 @@ SELECT
 FROM
 	pg_dist_shard_placement
 WHERE
-	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'reference_table_test'::regclass);
+	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'reference_table_test'::regclass)
+ORDER BY
+	placementid;
  shardid | shardstate | nodename  | nodeport 
 ---------+------------+-----------+----------
  1250000 |          1 | localhost |    57637
@@ -822,7 +824,9 @@ SELECT
 FROM
 	pg_dist_shard_placement
 WHERE
-	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'reference_table_test_fourth'::regclass);
+	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'reference_table_test_fourth'::regclass)
+ORDER BY
+	placementid;
  shardid | shardstate | nodename  | nodeport 
 ---------+------------+-----------+----------
  1250003 |          1 | localhost |    57637
@@ -1091,12 +1095,11 @@ LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_te
        2
 (2 rows)
 
-SET client_min_messages TO NOTICE;
 SET citus.log_multi_join_order TO FALSE;
 SET citus.shard_count TO DEFAULT;
 SET citus.task_executor_type to "real-time";
 -- some INSERT .. SELECT queries that involve both hash distributed and reference tables
--- should error out since we're inserting into reference table where 
+-- should go via coordinator since we're inserting into reference table where 
 -- not all the participants are reference tables
 INSERT INTO
 	reference_table_test (value_1)
@@ -1105,9 +1108,10 @@ SELECT
 FROM
 	colocated_table_test, colocated_table_test_2
 WHERE
-	colocated_table_test.value_1 = colocated_table_test.value_1;
-ERROR:  only reference tables may be queried when targeting a reference table with INSERT ... SELECT
--- should error out, same as the above
+	colocated_table_test.value_1 = colocated_table_test_2.value_1;
+DEBUG:  only reference tables may be queried when targeting a reference table with distributed INSERT ... SELECT
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
+-- should go via coordinator, same as the above
 INSERT INTO
 	reference_table_test (value_1)
 SELECT
@@ -1116,7 +1120,8 @@ FROM
 	colocated_table_test, reference_table_test
 WHERE
 	colocated_table_test.value_1 = reference_table_test.value_1;
-ERROR:  only reference tables may be queried when targeting a reference table with INSERT ... SELECT
+DEBUG:  only reference tables may be queried when targeting a reference table with distributed INSERT ... SELECT
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 -- now, insert into the hash partitioned table and use reference 
 -- tables in the SELECT queries
 INSERT INTO
@@ -1150,8 +1155,7 @@ RETURNING value_1, value_2;
        2 |       2
 (2 rows)
 
--- partition column value comes from reference table but still first error is
--- on data type mismatch
+-- partition column value comes from reference table, goes via coordinator
 INSERT INTO
 	colocated_table_test (value_1, value_2)
 SELECT
@@ -1159,11 +1163,10 @@ SELECT
 FROM
 	colocated_table_test_2, reference_table_test
 WHERE
-	colocated_table_test_2.value_4 = reference_table_test.value_4
-RETURNING value_1, value_2;
-ERROR:  INSERT INTO ... SELECT partition columns in the source table and subquery do not match
+	colocated_table_test_2.value_4 = reference_table_test.value_4;
+DEBUG:  cannot perform distributed INSERT INTO ... SELECT because the partition columns in the source table and subquery do not match
 DETAIL:  The data type of the target table's partition column should exactly match the data type of the corresponding simple column reference in the subquery.
--- partition column value comes from reference table which should error out
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 INSERT INTO
 	colocated_table_test (value_1, value_2)
 SELECT
@@ -1171,10 +1174,11 @@ SELECT
 FROM
 	colocated_table_test_2, reference_table_test
 WHERE
-	colocated_table_test_2.value_4 = reference_table_test.value_4
-RETURNING value_1, value_2;
-ERROR:  INSERT INTO ... SELECT partition columns in the source table and subquery do not match
+	colocated_table_test_2.value_4 = reference_table_test.value_4;
+DEBUG:  cannot perform distributed INSERT INTO ... SELECT becuase the partition columns in the source table and subquery do not match
 DETAIL:  The target table's partition column should correspond to a partition column in the subquery.
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
+RESET client_min_messages;
 -- some tests for mark_tables_colocated
 -- should error out
 SELECT mark_tables_colocated('colocated_table_test_2', ARRAY['reference_table_test']);
@@ -1327,43 +1331,61 @@ ALTER TABLE reference_table_ddl DROP COLUMN value_1;
 ALTER TABLE reference_table_ddl ALTER COLUMN value_2 SET DEFAULT 25.0;
 ALTER TABLE reference_table_ddl ALTER COLUMN value_3 SET NOT NULL;
 -- see that Citus applied all DDLs to the table
-\d reference_table_ddl
-          Table "public.reference_table_ddl"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.reference_table_ddl'::regclass;
  Column  |            Type             |  Modifiers   
 ---------+-----------------------------+--------------
  value_2 | double precision            | default 25.0
  value_3 | text                        | not null
  value_4 | timestamp without time zone | 
  value_5 | double precision            | 
-Indexes:
-    "reference_index_2" btree (value_2, value_3)
+(4 rows)
+
+\d reference_index_2
+    Index "public.reference_index_2"
+ Column  |       Type       | Definition 
+---------+------------------+------------
+ value_2 | double precision | value_2
+ value_3 | text             | value_3
+btree, for table "public.reference_table_ddl"
 
 -- also to the shard placements
 \c - - - :worker_1_port
-\d reference_table_ddl*
-      Table "public.reference_table_ddl_1250019"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.reference_table_ddl_1250019'::regclass;
  Column  |            Type             |  Modifiers   
 ---------+-----------------------------+--------------
  value_2 | double precision            | default 25.0
  value_3 | text                        | not null
  value_4 | timestamp without time zone | 
  value_5 | double precision            | 
-Indexes:
-    "reference_index_2_1250019" btree (value_2, value_3)
+(4 rows)
+
+\d reference_index_2_1250019
+Index "public.reference_index_2_1250019"
+ Column  |       Type       | Definition 
+---------+------------------+------------
+ value_2 | double precision | value_2
+ value_3 | text             | value_3
+btree, for table "public.reference_table_ddl_1250019"
 
 \c - - - :master_port
 DROP INDEX reference_index_2;
 NOTICE:  using one-phase commit for distributed DDL commands
 HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 \c - - - :worker_1_port
-\d reference_table_ddl*
-      Table "public.reference_table_ddl_1250019"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.reference_table_ddl_1250019'::regclass;
  Column  |            Type             |  Modifiers   
 ---------+-----------------------------+--------------
  value_2 | double precision            | default 25.0
  value_3 | text                        | not null
  value_4 | timestamp without time zone | 
  value_5 | double precision            | 
+(4 rows)
+
+\di reference_index_2*
+          List of relations
+ Schema | Name | Type | Owner | Table 
+--------+------+------+-------+-------
+(0 rows)
 
 \c - - - :master_port
 -- as we expect, renaming and setting WITH OIDS does not work for reference tables
@@ -1587,19 +1609,22 @@ SELECT * FROM reference_table_test;
       10 |       2 | 2       | Fri Dec 02 00:00:00 2016
 (1 row)
 
--- do not allow mixing transactions
+-- DML+master_modify_multiple_shards is allowed
 BEGIN;
 INSERT INTO reference_table_test VALUES (2, 2.0, '2', '2016-12-02');
 SELECT master_modify_multiple_shards('DELETE FROM colocated_table_test');
-ERROR:  multi-shard data modifications must not appear in transaction blocks which contain single-shard DML commands
+ master_modify_multiple_shards 
+-------------------------------
+                            10
+(1 row)
+
 ROLLBACK;
--- Do not allow DDL and modification in the same transaction
+-- DDL+DML is allowed
 BEGIN;
 ALTER TABLE reference_table_test ADD COLUMN value_dummy INT;
 NOTICE:  using one-phase commit for distributed DDL commands
 HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 INSERT INTO reference_table_test VALUES (2, 2.0, '2', '2016-12-02');
-ERROR:  single-shard DML commands must not appear in transaction blocks which contain multi-shard data modifications
 ROLLBACK;
 -- clean up tables
 DROP TABLE reference_table_test, reference_table_test_second, reference_table_test_third, 

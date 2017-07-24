@@ -9,17 +9,24 @@
 #
 # Note that we use variant comparison files to test version dependent regression
 # test results. For more information:
-# http://www.postgresql.org/docs/9.5/static/regress-variant.html
+# http://www.postgresql.org/docs/current/static/regress-variant.html
 # ----------
 
 # ---
 # Tests around schema changes, these are run first, so there's no preexisting objects.
 # ---
 test: multi_extension
+test: multi_703_upgrade
 test: multi_cluster_management
+test: multi_test_helpers
 test: multi_table_ddl
 test: multi_name_lengths
 test: multi_metadata_access
+
+# ---
+# Tests for partitioning support
+# ---
+test: multi_partitioning_utils
 
 # ----------
 # The following distributed tests depend on creating a partitioned table and
@@ -37,7 +44,7 @@ test: multi_insert_select
 # ----------
 # Miscellaneous tests to check our query planning behavior
 # ----------
-test: multi_deparse_shard_query
+test: multi_deparse_shard_query multi_distributed_transaction_id
 test: multi_basic_queries multi_complex_expressions 
 test: multi_explain
 test: multi_subquery multi_subquery_complex_queries multi_subquery_behavioral_analytics

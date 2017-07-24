@@ -19,6 +19,7 @@
 
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "distributed/backend_data.h"
 #include "distributed/connection_management.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/multi_shard_transaction.h"
@@ -73,6 +74,8 @@ BeginCoordinatedTransaction(void)
 	}
 
 	CurrentCoordinatedTransactionState = COORD_TRANS_STARTED;
+
+	AssignDistributedTransactionId();
 }
 
 
@@ -168,8 +171,10 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			XactModificationLevel = XACT_MODIFICATION_NONE;
 			dlist_init(&InProgressTransactions);
 			CoordinatedTransactionUses2PC = false;
+
+			UnSetDistributedTransactionId();
+			break;
 		}
-		break;
 
 		case XACT_EVENT_ABORT:
 		{
@@ -204,14 +209,21 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			dlist_init(&InProgressTransactions);
 			CoordinatedTransactionUses2PC = false;
 			subXactAbortAttempted = false;
+			UnSetDistributedTransactionId();
+			break;
 		}
-		break;
 
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
+		{
+			break;
+		}
+
 		case XACT_EVENT_PREPARE:
-		{ }
-		  break;
+		{
+			UnSetDistributedTransactionId();
+			break;
+		}
 
 		case XACT_EVENT_PRE_COMMIT:
 		{
@@ -270,8 +282,8 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 * committed. This handles failure at COMMIT/PREPARE time.
 			 */
 			PostCommitMarkFailedShardPlacements(CoordinatedTransactionUses2PC);
+			break;
 		}
-		break;
 
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 		case XACT_EVENT_PRE_PREPARE:
@@ -282,8 +294,8 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 								errmsg("cannot use 2PC in transactions involving "
 									   "multiple servers")));
 			}
+			break;
 		}
-		break;
 	}
 }
 

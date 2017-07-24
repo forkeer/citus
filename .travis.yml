@@ -1,7 +1,10 @@
 sudo: required
 dist: trusty
 language: c
-cache: apt
+cache:
+  apt: true
+  directories:
+  - /home/travis/postgresql
 branches:
   except: [ /^open-.*$/ ]
 env:
@@ -11,10 +14,10 @@ env:
     # During pull request builds (not push builds), use custom-built PostgreSQL
     - USE_CUSTOM_PG="${TRAVIS_PULL_REQUEST_SHA}"
   matrix:
-    - PGVERSION=9.5
     - PGVERSION=9.6
+    - PGVERSION=10
 before_install:
-  - git clone -b v0.6.1 --depth 1 https://github.com/citusdata/tools.git
+  - git clone -b v0.6.3 --depth 1 https://github.com/citusdata/tools.git
   - sudo make -C tools install
   - setup_apt
   - curl https://install.citusdata.com/community/deb.sh | sudo bash
@@ -24,7 +27,7 @@ install:
   - install_pg
   - install_custom_pg
   # download and install HLL manually, as custom builds won't satisfy deps
-  - apt-get download "postgresql-${PGVERSION}-hll=2.10.1.citus-1" && sudo dpkg --force-confold --force-confdef --force-all -i *hll*.deb
+  - apt-get download "postgresql-${PGVERSION}-hll=2.10.2.citus-1" && sudo dpkg --force-confold --force-confdef --force-all -i *hll*.deb
 before_script: citus_indent --quiet --check
 script: CFLAGS=-Werror pg_travis_multi_test check
 after_success:

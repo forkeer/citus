@@ -18,13 +18,6 @@
 #include "distributed/multi_server_executor.h"
 
 
-#if (PG_VERSION_NUM >= 90600)
-#define tuplecount_t uint64
-#else
-#define tuplecount_t long
-#endif
-
-
 typedef struct CitusScanState
 {
 	CustomScanState customScanState;  /* underlying custom scan node */
@@ -38,6 +31,7 @@ typedef struct CitusScanState
 extern Node * RealTimeCreateScan(CustomScan *scan);
 extern Node * TaskTrackerCreateScan(CustomScan *scan);
 extern Node * RouterCreateScan(CustomScan *scan);
+extern Node * CoordinatorInsertSelectCreateScan(CustomScan *scan);
 extern Node * DelayedErrorCreateScan(CustomScan *scan);
 extern void CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags);
 extern TupleTableSlot * RealTimeExecScan(CustomScanState *node);

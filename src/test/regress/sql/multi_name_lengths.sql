@@ -14,7 +14,7 @@ SELECT master_create_distributed_table('too_long_1234567890123456789012345678901
 SELECT master_create_worker_shards('too_long_12345678901234567890123456789012345678901234567890', '2', '2');
 
 \c - - - :worker_1_port
-\d too_long_*
+\dt too_long_*
 \c - - - :master_port
 
 -- Verify that the UDF works and rejects bad arguments.
@@ -50,7 +50,7 @@ ALTER TABLE name_lengths ADD EXCLUDE (int_col_1234567890123456789012345678901234
 ALTER TABLE name_lengths ADD CHECK (date_col_12345678901234567890123456789012345678901234567890 > '2014-01-01'::date);
 
 \c - - - :worker_1_port
-\d name_lengths_*
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.name_lengths_225002'::regclass;
 \c - - - :master_port
 
 -- Placeholders for unsupported add constraints with EXPLICIT names that are too long
@@ -59,7 +59,7 @@ ALTER TABLE name_lengths ADD CONSTRAINT nl_exclude_12345678901234567890123456789
 ALTER TABLE name_lengths ADD CONSTRAINT nl_checky_12345678901234567890123456789012345678901234567890 CHECK (date_col_12345678901234567890123456789012345678901234567890 >= '2014-01-01'::date);
 
 \c - - - :worker_1_port
-\d nl_*
+SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.name_lengths_225002'::regclass;
 \c - - - :master_port
 
 -- Placeholders for RENAME operations
@@ -99,13 +99,16 @@ CREATE TABLE sneaky_name_lengths (
         col2 integer not null,
         CONSTRAINT checky_12345678901234567890123456789012345678901234567890 CHECK (int_col_123456789012345678901234567890123456789012345678901234 > 100)
         );
-\d sneaky_name_lengths*
+
+\di public.sneaky_name_lengths*
+SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.sneaky_name_lengths'::regclass;
 
 SELECT master_create_distributed_table('sneaky_name_lengths', 'int_col_123456789012345678901234567890123456789012345678901234', 'hash');
 SELECT master_create_worker_shards('sneaky_name_lengths', '2', '2');
 
 \c - - - :worker_1_port
-\d sneaky_name_lengths*
+\di public.sneaky*225006
+SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.sneaky_name_lengths_225006'::regclass;
 \c - - - :master_port
 
 DROP TABLE sneaky_name_lengths CASCADE;
@@ -121,7 +124,7 @@ SELECT master_create_distributed_table('sneaky_name_lengths', 'col1', 'hash');
 SELECT master_create_worker_shards('sneaky_name_lengths', '2', '2');
 
 \c - - - :worker_1_port
-\d sneaky_name_lengths*
+\di unique*225008
 \c - - - :master_port
 
 DROP TABLE sneaky_name_lengths CASCADE;
@@ -135,7 +138,7 @@ SELECT master_create_distributed_table('too_long_1234567890123456789012345678901
 SELECT master_create_worker_shards('too_long_12345678901234567890123456789012345678901234567890', '2', '2');
 
 \c - - - :worker_1_port
-\d too_long_*
+\dt *225000000000*
 \c - - - :master_port
 
 DROP TABLE too_long_12345678901234567890123456789012345678901234567890 CASCADE;
@@ -147,9 +150,30 @@ CREATE TABLE U&"elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E
 SELECT master_create_distributed_table(U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!', 'col1', 'hash');
 SELECT master_create_worker_shards(U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!', '2', '2');
 
+-- Verify that quoting is used in shard_name
+SELECT shard_name(U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!'::regclass, min(shardid))
+FROM pg_dist_shard
+WHERE logicalrelid = U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!'::regclass;
+
 \c - - - :worker_1_port
-\d elephant_*
+\dt public.elephant_*
+\di public.elephant_*
 \c - - - :master_port
+
+-- Verify that shard_name UDF supports schemas
+CREATE SCHEMA multi_name_lengths;
+CREATE TABLE multi_name_lengths.too_long_12345678901234567890123456789012345678901234567890 (
+        col1 integer not null,
+        col2 integer not null);
+SELECT master_create_distributed_table('multi_name_lengths.too_long_12345678901234567890123456789012345678901234567890', 'col1', 'hash');
+SELECT master_create_worker_shards('multi_name_lengths.too_long_12345678901234567890123456789012345678901234567890', 2, 1);
+
+SELECT shard_name('multi_name_lengths.too_long_12345678901234567890123456789012345678901234567890'::regclass, min(shardid))
+FROM pg_dist_shard
+WHERE logicalrelid = 'multi_name_lengths.too_long_12345678901234567890123456789012345678901234567890'::regclass;
+
+
+DROP TABLE multi_name_lengths.too_long_12345678901234567890123456789012345678901234567890;
 
 -- Clean up.
 DROP TABLE name_lengths CASCADE;

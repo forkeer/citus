@@ -144,15 +144,13 @@ NOTICE:  using one-phase commit for distributed DDL commands
 HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 \c - - - :worker_1_port
 -- DDL commands
-\d mx_table
-                           Table "public.mx_table"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
  Column |  Type   |                        Modifiers                         
 --------+---------+----------------------------------------------------------
  col_1  | integer | 
  col_2  | text    | 
  col_3  | bigint  | not null default nextval('mx_table_col_3_seq'::regclass)
-Indexes:
-    "mx_test_uniq_index" UNIQUE, btree (col_1)
+(3 rows)
 
 CREATE INDEX mx_test_index ON mx_table(col_2);
 ERROR:  operation is not allowed on this node
@@ -163,16 +161,15 @@ HINT:  Connect to the coordinator and run it again.
 ALTER TABLE mx_table_2 ADD CONSTRAINT mx_fk_constraint FOREIGN KEY(col_1) REFERENCES mx_table(col_1);
 ERROR:  operation is not allowed on this node
 HINT:  Connect to the coordinator and run it again.
-\d mx_table
-                           Table "public.mx_table"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
  Column |  Type   |                        Modifiers                         
 --------+---------+----------------------------------------------------------
  col_1  | integer | 
  col_2  | text    | 
  col_3  | bigint  | not null default nextval('mx_table_col_3_seq'::regclass)
-Indexes:
-    "mx_test_uniq_index" UNIQUE, btree (col_1)
+(3 rows)
 
+\d mx_test_index
 -- master_modify_multiple_shards
 SELECT master_modify_multiple_shards('UPDATE mx_table SET col_2=''none''');
 ERROR:  operation is not allowed on this node
@@ -266,14 +263,17 @@ SELECT count(*) FROM mx_table;
      5
 (1 row)
 
--- INSERT / SELECT
+-- INSERT / SELECT pulls results to worker
+BEGIN;
+SET LOCAL client_min_messages TO DEBUG;
 INSERT INTO mx_table_2 SELECT * FROM mx_table;
-ERROR:  operation is not allowed on this node
-HINT:  Connect to the coordinator and run it again.
+DEBUG:  distributed INSERT ... SELECT can only be performed from the coordinator
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
+END;
 SELECT count(*) FROM mx_table_2;
  count 
 -------
-     0
+     5
 (1 row)
 
 -- mark_tables_colocated
@@ -335,7 +335,6 @@ SELECT hasmetadata FROM pg_dist_node WHERE nodeport=:worker_2_port;
 (1 row)
 
 \c - - - :worker_2_port
-DELETE FROM pg_dist_node;
 SELECT worker_drop_distributed_table(logicalrelid) FROM pg_dist_partition;
  worker_drop_distributed_table 
 -------------------------------
@@ -343,6 +342,7 @@ SELECT worker_drop_distributed_table(logicalrelid) FROM pg_dist_partition;
  
 (2 rows)
 
+DELETE FROM pg_dist_node;
 \c - - - :worker_1_port
 -- DROP TABLE
 DROP TABLE mx_table;
@@ -372,8 +372,9 @@ FROM pg_dist_shard NATURAL JOIN pg_dist_shard_placement
 WHERE logicalrelid = 'mx_table'::regclass AND nodeport=:worker_1_port
 ORDER BY shardid
 LIMIT 1 \gset
-INSERT INTO pg_dist_shard_placement (nodename, nodeport, shardid, shardstate, shardlength)
-VALUES ('localhost', :worker_2_port, :testshardid, 3, 0);
+SELECT groupid AS worker_2_group FROM pg_dist_node WHERE nodeport = :worker_2_port \gset
+INSERT INTO pg_dist_placement (groupid, shardid, shardstate, shardlength)
+VALUES (:worker_2_group, :testshardid, 3, 0);
 SELECT master_copy_shard_placement(:testshardid, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
 ERROR:  operation is not allowed on this node
 HINT:  Connect to the coordinator and run it again.
@@ -387,7 +388,7 @@ ORDER BY nodeport;
  1270000 | localhost |    57638 |          3
 (2 rows)
 
-DELETE FROM pg_dist_shard_placement WHERE nodeport = :worker_2_port AND shardid = :testshardid;
+DELETE FROM pg_dist_placement WHERE groupid = :worker_2_group AND shardid = :testshardid;
 -- master_get_new_placementid
 SELECT master_get_new_placementid();
 ERROR:  operation is not allowed on this node
@@ -399,23 +400,23 @@ CREATE SEQUENCE some_sequence;
 DROP SEQUENCE some_sequence;
 -- Show that dropping the sequence of an MX table with cascade harms the table and shards
 BEGIN;
-\d mx_table
-                           Table "public.mx_table"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
  Column |  Type   |                        Modifiers                         
 --------+---------+----------------------------------------------------------
  col_1  | integer | 
  col_2  | text    | 
  col_3  | bigint  | not null default nextval('mx_table_col_3_seq'::regclass)
+(3 rows)
 
 DROP SEQUENCE mx_table_col_3_seq CASCADE;
 NOTICE:  drop cascades to default for table mx_table column col_3
-\d mx_table
-   Table "public.mx_table"
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
  Column |  Type   | Modifiers 
 --------+---------+-----------
  col_1  | integer | 
  col_2  | text    | 
  col_3  | bigint  | not null
+(3 rows)
 
 ROLLBACK;
 -- Cleanup

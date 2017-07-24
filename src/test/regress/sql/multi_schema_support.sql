@@ -420,18 +420,18 @@ SET search_path TO public;
 ALTER TABLE test_schema_support.nation_hash ADD COLUMN new_col INT;
 
 -- verify column is added
-\d test_schema_support.nation_hash;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='test_schema_support.nation_hash'::regclass;
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='test_schema_support.nation_hash_1190003'::regclass;
 \c - - - :master_port
 
 ALTER TABLE test_schema_support.nation_hash DROP COLUMN IF EXISTS non_existent_column;
 ALTER TABLE test_schema_support.nation_hash DROP COLUMN IF EXISTS new_col;
 
 -- verify column is dropped
-\d test_schema_support.nation_hash;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='test_schema_support.nation_hash'::regclass;
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='test_schema_support.nation_hash_1190003'::regclass;
 \c - - - :master_port
 
 --test with search_path is set
@@ -439,9 +439,9 @@ SET search_path TO test_schema_support;
 ALTER TABLE nation_hash ADD COLUMN new_col INT;
 
 -- verify column is added
-\d test_schema_support.nation_hash;
+SELECT "Column", "Type", "Modifiers" FROM public.table_desc WHERE relid='test_schema_support.nation_hash'::regclass;
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+SELECT "Column", "Type", "Modifiers" FROM public.table_desc WHERE relid='test_schema_support.nation_hash_1190003'::regclass;
 \c - - - :master_port
 
 SET search_path TO test_schema_support;
@@ -449,9 +449,9 @@ ALTER TABLE nation_hash DROP COLUMN IF EXISTS non_existent_column;
 ALTER TABLE nation_hash DROP COLUMN IF EXISTS new_col;
 
 -- verify column is dropped
-\d test_schema_support.nation_hash;
+SELECT "Column", "Type", "Modifiers" FROM public.table_desc WHERE relid='test_schema_support.nation_hash'::regclass;
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+SELECT "Column", "Type", "Modifiers" FROM public.table_desc WHERE relid='test_schema_support.nation_hash_1190003'::regclass;
 \c - - - :master_port
 
 
@@ -462,18 +462,18 @@ SET search_path TO public;
 CREATE INDEX index1 ON test_schema_support.nation_hash(n_name);
 
 --verify INDEX is created
-\d test_schema_support.nation_hash;
+\d test_schema_support.index1
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+\d test_schema_support.index1_1190003
 \c - - - :master_port
 
 -- DROP index
 DROP INDEX test_schema_support.index1;
 
 --verify INDEX is dropped
-\d test_schema_support.nation_hash;
+\d test_schema_support.index1
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+\d test_schema_support.index1_1190003
 \c - - - :master_port
 
 --test with search_path is set
@@ -483,9 +483,9 @@ SET search_path TO test_schema_support;
 CREATE INDEX index1 ON nation_hash(n_name);
 
 --verify INDEX is created
-\d test_schema_support.nation_hash;
+\d test_schema_support.index1
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+\d test_schema_support.index1_1190003
 \c - - - :master_port
 
 -- DROP index
@@ -493,9 +493,9 @@ SET search_path TO test_schema_support;
 DROP INDEX index1;
 
 --verify INDEX is dropped
-\d test_schema_support.nation_hash;
+\d test_schema_support.index1
 \c - - - :worker_1_port
-\d test_schema_support.nation_hash_1190003;
+\d test_schema_support.index1_1190003
 \c - - - :master_port
 
 
@@ -765,3 +765,20 @@ SELECT run_command_on_workers('DROP OWNED BY "test-user" CASCADE');
 SELECT run_command_on_coordinator_and_workers('DROP USER "test-user"');
 
 DROP FUNCTION run_command_on_coordinator_and_workers(p_sql text);
+
+-- test run_command_on_* UDFs with schema
+CREATE SCHEMA run_test_schema;
+CREATE TABLE run_test_schema.test_table(id int);
+SELECT create_distributed_table('run_test_schema.test_table','id');
+
+-- randomly insert data to evaluate below UDFs better
+INSERT INTO run_test_schema.test_table VALUES(1);
+INSERT INTO run_test_schema.test_table VALUES(7);
+INSERT INTO run_test_schema.test_table VALUES(9);
+
+-- try UDFs which call shard_name as a subroutine
+SELECT sum(result::int) FROM run_command_on_placements('run_test_schema.test_table','SELECT pg_table_size(''%s'')');
+SELECT sum(result::int) FROM run_command_on_shards('run_test_schema.test_table','SELECT pg_table_size(''%s'')');
+
+-- Clean up the created schema
+DROP SCHEMA run_test_schema CASCADE;

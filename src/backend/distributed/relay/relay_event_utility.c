@@ -166,6 +166,7 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 			 */
 		}
 
+		/* fallthrough */
 		case T_CreateStmt:
 		{
 			CreateStmt *createStmt = (CreateStmt *) parseTree;
@@ -437,25 +438,42 @@ RelayEventExtendNamesForInterShardCommands(Node *parseTree, uint64 leftShardId,
 			foreach(commandCell, commandList)
 			{
 				AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
+				char **referencedTableName = NULL;
+				char **relationSchemaName = NULL;
+
 				if (command->subtype == AT_AddConstraint)
 				{
 					Constraint *constraint = (Constraint *) command->def;
 					if (constraint->contype == CONSTR_FOREIGN)
 					{
-						char **referencedTableName = &(constraint->pktable->relname);
-						char **relationSchemaName = &(constraint->pktable->schemaname);
-
-						/* prefix with schema name if it is not added already */
-						SetSchemaNameIfNotExist(relationSchemaName, rightShardSchemaName);
-
-						/*
-						 * We will not append shard id to referencing table name or
-						 * constraint name. They will be handled when we drop into
-						 * RelayEventExtendNames.
-						 */
-						AppendShardIdToName(referencedTableName, rightShardId);
+						referencedTableName = &(constraint->pktable->relname);
+						relationSchemaName = &(constraint->pktable->schemaname);
 					}
 				}
+#if (PG_VERSION_NUM >= 100000)
+				else if (command->subtype == AT_AttachPartition || command->subtype ==
+						 AT_DetachPartition)
+				{
+					PartitionCmd *partitionCommand = (PartitionCmd *) command->def;
+
+					referencedTableName = &(partitionCommand->name->relname);
+					relationSchemaName = &(partitionCommand->name->schemaname);
+				}
+#endif
+				else
+				{
+					continue;
+				}
+
+				/* prefix with schema name if it is not added already */
+				SetSchemaNameIfNotExist(relationSchemaName, rightShardSchemaName);
+
+				/*
+				 * We will not append shard id to referencing table name or
+				 * constraint name. They will be handled when we drop into
+				 * RelayEventExtendNames.
+				 */
+				AppendShardIdToName(referencedTableName, rightShardId);
 			}
 
 			/* drop into RelayEventExtendNames for non-inter table commands */
@@ -604,7 +622,6 @@ AppendShardIdToName(char **name, uint64 shardId)
 	{
 		snprintf(extendedName, NAMEDATALEN, "%s%s", (*name), shardIdAndSeparator);
 	}
-
 	/*
 	 * Otherwise, we need to truncate the name further to accommodate
 	 * a sufficient hash value. The resulting name will avoid collision
@@ -651,31 +668,18 @@ AppendShardIdToName(char **name, uint64 shardId)
 
 /*
  * shard_name() provides a PG function interface to AppendShardNameToId above.
+ * Returns the name of a shard as a quoted schema-qualified identifier.
  */
 Datum
 shard_name(PG_FUNCTION_ARGS)
 {
-	Oid relationId = InvalidOid;
-	int64 shardId = 0;
+	Oid relationId = PG_GETARG_OID(0);
+	int64 shardId = PG_GETARG_INT64(1);
 	char *relationName = NULL;
 
-	/*
-	 * Have to check arguments for NULLness as it can't be declared STRICT
-	 * because of min/max arguments, which have to be NULLable for new shards.
-	 */
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("object_name cannot be null")));
-	}
-	if (PG_ARGISNULL(1))
-	{
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("shard_id cannot be null")));
-	}
-
-	relationId = PG_GETARG_OID(0);
-	shardId = PG_GETARG_INT64(1);
+	Oid schemaId = InvalidOid;
+	char *schemaName = NULL;
+	char *qualifiedName = NULL;
 
 	CheckCitusVersion(ERROR);
 
@@ -701,5 +705,10 @@ shard_name(PG_FUNCTION_ARGS)
 	}
 
 	AppendShardIdToName(&relationName, shardId);
-	PG_RETURN_TEXT_P(cstring_to_text(relationName));
+
+	schemaId = get_rel_namespace(relationId);
+	schemaName = get_namespace_name(schemaId);
+	qualifiedName = quote_qualified_identifier(schemaName, relationName);
+
+	PG_RETURN_TEXT_P(cstring_to_text(qualifiedName));
 }

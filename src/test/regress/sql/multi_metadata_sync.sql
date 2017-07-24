@@ -8,9 +8,9 @@
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1310000;
 
-SELECT nextval('pg_catalog.pg_dist_shard_placement_placementid_seq') AS last_placement_id
+SELECT nextval('pg_catalog.pg_dist_placement_placementid_seq') AS last_placement_id
 \gset
-ALTER SEQUENCE pg_catalog.pg_dist_shard_placement_placementid_seq RESTART 100000;
+ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 100000;
 
 SELECT nextval('pg_catalog.pg_dist_groupid_seq') AS last_group_id \gset
 SELECT nextval('pg_catalog.pg_dist_node_nodeid_seq') AS last_node_id \gset
@@ -78,7 +78,9 @@ SELECT * FROM pg_dist_node ORDER BY nodeid;
 SELECT * FROM pg_dist_partition ORDER BY logicalrelid;
 SELECT * FROM pg_dist_shard ORDER BY shardid;
 SELECT * FROM pg_dist_shard_placement ORDER BY shardid, nodename, nodeport;
-\d mx_testing_schema.mx_test_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_testing_schema.mx_test_table'::regclass;
+\d mx_testing_schema.mx_test_table_col_1_key
+\d mx_testing_schema.mx_index
 
 -- Check that pg_dist_colocation is not synced
 SELECT * FROM pg_dist_colocation ORDER BY colocationid;
@@ -107,7 +109,7 @@ SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
 
 -- Check that foreign key metadata exists on the worker
 \c - - - :worker_1_port
-\d mx_testing_schema_2.fk_test_2
+SELECT "Constraint", "Definition" FROM table_fkeys WHERE relid='mx_testing_schema_2.fk_test_2'::regclass;
 
 \c - - - :master_port
 DROP TABLE mx_testing_schema_2.fk_test_2;
@@ -126,7 +128,9 @@ SELECT * FROM pg_dist_node ORDER BY nodeid;
 SELECT * FROM pg_dist_partition ORDER BY logicalrelid;
 SELECT * FROM pg_dist_shard ORDER BY shardid;
 SELECT * FROM pg_dist_shard_placement ORDER BY shardid, nodename, nodeport;
-\d mx_testing_schema.mx_test_table
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_testing_schema.mx_test_table'::regclass;
+\d mx_testing_schema.mx_test_table_col_1_key
+\d mx_testing_schema.mx_index
 SELECT count(*) FROM pg_trigger WHERE tgrelid='mx_testing_schema.mx_test_table'::regclass;
 
 -- Make sure that start_metadata_sync_to_node cannot be called inside a transaction
@@ -190,8 +194,13 @@ CREATE TABLE mx_test_schema_2.mx_table_2 (col1 int, col2 text);
 CREATE INDEX mx_index_2 ON mx_test_schema_2.mx_table_2 (col2);
 ALTER TABLE mx_test_schema_2.mx_table_2 ADD CONSTRAINT mx_fk_constraint FOREIGN KEY(col1) REFERENCES mx_test_schema_1.mx_table_1(col1);
 
-\d mx_test_schema_1.mx_table_1
-\d mx_test_schema_2.mx_table_2
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_test_schema_1.mx_table_1'::regclass;
+\d mx_test_schema_1.mx_table_1_col1_key
+\d mx_test_schema_1.mx_index_1
+
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_test_schema_2.mx_table_2'::regclass;
+\d mx_test_schema_2.mx_index_2
+SELECT "Constraint", "Definition" FROM table_fkeys WHERE relid='mx_test_schema_2.mx_table_2'::regclass;
 
 SELECT create_distributed_table('mx_test_schema_1.mx_table_1', 'col1');
 SELECT create_distributed_table('mx_test_schema_2.mx_table_2', 'col1');
@@ -222,8 +231,7 @@ ORDER BY
 \c - - - :worker_1_port
 
 -- Check that tables are created
-\d mx_test_schema_1.mx_table_1
-\d mx_test_schema_2.mx_table_2
+\dt mx_test_schema_?.mx_table_?
 
 -- Check that table metadata are created
 SELECT 
@@ -260,16 +268,17 @@ SELECT * FROM pg_dist_shard_placement ORDER BY shardid, nodename, nodeport;
 SET citus.multi_shard_commit_protocol TO '2pc';
 SET client_min_messages TO 'ERROR';
 CREATE INDEX mx_index_3 ON mx_test_schema_2.mx_table_2 USING hash (col1);
-CREATE UNIQUE INDEX mx_index_4 ON mx_test_schema_2.mx_table_2(col1);
+ALTER TABLE mx_test_schema_2.mx_table_2 ADD CONSTRAINT mx_table_2_col1_key UNIQUE (col1);
 \c - - - :worker_1_port
-\d mx_test_schema_2.mx_table_2
+\d mx_test_schema_2.mx_index_3
+\d mx_test_schema_2.mx_table_2_col1_key
 
 -- Check that DROP INDEX statement is propagated
 \c - - - :master_port
 SET citus.multi_shard_commit_protocol TO '2pc';
 DROP INDEX mx_test_schema_2.mx_index_3;
 \c - - - :worker_1_port
-\d mx_test_schema_2.mx_table_2
+\d mx_test_schema_2.mx_index_3
 
 -- Check that ALTER TABLE statements are propagated
 \c - - - :master_port
@@ -285,7 +294,8 @@ FOREIGN KEY
 REFERENCES
 	mx_test_schema_2.mx_table_2(col1);
 \c - - - :worker_1_port
-\d mx_test_schema_1.mx_table_1
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_test_schema_1.mx_table_1'::regclass;
+SELECT "Constraint", "Definition" FROM table_fkeys WHERE relid='mx_test_schema_1.mx_table_1'::regclass;
 
 -- Check that foreign key constraint with NOT VALID works as well
 \c - - - :master_port
@@ -301,7 +311,7 @@ REFERENCES
 	mx_test_schema_2.mx_table_2(col1)
 NOT VALID;
 \c - - - :worker_1_port
-\d mx_test_schema_1.mx_table_1
+SELECT "Constraint", "Definition" FROM table_fkeys WHERE relid='mx_test_schema_1.mx_table_1'::regclass;
 
 -- Check that mark_tables_colocated call propagates the changes to the workers 
 \c - - - :master_port
@@ -417,13 +427,13 @@ DROP TABLE mx_table_with_small_sequence;
 -- Create an MX table with (BIGSERIAL) sequences
 CREATE TABLE mx_table_with_sequence(a int, b BIGSERIAL, c BIGSERIAL);
 SELECT create_distributed_table('mx_table_with_sequence', 'a');
-\d mx_table_with_sequence
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_table_with_sequence'::regclass;
 \ds mx_table_with_sequence_b_seq
 \ds mx_table_with_sequence_c_seq
 
 -- Check that the sequences created on the metadata worker as well
 \c - - - :worker_1_port
-\d mx_table_with_sequence
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_table_with_sequence'::regclass;
 \ds mx_table_with_sequence_b_seq
 \ds mx_table_with_sequence_c_seq
 
@@ -437,7 +447,7 @@ SELECT start_metadata_sync_to_node('localhost', :worker_2_port);
 
 \c - - - :worker_2_port
 SELECT groupid FROM pg_dist_local_group;
-\d mx_table_with_sequence
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_table_with_sequence'::regclass;
 \ds mx_table_with_sequence_b_seq
 \ds mx_table_with_sequence_c_seq
 SELECT nextval('mx_table_with_sequence_b_seq');
@@ -469,10 +479,11 @@ DROP TABLE mx_table_with_sequence;
 -- Remove a node so that shards and sequences won't be created on table creation. Therefore,
 -- we can test that start_metadata_sync_to_node can actually create the sequence with proper
 -- owner
-CREATE TABLE pg_dist_shard_placement_temp AS SELECT * FROM pg_dist_shard_placement;
+CREATE TABLE pg_dist_placement_temp AS SELECT * FROM pg_dist_placement;
 CREATE TABLE pg_dist_partition_temp AS SELECT * FROM pg_dist_partition;
-DELETE FROM pg_dist_shard_placement;
+DELETE FROM pg_dist_placement;
 DELETE FROM pg_dist_partition;
+SELECT groupid AS old_worker_2_group FROM pg_dist_node WHERE nodeport = :worker_2_port \gset
 SELECT master_remove_node('localhost', :worker_2_port);
 
  -- the master user needs superuser permissions to change the replication model
@@ -508,11 +519,25 @@ SELECT * FROM mx_table ORDER BY a;
 \c - mx_user - :master_port
 DROP TABLE mx_table;
 
+-- put the metadata back into a consistent state
 \c - postgres - :master_port
-INSERT INTO pg_dist_shard_placement SELECT * FROM pg_dist_shard_placement_temp;
+INSERT INTO pg_dist_placement SELECT * FROM pg_dist_placement_temp;
 INSERT INTO pg_dist_partition SELECT * FROM pg_dist_partition_temp;
-DROP TABLE pg_dist_shard_placement_temp;
+DROP TABLE pg_dist_placement_temp;
 DROP TABLE pg_dist_partition_temp;
+UPDATE pg_dist_placement
+  SET groupid = (SELECT groupid FROM pg_dist_node WHERE nodeport = :worker_2_port)
+  WHERE groupid = :old_worker_2_group;
+\c - - - :worker_1_port
+UPDATE pg_dist_placement
+  SET groupid = (SELECT groupid FROM pg_dist_node WHERE nodeport = :worker_2_port)
+  WHERE groupid = :old_worker_2_group;
+\c - - - :worker_2_port
+UPDATE pg_dist_placement
+  SET groupid = (SELECT groupid FROM pg_dist_node WHERE nodeport = :worker_2_port)
+  WHERE groupid = :old_worker_2_group;
+
+\c - - - :master_port
 SELECT stop_metadata_sync_to_node('localhost', :worker_2_port);
 
 DROP USER mx_user;
@@ -525,10 +550,10 @@ DROP USER mx_user;
 \c - - - :master_port
 CREATE TABLE mx_ref (col_1 int, col_2 text);
 SELECT create_reference_table('mx_ref');
-\d mx_ref
+\dt mx_ref
 
 \c - - - :worker_1_port
-\d mx_ref
+\dt mx_ref
 SELECT
 	logicalrelid, partmethod, repmodel, shardid, placementid, nodename, nodeport
 FROM
@@ -546,10 +571,12 @@ SELECT shardid AS ref_table_shardid FROM pg_dist_shard WHERE logicalrelid='mx_re
 \c - - - :master_port
 ALTER TABLE mx_ref ADD COLUMN col_3 NUMERIC DEFAULT 0;
 CREATE INDEX mx_ref_index ON mx_ref(col_1);
-\d mx_ref
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ref'::regclass;
+\d mx_ref_index
 
 \c - - - :worker_1_port
-\d mx_ref
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ref'::regclass;
+\d mx_ref_index
 	
 -- Check that metada is cleaned successfully upon drop table
 \c - - - :master_port
@@ -563,8 +590,12 @@ SELECT * FROM pg_dist_shard_placement WHERE shardid=:ref_table_shardid;
 
 -- Check that master_add_node propagates the metadata about new placements of a reference table
 \c - - - :master_port
-CREATE TABLE tmp_shard_placement AS SELECT * FROM pg_dist_shard_placement WHERE nodeport = :worker_2_port;
-DELETE FROM pg_dist_shard_placement WHERE nodeport = :worker_2_port;
+SELECT groupid AS old_worker_2_group
+  FROM pg_dist_node WHERE nodeport = :worker_2_port \gset
+CREATE TABLE tmp_placement AS
+  SELECT * FROM pg_dist_placement WHERE groupid = :old_worker_2_group;
+DELETE FROM pg_dist_placement
+  WHERE groupid = :old_worker_2_group;
 SELECT master_remove_node('localhost', :worker_2_port);
 CREATE TABLE mx_ref (col_1 int, col_2 text);
 SELECT create_reference_table('mx_ref');
@@ -592,9 +623,19 @@ FROM pg_dist_shard NATURAL JOIN pg_dist_shard_placement
 WHERE logicalrelid='mx_ref'::regclass
 ORDER BY shardid, nodeport;
 
+-- Get the metadata back into a consistent state
 \c - - - :master_port
-INSERT INTO pg_dist_shard_placement (SELECT * FROM tmp_shard_placement);
-DROP TABLE tmp_shard_placement;
+INSERT INTO pg_dist_placement (SELECT * FROM tmp_placement);
+DROP TABLE tmp_placement;
+
+UPDATE pg_dist_placement
+  SET groupid = (SELECT groupid FROM pg_dist_node WHERE nodeport = :worker_2_port)
+  WHERE groupid = :old_worker_2_group;
+
+\c - - - :worker_1_port
+UPDATE pg_dist_placement
+  SET groupid = (SELECT groupid FROM pg_dist_node WHERE nodeport = :worker_2_port)
+  WHERE groupid = :old_worker_2_group;
 
 -- Cleanup
 \c - - - :master_port
@@ -613,4 +654,4 @@ RESET citus.multi_shard_commit_protocol;
 ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART :last_group_id;
 ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART :last_node_id;
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART :last_colocation_id;
-ALTER SEQUENCE pg_catalog.pg_dist_shard_placement_placementid_seq RESTART :last_placement_id;
+ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART :last_placement_id;

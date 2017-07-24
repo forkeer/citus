@@ -436,17 +436,9 @@ for my $port (@workerPorts)
 my @arguments = (
     "--host", $host,
     '--port', $masterPort,
-    '--user', $user
+    '--user', $user,
+    '--bindir', "tmp_check/tmp-bin"
 );
-
-if ($majorversion eq '9.5' || $majorversion eq '9.6')
-{
-    push(@arguments, '--bindir', "tmp_check/tmp-bin");
-}
-else
-{
-    die "Citus is not compatible with the detected PostgreSQL version $majorversion";
-}
 
 # Add load extension parameters to the argument list
 for my $extension (@extensions)
@@ -462,7 +454,6 @@ my $startTime = time();
 # Finally run the tests
 if ($vanillatest)
 {
-    push(@arguments, "--schedule=${postgresSrcdir}/parallel_schedule");
     $ENV{PGHOST} = $host;
     $ENV{PGPORT} = $masterPort;
     $ENV{PGUSER} = $user;
