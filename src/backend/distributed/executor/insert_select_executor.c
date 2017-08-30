@@ -14,8 +14,10 @@
 #include "distributed/insert_select_planner.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_executor.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_planner.h"
+#include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
 #include "executor/executor.h"
 #include "nodes/execnodes.h"
@@ -60,6 +62,16 @@ CoordinatorInsertSelectExecScan(CustomScanState *node)
 
 		ereport(DEBUG1, (errmsg("Collecting INSERT ... SELECT results on coordinator")));
 
+		/*
+		 * If we are dealing with partitioned table, we also need to lock its
+		 * partitions. Here we only lock targetRelation, we acquire necessary
+		 * locks on selected tables during execution of those select queries.
+		 */
+		if (PartitionedTable(targetRelationId))
+		{
+			LockPartitionRelations(targetRelationId, RowExclusiveLock);
+		}
+
 		ExecuteSelectIntoRelation(targetRelationId, insertTargetList, selectQuery,
 								  executorState);
 
@@ -87,10 +99,10 @@ ExecuteSelectIntoRelation(Oid targetRelationId, List *insertTargetList,
 	List *columnNameList = NIL;
 	bool stopOnFailure = false;
 	char partitionMethod = 0;
+	Var *partitionColumn = NULL;
+	int partitionColumnIndex = -1;
 
 	CitusCopyDestReceiver *copyDest = NULL;
-
-	BeginOrContinueCoordinatedTransaction();
 
 	partitionMethod = PartitionMethod(targetRelationId);
 	if (partitionMethod == DISTRIBUTE_BY_NONE)
@@ -98,17 +110,32 @@ ExecuteSelectIntoRelation(Oid targetRelationId, List *insertTargetList,
 		stopOnFailure = true;
 	}
 
+	partitionColumn = PartitionColumn(targetRelationId, 0);
+
 	/* build the list of column names for the COPY statement */
 	foreach(insertTargetCell, insertTargetList)
 	{
 		TargetEntry *insertTargetEntry = (TargetEntry *) lfirst(insertTargetCell);
+		char *columnName = insertTargetEntry->resname;
+
+		/* load the column information from pg_attribute */
+		AttrNumber attrNumber = get_attnum(targetRelationId, columnName);
+
+		/* check whether this is the partition column */
+		if (partitionColumn != NULL && attrNumber == partitionColumn->varattno)
+		{
+			Assert(partitionColumnIndex == -1);
+
+			partitionColumnIndex = list_length(columnNameList);
+		}
 
 		columnNameList = lappend(columnNameList, insertTargetEntry->resname);
 	}
 
 	/* set up a DestReceiver that copies into the distributed table */
 	copyDest = CreateCitusCopyDestReceiver(targetRelationId, columnNameList,
-										   executorState, stopOnFailure);
+										   partitionColumnIndex, executorState,
+										   stopOnFailure);
 
 	ExecuteIntoDestReceiver(selectQuery, paramListInfo, (DestReceiver *) copyDest);
 

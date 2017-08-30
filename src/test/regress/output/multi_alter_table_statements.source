@@ -332,7 +332,7 @@ SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.lineite
 ALTER TABLE lineitem_alter ADD COLUMN int_column3 INTEGER,
 	ALTER COLUMN int_column1 SET STATISTICS 10;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, ATTACH|DETACH PARTITION and TYPE subcommands are supported.
 ALTER TABLE lineitem_alter DROP COLUMN int_column1, DROP COLUMN int_column2;
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.lineitem_alter'::regclass;
      Column      |         Type          | Modifiers 
@@ -364,12 +364,12 @@ ERROR:  cannot execute ALTER TABLE command involving partition column
 -- Verify that we error out on unsupported statement types
 ALTER TABLE lineitem_alter ALTER COLUMN l_orderkey SET STATISTICS 100;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, ATTACH|DETACH PARTITION and TYPE subcommands are supported.
 ALTER TABLE lineitem_alter DROP CONSTRAINT IF EXISTS non_existent_contraint;
 NOTICE:  constraint "non_existent_contraint" of relation "lineitem_alter" does not exist, skipping
 ALTER TABLE lineitem_alter SET WITHOUT OIDS;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, ATTACH|DETACH PARTITION and TYPE subcommands are supported.
 -- Verify that we error out in case of postgres errors on supported statement
 -- types
 ALTER TABLE lineitem_alter ADD COLUMN new_column non_existent_type;
@@ -505,19 +505,20 @@ CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
 SAVEPOINT my_savepoint;
 CREATE INDEX temp_index_3 ON lineitem_alter(l_partkey);
 ROLLBACK;
--- but that actually rolling back to it is not
+-- and also rolling back to it is also allowed
 BEGIN;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
 SAVEPOINT my_savepoint;
 CREATE INDEX temp_index_3 ON lineitem_alter(l_partkey);
 ROLLBACK TO my_savepoint;
 COMMIT;
-ERROR:  cannot ROLLBACK TO SAVEPOINT in transactions which modify distributed tables
 SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
- indexname | tablename 
------------+-----------
-(0 rows)
+  indexname   |   tablename    
+--------------+----------------
+ temp_index_2 | lineitem_alter
+(1 row)
 
+DROP INDEX temp_index_2;
 -- Add column on only one worker...
 \c - - - :worker_2_port
 ALTER TABLE lineitem_alter_220000 ADD COLUMN first integer;
@@ -758,11 +759,9 @@ ALTER TABLE lineitem_alter ALTER COLUMN l_orderkey SET STATISTICS 100;
 ALTER TABLE lineitem_alter DROP CONSTRAINT IF EXISTS non_existent_contraint;
 NOTICE:  constraint "non_existent_contraint" of relation "lineitem_alter" does not exist, skipping
 ALTER TABLE lineitem_alter SET WITHOUT OIDS;
--- even distribution column can be dropped however postgresql prevents this.
+-- distribution column still cannot be dropped.
 ALTER TABLE lineitem_alter DROP COLUMN l_orderkey;
-ERROR:  cannot drop table lineitem_alter column l_orderkey because other objects depend on it
-DETAIL:  table lineitem_alter depends on table lineitem_alter column l_orderkey
-HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ERROR:  cannot execute ALTER TABLE command dropping partition column
 -- Even unique indexes on l_partkey (non-partition column) are allowed.
 -- Citus would have prevented that.
 CREATE UNIQUE INDEX unique_lineitem_partkey on lineitem_alter(l_partkey);

@@ -62,6 +62,7 @@
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_copy.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_shard_transaction.h"
 #include "distributed/placement_connection.h"
@@ -74,6 +75,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/memutils.h"
 
 
@@ -149,10 +151,6 @@ CitusCopyFrom(CopyStmt *copyStatement, char *completionTag)
 	bool isCopyFromWorker = false;
 
 	BeginOrContinueCoordinatedTransaction();
-	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
-	{
-		CoordinatedTransactionUse2PC();
-	}
 
 	/* disallow COPY to/from file or program except for superusers */
 	if (copyStatement->filename != NULL && !superuser())
@@ -242,6 +240,7 @@ CopyFromWorkerNode(CopyStmt *copyStatement, char *completionTag)
 	uint32 connectionFlags = FOR_DML;
 
 	masterConnection = GetNodeConnection(connectionFlags, nodeName, nodePort);
+	MarkRemoteTransactionCritical(masterConnection);
 	ClaimConnectionExclusively(masterConnection);
 
 	RemoteTransactionBeginIfNecessary(masterConnection);
@@ -288,12 +287,16 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	DestReceiver *dest = NULL;
 
 	Relation distributedRelation = NULL;
+	Relation copiedDistributedRelation = NULL;
+	Form_pg_class copiedDistributedRelationTuple = NULL;
 	TupleDesc tupleDescriptor = NULL;
 	uint32 columnCount = 0;
 	Datum *columnValues = NULL;
 	bool *columnNulls = NULL;
 	int columnIndex = 0;
 	List *columnNameList = NIL;
+	Var *partitionColumn = NULL;
+	int partitionColumnIndex = INVALID_PARTITION_COLUMN_INDEX;
 	TupleTableSlot *tupleTableSlot = NULL;
 
 	EState *executorState = NULL;
@@ -321,6 +324,14 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	tupleTableSlot->tts_values = columnValues;
 	tupleTableSlot->tts_isnull = columnNulls;
 
+	/* determine the partition column index in the tuple descriptor */
+	partitionColumn = PartitionColumn(tableId, 0);
+	if (partitionColumn != NULL)
+	{
+		partitionColumnIndex = partitionColumn->varattno - 1;
+	}
+
+	/* build the list of column names for remote COPY statements */
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		Form_pg_attribute currentColumn = tupleDescriptor->attrs[columnIndex];
@@ -345,22 +356,57 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	}
 
 	/* set up the destination for the COPY */
-	copyDest = CreateCitusCopyDestReceiver(tableId, columnNameList, executorState,
-										   stopOnFailure);
+	copyDest = CreateCitusCopyDestReceiver(tableId, columnNameList, partitionColumnIndex,
+										   executorState, stopOnFailure);
 	dest = (DestReceiver *) copyDest;
 	dest->rStartup(dest, 0, tupleDescriptor);
+
+	/*
+	 * BeginCopyFrom opens all partitions of given partitioned table with relation_open
+	 * and it expects its caller to close those relations. We do not have direct access
+	 * to opened relations, thus we are changing relkind of partitioned tables so that
+	 * Postgres will treat those tables as regular relations and will not open its
+	 * partitions.
+	 *
+	 * We will make this change on copied version of distributed relation to not change
+	 * anything in relcache.
+	 */
+	if (PartitionedTable(tableId))
+	{
+		copiedDistributedRelation = (Relation) palloc0(sizeof(RelationData));
+		copiedDistributedRelationTuple = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
+
+		/*
+		 * There is no need to deep copy everything. We will just deep copy of the fields
+		 * we will change.
+		 */
+		memcpy(copiedDistributedRelation, distributedRelation, sizeof(RelationData));
+		memcpy(copiedDistributedRelationTuple, distributedRelation->rd_rel,
+			   CLASS_TUPLE_SIZE);
+
+		copiedDistributedRelationTuple->relkind = RELKIND_RELATION;
+		copiedDistributedRelation->rd_rel = copiedDistributedRelationTuple;
+	}
+	else
+	{
+		/*
+		 * If we are not dealing with partitioned table, copiedDistributedRelation is same
+		 * as distributedRelation.
+		 */
+		copiedDistributedRelation = distributedRelation;
+	}
 
 	/* initialize copy state to read from COPY data source */
 #if (PG_VERSION_NUM >= 100000)
 	copyState = BeginCopyFrom(NULL,
-							  distributedRelation,
+							  copiedDistributedRelation,
 							  copyStatement->filename,
 							  copyStatement->is_program,
 							  NULL,
 							  copyStatement->attlist,
 							  copyStatement->options);
 #else
-	copyState = BeginCopyFrom(distributedRelation,
+	copyState = BeginCopyFrom(copiedDistributedRelation,
 							  copyStatement->filename,
 							  copyStatement->is_program,
 							  copyStatement->attlist,
@@ -763,7 +809,7 @@ OpenCopyConnections(CopyStmt *copyStatement, ShardConnections *shardConnections,
 		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
 		char *nodeUser = CurrentUserName();
 		MultiConnection *connection = NULL;
-		uint32 connectionFlags = FOR_DML;
+		uint32 connectionFlags = FOR_DML | CONNECTION_PER_PLACEMENT;
 		StringInfo copyCommand = NULL;
 		PGresult *result = NULL;
 
@@ -1678,10 +1724,14 @@ CopyFlushOutput(CopyOutState cstate, char *start, char *pointer)
 /*
  * CreateCitusCopyDestReceiver creates a DestReceiver that copies into
  * a distributed table.
+ *
+ * The caller should provide the list of column names to use in the
+ * remote COPY statement, and the partition column index in the tuple
+ * descriptor (*not* the column name list).
  */
 CitusCopyDestReceiver *
-CreateCitusCopyDestReceiver(Oid tableId, List *columnNameList, EState *executorState,
-							bool stopOnFailure)
+CreateCitusCopyDestReceiver(Oid tableId, List *columnNameList, int partitionColumnIndex,
+							EState *executorState, bool stopOnFailure)
 {
 	CitusCopyDestReceiver *copyDest = NULL;
 
@@ -1697,6 +1747,7 @@ CreateCitusCopyDestReceiver(Oid tableId, List *columnNameList, EState *executorS
 	/* set up output parameters */
 	copyDest->distributedRelationId = tableId;
 	copyDest->columnNameList = columnNameList;
+	copyDest->partitionColumnIndex = partitionColumnIndex;
 	copyDest->executorState = executorState;
 	copyDest->stopOnFailure = stopOnFailure;
 	copyDest->memoryContext = CurrentMemoryContext;
@@ -1722,15 +1773,12 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	char *schemaName = get_namespace_name(schemaOid);
 
 	Relation distributedRelation = NULL;
-	int columnIndex = 0;
 	List *columnNameList = copyDest->columnNameList;
 	List *quotedColumnNameList = NIL;
 
 	ListCell *columnNameCell = NULL;
 
 	char partitionMethod = '\0';
-	Var *partitionColumn = PartitionColumn(tableId, 0);
-	int partitionColumnIndex = -1;
 	DistTableCacheEntry *cacheEntry = NULL;
 
 	CopyStmt *copyStatement = NULL;
@@ -1795,7 +1843,10 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	/* keep the table metadata to avoid looking it up for every tuple */
 	copyDest->tableMetadata = cacheEntry;
 
-	if (cacheEntry->replicationModel == REPLICATION_MODEL_2PC)
+	BeginOrContinueCoordinatedTransaction();
+
+	if (cacheEntry->replicationModel == REPLICATION_MODEL_2PC ||
+		MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
 	{
 		CoordinatedTransactionUse2PC();
 	}
@@ -1814,36 +1865,22 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	copyDest->columnOutputFunctions =
 		ColumnOutputFunctions(inputTupleDescriptor, copyOutState->binary);
 
-	/* find the partition column index in the column list */
+	/* ensure the column names are properly quoted in the COPY statement */
 	foreach(columnNameCell, columnNameList)
 	{
 		char *columnName = (char *) lfirst(columnNameCell);
 		char *quotedColumnName = (char *) quote_identifier(columnName);
 
-		/* load the column information from pg_attribute */
-		AttrNumber attrNumber = get_attnum(tableId, columnName);
-
-		/* check whether this is the partition column */
-		if (partitionColumn != NULL && attrNumber == partitionColumn->varattno)
-		{
-			Assert(partitionColumnIndex == -1);
-
-			partitionColumnIndex = columnIndex;
-		}
-
-		columnIndex++;
-
 		quotedColumnNameList = lappend(quotedColumnNameList, quotedColumnName);
 	}
 
-	if (partitionMethod != DISTRIBUTE_BY_NONE && partitionColumnIndex == -1)
+	if (partitionMethod != DISTRIBUTE_BY_NONE &&
+		copyDest->partitionColumnIndex == INVALID_PARTITION_COLUMN_INDEX)
 	{
 		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 						errmsg("the partition column of table %s should have a value",
 							   quote_qualified_identifier(schemaName, relationName))));
 	}
-
-	copyDest->partitionColumnIndex = partitionColumnIndex;
 
 	/* define the template for the COPY statement that is sent to workers */
 	copyStatement = makeNode(CopyStmt);
@@ -1906,7 +1943,7 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 	 * tables. Note that, reference tables has NULL partition column values so
 	 * skip the check.
 	 */
-	if (partitionColumnIndex >= 0)
+	if (partitionColumnIndex != INVALID_PARTITION_COLUMN_INDEX)
 	{
 		if (columnNulls[partitionColumnIndex])
 		{

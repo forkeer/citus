@@ -29,6 +29,7 @@
 #include "catalog/pg_type.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/distribution_column.h"
+#include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
@@ -86,6 +87,7 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 
 	EnsureCoordinator();
 	EnsureSuperUser();
+	EnsureModificationsCanRun();
 	CheckCitusVersion(ERROR);
 
 	PreventTransactionChain(true, "start_metadata_sync_to_node");
@@ -110,6 +112,15 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 	}
 
 	MarkNodeHasMetadata(nodeNameString, nodePort, true);
+
+	if (!WorkerNodeIsPrimary(workerNode))
+	{
+		/*
+		 * If this is a secondary node we can't actually sync metadata to it; we assume
+		 * the primary node is receiving metadata.
+		 */
+		PG_RETURN_VOID();
+	}
 
 	/* generate and add the local group id's update query */
 	localGroupIdUpdateCommand = LocalGroupIdUpdateCommand(workerNode->groupId);
@@ -217,10 +228,14 @@ MetadataCreateCommands(void)
 	List *metadataSnapshotCommandList = NIL;
 	List *distributedTableList = DistributedTableList();
 	List *propagatedTableList = NIL;
-	List *workerNodeList = ActiveWorkerNodeList();
+	bool includeNodesFromOtherClusters = true;
+	List *workerNodeList = ReadWorkerNodes(includeNodesFromOtherClusters);
 	ListCell *distributedTableCell = NULL;
 	char *nodeListInsertCommand = NULL;
 	bool includeSequenceDefaults = true;
+
+	/* make sure we have deterministic output for our tests */
+	SortList(workerNodeList, CompareWorkerNodes);
 
 	/* generate insert command for pg_dist_node table */
 	nodeListInsertCommand = NodeListInsertCommand(workerNodeList);
@@ -398,6 +413,7 @@ NodeListInsertCommand(List *workerNodeList)
 	StringInfo nodeListInsertCommand = makeStringInfo();
 	int workerCount = list_length(workerNodeList);
 	int processedWorkerNodeCount = 0;
+	Oid primaryRole = PrimaryNodeRoleId();
 
 	/* if there are no workers, return NULL */
 	if (workerCount == 0)
@@ -405,10 +421,18 @@ NodeListInsertCommand(List *workerNodeList)
 		return nodeListInsertCommand->data;
 	}
 
+	if (primaryRole == InvalidOid)
+	{
+		ereport(ERROR, (errmsg("bad metadata, noderole does not exist"),
+						errdetail("you should never see this, please submit "
+								  "a bug report"),
+						errhint("run ALTER EXTENSION citus UPDATE and try again")));
+	}
+
 	/* generate the query without any values yet */
 	appendStringInfo(nodeListInsertCommand,
 					 "INSERT INTO pg_dist_node (nodeid, groupid, nodename, nodeport, "
-					 "noderack, hasmetadata, isactive) VALUES ");
+					 "noderack, hasmetadata, isactive, noderole, nodecluster) VALUES ");
 
 	/* iterate over the worker nodes, add the values */
 	foreach(workerNodeCell, workerNodeList)
@@ -417,15 +441,21 @@ NodeListInsertCommand(List *workerNodeList)
 		char *hasMetadataString = workerNode->hasMetadata ? "TRUE" : "FALSE";
 		char *isActiveString = workerNode->isActive ? "TRUE" : "FALSE";
 
+		Datum nodeRoleOidDatum = ObjectIdGetDatum(workerNode->nodeRole);
+		Datum nodeRoleStringDatum = DirectFunctionCall1(enum_out, nodeRoleOidDatum);
+		char *nodeRoleString = DatumGetCString(nodeRoleStringDatum);
+
 		appendStringInfo(nodeListInsertCommand,
-						 "(%d, %d, %s, %d, %s, %s, %s)",
+						 "(%d, %d, %s, %d, %s, %s, %s, '%s'::noderole, %s)",
 						 workerNode->nodeId,
 						 workerNode->groupId,
 						 quote_literal_cstr(workerNode->workerName),
 						 workerNode->workerPort,
 						 quote_literal_cstr(workerNode->workerRack),
 						 hasMetadataString,
-						 isActiveString);
+						 isActiveString,
+						 nodeRoleString,
+						 quote_literal_cstr(workerNode->nodeCluster));
 
 		processedWorkerNodeCount++;
 		if (processedWorkerNodeCount != workerCount)
@@ -1014,7 +1044,7 @@ SchemaOwnerName(Oid objectId)
 static bool
 HasMetadataWorkers(void)
 {
-	List *workerNodeList = ActiveWorkerNodeList();
+	List *workerNodeList = ActivePrimaryNodeList();
 	ListCell *workerNodeCell = NULL;
 
 	foreach(workerNodeCell, workerNodeList)

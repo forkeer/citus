@@ -15,7 +15,7 @@ SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 SELECT master_get_active_worker_nodes();
 
 -- try to add a node that is already in the cluster
-SELECT * FROM master_add_node('localhost', :worker_1_port);
+SELECT nodeid, groupid FROM master_add_node('localhost', :worker_1_port);
 
 -- get the active nodes
 SELECT master_get_active_worker_nodes();
@@ -32,7 +32,7 @@ SELECT master_disable_node('localhost', :worker_2_port);
 SELECT master_get_active_worker_nodes();
 
 -- add some shard placements to the cluster
-SELECT master_activate_node('localhost', :worker_2_port);
+SELECT isactive FROM master_activate_node('localhost', :worker_2_port);
 CREATE TABLE cluster_management_test (col_1 text, col_2 int);
 SELECT master_create_distributed_table('cluster_management_test', 'col_1', 'hash');
 SELECT master_create_worker_shards('cluster_management_test', 16, 1);
@@ -52,8 +52,11 @@ INSERT INTO test_reference_table VALUES (1, '1');
 SELECT master_disable_node('localhost', :worker_2_port); 
 SELECT master_get_active_worker_nodes();
 
+-- try to disable a node which does not exist and see that an error is thrown
+SELECT master_disable_node('localhost.noexist', 2345);
+
 -- restore the node for next tests
-SELECT master_activate_node('localhost', :worker_2_port);
+SELECT isactive FROM master_activate_node('localhost', :worker_2_port);
 
 -- try to remove a node with active placements and see that node removal is failed
 SELECT master_remove_node('localhost', :worker_2_port); 
@@ -71,6 +74,24 @@ SELECT master_get_active_worker_nodes();
 SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 UPDATE pg_dist_placement SET shardstate=1 WHERE groupid=:worker_2_group;
 
+-- when there is no primary we should get a pretty error
+UPDATE pg_dist_node SET noderole = 'secondary' WHERE nodeport=:worker_2_port;
+SELECT * FROM cluster_management_test;
+
+-- when there is no node at all in the group we should get a different error
+DELETE FROM pg_dist_node WHERE nodeport=:worker_2_port;
+SELECT * FROM cluster_management_test;
+
+-- clean-up
+SELECT groupid as new_group FROM master_add_node('localhost', :worker_2_port) \gset
+UPDATE pg_dist_placement SET groupid = :new_group WHERE groupid = :worker_2_group;
+
+-- test that you are allowed to remove secondary nodes even if there are placements
+SELECT 1 FROM master_add_node('localhost', 9990, groupid => :new_group, noderole => 'secondary');
+SELECT master_remove_node('localhost', :worker_2_port);
+SELECT master_remove_node('localhost', 9990);
+
+-- clean-up
 DROP TABLE cluster_management_test;
 
 -- check that adding/removing nodes are propagated to nodes with hasmetadata=true
@@ -96,7 +117,7 @@ SELECT nodename, nodeport FROM pg_dist_node WHERE nodename='localhost' AND nodep
 SELECT 
 	master_remove_node('localhost', :worker_1_port), 
 	master_remove_node('localhost', :worker_2_port);
-SELECT * FROM pg_dist_node ORDER BY nodeid;
+SELECT count(1) FROM pg_dist_node;
 
 -- check that adding two nodes in the same transaction works
 SELECT
@@ -162,3 +183,58 @@ DELETE FROM pg_dist_node;
 \c - - - :master_port
 SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
 SELECT stop_metadata_sync_to_node('localhost', :worker_2_port);
+
+-- check that you can't add a primary to a non-default cluster
+SELECT master_add_node('localhost', 9999, nodecluster => 'olap');
+
+-- check that you can't add more than one primary to a group
+SELECT groupid AS worker_1_group FROM pg_dist_node WHERE nodeport = :worker_1_port \gset
+SELECT master_add_node('localhost', 9999, groupid => :worker_1_group, noderole => 'primary');
+
+-- check that you can add secondaries and unavailable nodes to a group
+SELECT groupid AS worker_2_group FROM pg_dist_node WHERE nodeport = :worker_2_port \gset
+SELECT 1 FROM master_add_node('localhost', 9998, groupid => :worker_1_group, noderole => 'secondary');
+SELECT 1 FROM master_add_node('localhost', 9997, groupid => :worker_1_group, noderole => 'unavailable');
+-- add_inactive_node also works with secondaries
+SELECT 1 FROM master_add_inactive_node('localhost', 9996, groupid => :worker_2_group, noderole => 'secondary');
+
+-- check that you can add a seconary to a non-default cluster, and activate it, and remove it
+SELECT master_add_inactive_node('localhost', 9999, groupid => :worker_2_group, nodecluster => 'olap', noderole => 'secondary');
+SELECT master_activate_node('localhost', 9999);
+SELECT master_disable_node('localhost', 9999);
+SELECT master_remove_node('localhost', 9999);
+
+-- check that you can't manually add two primaries to a group
+INSERT INTO pg_dist_node (nodename, nodeport, groupid, noderole)
+  VALUES ('localhost', 5000, :worker_1_group, 'primary');
+UPDATE pg_dist_node SET noderole = 'primary'
+  WHERE groupid = :worker_1_group AND nodeport = 9998;
+
+-- check that you can't manually add a primary to a non-default cluster
+INSERT INTO pg_dist_node (nodename, nodeport, groupid, noderole, nodecluster)
+  VALUES ('localhost', 5000, 1000, 'primary', 'olap');
+UPDATE pg_dist_node SET nodecluster = 'olap'
+  WHERE nodeport = :worker_1_port;
+
+-- check that you /can/ add a secondary node to a non-default cluster
+SELECT groupid AS worker_2_group FROM pg_dist_node WHERE nodeport = :worker_2_port \gset
+SELECT master_add_node('localhost', 8888, groupid => :worker_1_group, noderole => 'secondary', nodecluster=> 'olap');
+
+-- check that super-long cluster names are truncated
+SELECT master_add_node('localhost', 8887, groupid => :worker_1_group, noderole => 'secondary', nodecluster=>
+	'thisisasixtyfourcharacterstringrepeatedfourtimestomake256chars.'
+	'thisisasixtyfourcharacterstringrepeatedfourtimestomake256chars.'
+	'thisisasixtyfourcharacterstringrepeatedfourtimestomake256chars.'
+	'thisisasixtyfourcharacterstringrepeatedfourtimestomake256chars.'
+	'overflow'
+);
+SELECT * FROM pg_dist_node WHERE nodeport=8887;
+
+-- don't remove the secondary and unavailable nodes, check that no commands are sent to
+-- them in any of the remaining tests
+
+-- master_add_secondary_node lets you skip looking up the groupid
+SELECT master_add_secondary_node('localhost', 9995, 'localhost', :worker_1_port);
+SELECT master_add_secondary_node('localhost', 9994, primaryname => 'localhost', primaryport => :worker_2_port);
+SELECT master_add_secondary_node('localhost', 9993, 'localhost', 2000);
+SELECT master_add_secondary_node('localhost', 9992, 'localhost', :worker_1_port, nodecluster => 'second-cluster');

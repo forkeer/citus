@@ -30,6 +30,7 @@
 #define PG_TABLE_SIZE_FUNCTION "pg_table_size(%s)"
 #define PG_RELATION_SIZE_FUNCTION "pg_relation_size(%s)"
 #define PG_TOTAL_RELATION_SIZE_FUNCTION "pg_total_relation_size(%s)"
+#define CSTORE_TABLE_SIZE_FUNCTION "cstore_table_size(%s)"
 
 #if (PG_VERSION_NUM < 100000)
 static inline void
@@ -115,8 +116,8 @@ extern void CopyShardInterval(ShardInterval *srcInterval, ShardInterval *destInt
 extern void CopyShardPlacement(ShardPlacement *srcPlacement,
 							   ShardPlacement *destPlacement);
 extern uint64 ShardLength(uint64 shardId);
-extern bool NodeHasShardPlacements(char *nodeName, int32 nodePort,
-								   bool onlyLookForActivePlacements);
+extern bool NodeGroupHasShardPlacements(uint32 groupId,
+										bool onlyConsiderActivePlacements);
 extern List * FinalizedShardPlacementList(uint64 shardId);
 extern ShardPlacement * FinalizedShardPlacement(uint64 shardId, bool missingOk);
 extern List * BuildShardPlacementList(ShardInterval *shardInterval);
@@ -138,6 +139,9 @@ extern void UpdateShardPlacementState(uint64 placementId, char shardState);
 extern void DeleteShardPlacementRow(uint64 placementId);
 extern void UpdateColocationGroupReplicationFactor(uint32 colocationId,
 												   int replicationFactor);
+extern void CreateDistributedTable(Oid relationId, Var *distributionColumn,
+								   char distributionMethod, char *colocateWithTableName,
+								   bool viaDeprecatedAPI);
 extern void CreateTruncateTrigger(Oid relationId);
 
 /* Remaining metadata utility functions  */
@@ -146,6 +150,7 @@ extern void EnsureTablePermissions(Oid relationId, AclMode mode);
 extern void EnsureTableOwner(Oid relationId);
 extern void EnsureSuperUser(void);
 extern void EnsureReplicationSettings(Oid relationId, char replicationModel);
+extern bool RegularTable(Oid relationId);
 extern bool TableReferenced(Oid relationId);
 extern char * ConstructQualifiedShardName(ShardInterval *shardInterval);
 extern Datum StringToDatum(char *inputString, Oid dataType);

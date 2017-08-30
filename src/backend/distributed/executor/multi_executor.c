@@ -22,9 +22,11 @@
 #include "distributed/multi_master_planner.h"
 #include "distributed/multi_planner.h"
 #include "distributed/multi_router_executor.h"
+#include "distributed/multi_router_planner.h"
 #include "distributed/multi_resowner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/multi_utility.h"
+#include "distributed/resource_lock.h"
 #include "distributed/worker_protocol.h"
 #include "executor/execdebug.h"
 #include "commands/copy.h"
@@ -57,10 +59,10 @@ static CustomExecMethods TaskTrackerCustomExecMethods = {
 	.ExplainCustomScan = CitusExplainScan
 };
 
-static CustomExecMethods RouterSingleModifyCustomExecMethods = {
-	.CustomName = "RouterSingleModifyScan",
+static CustomExecMethods RouterSequentialModifyCustomExecMethods = {
+	.CustomName = "RouterSequentialModifyScan",
 	.BeginCustomScan = CitusModifyBeginScan,
-	.ExecCustomScan = RouterSingleModifyExecScan,
+	.ExecCustomScan = RouterSequentialModifyExecScan,
 	.EndCustomScan = CitusEndScan,
 	.ReScanCustomScan = CitusReScan,
 	.ExplainCustomScan = CitusExplainScan
@@ -158,12 +160,12 @@ RouterCreateScan(CustomScan *scan)
 
 	isModificationQuery = IsModifyMultiPlan(multiPlan);
 
-	/* check if this is a single shard query */
-	if (list_length(taskList) == 1)
+	/* check whether query has at most one shard */
+	if (list_length(taskList) <= 1)
 	{
 		if (isModificationQuery)
 		{
-			scanState->customScanState.methods = &RouterSingleModifyCustomExecMethods;
+			scanState->customScanState.methods = &RouterSequentialModifyCustomExecMethods;
 		}
 		else
 		{
@@ -173,7 +175,19 @@ RouterCreateScan(CustomScan *scan)
 	else
 	{
 		Assert(isModificationQuery);
-		scanState->customScanState.methods = &RouterMultiModifyCustomExecMethods;
+
+		if (IsMultiRowInsert(workerJob->jobQuery))
+		{
+			/*
+			 * Multi-row INSERT is executed sequentially instead of using
+			 * parallel connections.
+			 */
+			scanState->customScanState.methods = &RouterSequentialModifyCustomExecMethods;
+		}
+		else
+		{
+			scanState->customScanState.methods = &RouterMultiModifyCustomExecMethods;
+		}
 	}
 
 	return (Node *) scanState;
@@ -246,6 +260,9 @@ RealTimeExecScan(CustomScanState *node)
 	{
 		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
+
+		/* we are taking locks on partitions of partitioned tables */
+		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
 
 		PrepareMasterJobDirectory(workerJob);
 		MultiRealTimeExecute(workerJob);
@@ -443,6 +460,9 @@ TaskTrackerExecScan(CustomScanState *node)
 	{
 		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
+
+		/* we are taking locks on partitions of partitioned tables */
+		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
 
 		PrepareMasterJobDirectory(workerJob);
 		MultiTaskTrackerExecute(workerJob);

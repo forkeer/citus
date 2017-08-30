@@ -389,7 +389,7 @@ RecreateTableDDLCommandList(Oid relationId)
 	bool includeSequenceDefaults = false;
 
 	/* build appropriate DROP command based on relation kind */
-	if (relationKind == RELKIND_RELATION)
+	if (RegularTable(relationId))
 	{
 		appendStringInfo(dropCommand, DROP_REGULAR_TABLE_COMMAND,
 						 qualifiedRelationName);
@@ -402,7 +402,8 @@ RecreateTableDDLCommandList(Oid relationId)
 	else
 	{
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("repair target is not a regular or foreign table")));
+						errmsg("repair target is not a regular, foreign or partitioned "
+							   "table")));
 	}
 
 	dropCommandList = list_make1(dropCommand->data);

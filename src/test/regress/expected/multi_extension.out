@@ -114,11 +114,22 @@ ALTER EXTENSION citus UPDATE TO '7.0-1';
 ALTER EXTENSION citus UPDATE TO '7.0-2';
 ALTER EXTENSION citus UPDATE TO '7.0-3';
 ALTER EXTENSION citus UPDATE TO '7.0-4';
+ALTER EXTENSION citus UPDATE TO '7.0-5';
+ALTER EXTENSION citus UPDATE TO '7.0-6';
+ALTER EXTENSION citus UPDATE TO '7.0-7';
+ALTER EXTENSION citus UPDATE TO '7.0-8';
+ALTER EXTENSION citus UPDATE TO '7.0-9';
+ALTER EXTENSION citus UPDATE TO '7.0-10';
+ALTER EXTENSION citus UPDATE TO '7.0-11';
+ALTER EXTENSION citus UPDATE TO '7.0-12';
+ALTER EXTENSION citus UPDATE TO '7.0-13';
+ALTER EXTENSION citus UPDATE TO '7.0-14';
+ALTER EXTENSION citus UPDATE TO '7.0-15';
 -- show running version
 SHOW citus.version;
  citus.version 
 ---------------
- 7.0devel
+ 7.1devel
 (1 row)
 
 -- ensure no objects were created outside pg_catalog
@@ -140,7 +151,7 @@ RESET citus.enable_version_checks;
 DROP EXTENSION citus;
 CREATE EXTENSION citus VERSION '5.0';
 ERROR:  specified version incompatible with loaded Citus library
-DETAIL:  Loaded library requires 7.0, but 5.0 was specified.
+DETAIL:  Loaded library requires 7.1, but 5.0 was specified.
 HINT:  If a newer library is present, restart the database and try the command again.
 -- Test non-distributed queries work even in version mismatch
 SET citus.enable_version_checks TO 'false';
@@ -183,7 +194,7 @@ ORDER BY 1;
 -- We should not distribute table in version mistmatch
 SELECT create_distributed_table('version_mismatch_table', 'column1');
 ERROR:  loaded Citus library version differs from installed extension version
-DETAIL:  Loaded library requires 7.0, but the installed extension version is 6.2-1.
+DETAIL:  Loaded library requires 7.1, but the installed extension version is 6.2-1.
 HINT:  Run ALTER EXTENSION citus UPDATE and try again.
 -- This function will cause fail in next ALTER EXTENSION
 CREATE OR REPLACE FUNCTION pg_catalog.citus_table_size(table_name regclass)
@@ -268,6 +279,7 @@ BEGIN
     END LOOP;
 END;
 $$;
+-- see that the deamon started
 SELECT datname,
     datname = current_database(),
     usename = (SELECT extowner::regrole::text FROM pg_extension WHERE extname = 'citus')
@@ -277,15 +289,43 @@ FROM test.maintenance_worker();
  another | t        | t
 (1 row)
 
--- Test that database with active worker can be dropped. That'll
--- require killing the maintenance worker.
+-- Test that database with active worker can be dropped.
 \c regression
-SELECT datname,
-    pg_terminate_backend(pid)
-FROM test.maintenance_worker('another');
- datname | pg_terminate_backend 
----------+----------------------
- another | t
+CREATE SCHEMA test_deamon;
+-- we create a similar function on the regression database
+-- note that this function checks for the existence of the daemon
+-- when not found, returns true else tries for 5 times and 
+-- returns false
+CREATE OR REPLACE FUNCTION test_deamon.maintenance_deamon_died(p_dbname text)
+    RETURNS boolean
+    LANGUAGE plpgsql
+AS $$
+DECLARE
+   activity record;
+BEGIN
+    PERFORM pg_stat_clear_snapshot();
+    LOOP
+        SELECT * INTO activity FROM pg_stat_activity
+        WHERE application_name = 'Citus Maintenance Daemon' AND datname = p_dbname;
+        IF activity.pid IS NULL THEN
+            RETURN true;
+        ELSE
+            RETURN false;
+        END IF;
+    END LOOP;
+END;
+$$;
+-- drop the database and see that the deamon is dead
+DROP DATABASE another;
+SELECT 
+    *
+FROM 
+    test_deamon.maintenance_deamon_died('another');
+ maintenance_deamon_died 
+-------------------------
+ t
 (1 row)
 
-DROP DATABASE another;
+-- we don't need the schema and the function anymore
+DROP SCHEMA test_deamon CASCADE;
+NOTICE:  drop cascades to function test_deamon.maintenance_deamon_died(text)

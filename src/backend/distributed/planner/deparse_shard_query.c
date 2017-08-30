@@ -26,11 +26,14 @@
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "parser/parsetree.h"
 #include "storage/lock.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 
+static void UpdateTaskQueryString(Query *query, Oid distributedTableId,
+								  RangeTblEntry *valuesRTE, Task *task);
 static void ConvertRteToSubqueryWithEmptyResult(RangeTblEntry *rte);
 
 
@@ -43,11 +46,11 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 {
 	ListCell *taskCell = NULL;
 	Oid relationId = ((RangeTblEntry *) linitial(originalQuery->rtable))->relid;
+	RangeTblEntry *valuesRTE = ExtractDistributedInsertValuesRTE(originalQuery);
 
 	foreach(taskCell, taskList)
 	{
 		Task *task = (Task *) lfirst(taskCell);
-		StringInfo newQueryString = makeStringInfo();
 		Query *query = originalQuery;
 
 		if (task->insertSelectQuery)
@@ -77,17 +80,79 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 
 			UpdateRelationToShardNames((Node *) copiedSubquery, relationShardList);
 		}
+		else if (task->upsertQuery || valuesRTE != NULL)
+		{
+			RangeTblEntry *rangeTableEntry = NULL;
 
-		deparse_shard_query(query, relationId, task->anchorShardId,
-							newQueryString);
+			/*
+			 * Always an alias in UPSERTs and multi-row INSERTs to avoid
+			 * deparsing issues (e.g. RETURNING might reference the original
+			 * table name, which has been replaced by a shard name).
+			 */
+			rangeTableEntry = linitial(query->rtable);
+			if (rangeTableEntry->alias == NULL)
+			{
+				Alias *alias = makeAlias(CITUS_TABLE_ALIAS, NIL);
+				rangeTableEntry->alias = alias;
+			}
+		}
 
-		ereport(DEBUG4, (errmsg("query before rebuilding: %s",
-								task->queryString)));
-		ereport(DEBUG4, (errmsg("query after rebuilding:  %s",
-								newQueryString->data)));
+		ereport(DEBUG4, (errmsg("query before rebuilding: %s", task->queryString)));
 
-		task->queryString = newQueryString->data;
+		UpdateTaskQueryString(query, relationId, valuesRTE, task);
+
+		ereport(DEBUG4, (errmsg("query after rebuilding:  %s", task->queryString)));
 	}
+}
+
+
+/*
+ * UpdateTaskQueryString updates the query string stored within the provided
+ * Task. If the Task has row values from a multi-row INSERT, those are injected
+ * into the provided query (using the provided valuesRTE, which must belong to
+ * the query) before deparse occurs (the query's full VALUES list will be
+ * restored before this function returns).
+ */
+static void
+UpdateTaskQueryString(Query *query, Oid distributedTableId, RangeTblEntry *valuesRTE,
+					  Task *task)
+{
+	StringInfo queryString = makeStringInfo();
+	List *oldValuesLists = NIL;
+
+	if (valuesRTE != NULL)
+	{
+		Assert(valuesRTE->rtekind == RTE_VALUES);
+		Assert(task->rowValuesLists != NULL);
+
+		oldValuesLists = valuesRTE->values_lists;
+		valuesRTE->values_lists = task->rowValuesLists;
+	}
+
+	/*
+	 * For INSERT queries, we only have one relation to update, so we can
+	 * use deparse_shard_query(). For UPDATE and DELETE queries, we may have
+	 * subqueries and joins, so we use relation shard list to update shard
+	 * names and call pg_get_query_def() directly.
+	 */
+	if (query->commandType == CMD_INSERT)
+	{
+		deparse_shard_query(query, distributedTableId, task->anchorShardId, queryString);
+	}
+	else
+	{
+		List *relationShardList = task->relationShardList;
+		UpdateRelationToShardNames((Node *) query, relationShardList);
+
+		pg_get_query_def(query, queryString);
+	}
+
+	if (valuesRTE != NULL)
+	{
+		valuesRTE->values_lists = oldValuesLists;
+	}
+
+	task->queryString = queryString->data;
 }
 
 

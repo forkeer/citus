@@ -1343,9 +1343,7 @@ INSERT INTO raw_events_first (user_id)
 SELECT user_id FROM raw_events_second JOIN reference_table USING (user_id);
 ROLLBACK;
 
--- Insert after copy is disallowed when the INSERT INTO ... SELECT  chooses
--- to use a connection for one shard, while the connection already modified
--- another shard.
+-- Insert after copy is allowed
 BEGIN;
 COPY raw_events_second (user_id, value_1) FROM STDIN DELIMITER ',';
 100,100
@@ -1375,6 +1373,15 @@ INSERT INTO raw_events_first SELECT * FROM raw_events_second WHERE user_id = 100
 COPY raw_events_first (user_id, value_1) FROM STDIN DELIMITER ',';
 103,103
 \.
+ROLLBACK;
+
+-- Similarly, multi-row INSERTs will take part in transactions and reuse connections...
+BEGIN;
+INSERT INTO raw_events_first SELECT * FROM raw_events_second WHERE user_id = 100;
+COPY raw_events_first (user_id, value_1) FROM STDIN DELIMITER ',';
+104,104
+\.
+INSERT INTO raw_events_first (user_id, value_1) VALUES (105, 105), (106, 106);
 ROLLBACK;
 
 -- selecting from views works
@@ -1896,17 +1903,22 @@ SELECT user_id, value_4 FROM test_view ORDER BY user_id, value_4;
 DROP VIEW test_view;
 
 -- Make sure we handle dropped columns correctly
-TRUNCATE raw_events_first;
+CREATE TABLE drop_col_table (col1 text, col2 text, col3 text);
+SELECT create_distributed_table('drop_col_table', 'col2');
 
-ALTER TABLE raw_events_first DROP COLUMN value_1;
+ALTER TABLE drop_col_table DROP COLUMN col1;
 
-INSERT INTO raw_events_first (user_id, value_4)
+INSERT INTO drop_col_table (col3, col2)
 SELECT value_4, user_id FROM raw_events_second LIMIT 5;
 
-SELECT user_id, value_4 FROM raw_events_first ORDER BY user_id;
+SELECT * FROM drop_col_table ORDER BY col2, col3;
+
+-- make sure the tuple went to the right shard
+SELECT * FROM drop_col_table WHERE col2 = '1';
 
 RESET client_min_messages;
 
+DROP TABLE drop_col_table;
 DROP TABLE raw_table;
 DROP TABLE summary_table;
 DROP TABLE raw_events_first CASCADE;

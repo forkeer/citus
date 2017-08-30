@@ -86,11 +86,16 @@ citus_total_relation_size(PG_FUNCTION_ARGS)
 {
 	Oid relationId = PG_GETARG_OID(0);
 	uint64 totalRelationSize = 0;
+	char *tableSizeFunction = PG_TOTAL_RELATION_SIZE_FUNCTION;
 
 	CheckCitusVersion(ERROR);
 
-	totalRelationSize = DistributedTableSize(relationId,
-											 PG_TOTAL_RELATION_SIZE_FUNCTION);
+	if (CStoreTable(relationId))
+	{
+		tableSizeFunction = CSTORE_TABLE_SIZE_FUNCTION;
+	}
+
+	totalRelationSize = DistributedTableSize(relationId, tableSizeFunction);
 
 	PG_RETURN_INT64(totalRelationSize);
 }
@@ -105,10 +110,16 @@ citus_table_size(PG_FUNCTION_ARGS)
 {
 	Oid relationId = PG_GETARG_OID(0);
 	uint64 tableSize = 0;
+	char *tableSizeFunction = PG_TABLE_SIZE_FUNCTION;
 
 	CheckCitusVersion(ERROR);
 
-	tableSize = DistributedTableSize(relationId, PG_TABLE_SIZE_FUNCTION);
+	if (CStoreTable(relationId))
+	{
+		tableSizeFunction = CSTORE_TABLE_SIZE_FUNCTION;
+	}
+
+	tableSize = DistributedTableSize(relationId, tableSizeFunction);
 
 	PG_RETURN_INT64(tableSize);
 }
@@ -123,10 +134,16 @@ citus_relation_size(PG_FUNCTION_ARGS)
 {
 	Oid relationId = PG_GETARG_OID(0);
 	uint64 relationSize = 0;
+	char *tableSizeFunction = PG_RELATION_SIZE_FUNCTION;
 
 	CheckCitusVersion(ERROR);
 
-	relationSize = DistributedTableSize(relationId, PG_RELATION_SIZE_FUNCTION);
+	if (CStoreTable(relationId))
+	{
+		tableSizeFunction = CSTORE_TABLE_SIZE_FUNCTION;
+	}
+
+	relationSize = DistributedTableSize(relationId, tableSizeFunction);
 
 	PG_RETURN_INT64(relationSize);
 }
@@ -141,7 +158,6 @@ static uint64
 DistributedTableSize(Oid relationId, char *sizeQuery)
 {
 	Relation relation = NULL;
-	Relation pgDistNode = NULL;
 	List *workerNodeList = NULL;
 	ListCell *workerNodeCell = NULL;
 	uint64 totalRelationSize = 0;
@@ -158,9 +174,7 @@ DistributedTableSize(Oid relationId, char *sizeQuery)
 
 	ErrorIfNotSuitableToGetSize(relationId);
 
-	pgDistNode = heap_open(DistNodeRelationId(), AccessShareLock);
-
-	workerNodeList = ActiveWorkerNodeList();
+	workerNodeList = ActiveReadableNodeList();
 
 	foreach(workerNodeCell, workerNodeList)
 	{
@@ -170,7 +184,6 @@ DistributedTableSize(Oid relationId, char *sizeQuery)
 		totalRelationSize += relationSizeOnNode;
 	}
 
-	heap_close(pgDistNode, NoLock);
 	heap_close(relation, AccessShareLock);
 
 	return totalRelationSize;
@@ -606,11 +619,10 @@ ShardLength(uint64 shardId)
 
 
 /*
- * NodeHasShardPlacements returns whether any active shards are placed on the group
- * this node is a part of.
+ * NodeGroupHasShardPlacements returns whether any active shards are placed on the group
  */
 bool
-NodeHasShardPlacements(char *nodeName, int32 nodePort, bool onlyConsiderActivePlacements)
+NodeGroupHasShardPlacements(uint32 groupId, bool onlyConsiderActivePlacements)
 {
 	const int scanKeyCount = (onlyConsiderActivePlacements ? 2 : 1);
 	const bool indexOK = false;
@@ -620,8 +632,6 @@ NodeHasShardPlacements(char *nodeName, int32 nodePort, bool onlyConsiderActivePl
 	HeapTuple heapTuple = NULL;
 	SysScanDesc scanDescriptor = NULL;
 	ScanKeyData scanKey[scanKeyCount];
-
-	uint32 groupId = GroupForNode(nodeName, nodePort);
 
 	Relation pgPlacement = heap_open(DistPlacementRelationId(),
 									 AccessShareLock);
@@ -978,15 +988,6 @@ RecordDistributedRelationDependencies(Oid distributedRelationId, Node *distribut
 
 	/* dependency from table entry to extension */
 	recordDependencyOn(&relationAddr, &citusExtensionAddr, DEPENDENCY_NORMAL);
-
-	/* make sure the distribution key column/expression does not just go away */
-#if (PG_VERSION_NUM >= 100000)
-	recordDependencyOnSingleRelExpr(&relationAddr, distributionKey, distributedRelationId,
-									DEPENDENCY_NORMAL, DEPENDENCY_NORMAL, false);
-#else
-	recordDependencyOnSingleRelExpr(&relationAddr, distributionKey, distributedRelationId,
-									DEPENDENCY_NORMAL, DEPENDENCY_NORMAL);
-#endif
 }
 
 

@@ -352,7 +352,12 @@ SELECT master_create_distributed_table('customer_worker_copy_append', 'c_custkey
 
 -- Test copy from the worker node
 COPY customer_worker_copy_append FROM '@abs_srcdir@/data/customer.1.data' with (delimiter '|', master_host 'localhost', master_port 57636);
+
+-- Make sure we don't use 2PC when connecting to master, even if requested
+BEGIN;
+SET LOCAL citus.multi_shard_commit_protocol TO '2pc';
 COPY customer_worker_copy_append FROM '@abs_srcdir@/data/customer.2.data' with (delimiter '|', master_host 'localhost', master_port 57636);
+COMMIT;
 
 -- Test if there is no relation to copy data with the worker copy
 COPY lineitem_copy_none FROM '@abs_srcdir@/data/lineitem.1.data' with (delimiter '|', master_host 'localhost', master_port 57636);
@@ -585,7 +590,7 @@ SELECT shardid, nodename, nodeport
 	WHERE logicalrelid = 'numbers_append'::regclass order by placementid;
 
 -- add the node back
-SELECT master_activate_node('localhost', :worker_1_port);
+SELECT 1 FROM master_activate_node('localhost', :worker_1_port);
 RESET citus.shard_replication_factor;
 -- add two new shards and verify they are created at both workers
 COPY numbers_append FROM STDIN WITH (FORMAT 'csv');
@@ -775,6 +780,26 @@ SELECT create_distributed_table('tt1','id');
 \.
 DROP TABLE tt1;
 END;
+
+-- Test dropping a column in front of the partition column
+CREATE TABLE drop_copy_test_table (col1 int, col2 int, col3 int, col4 int);
+SELECT create_distributed_table('drop_copy_test_table','col3');
+
+ALTER TABLE drop_copy_test_table drop column col1;
+COPY drop_copy_test_table (col2,col3,col4) from STDIN with CSV;
+,1,
+,2,
+\.
+SELECT * FROM drop_copy_test_table WHERE col3 = 1;
+
+ALTER TABLE drop_copy_test_table drop column col4;
+COPY drop_copy_test_table (col2,col3) from STDIN with CSV;
+,1
+,2
+\.
+SELECT * FROM drop_copy_test_table WHERE col3 = 1;
+
+DROP TABLE drop_copy_test_table;
 
 -- There should be no "tt1" shard on the worker nodes
 \c - - - :worker_1_port

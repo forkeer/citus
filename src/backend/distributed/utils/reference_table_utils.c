@@ -28,6 +28,7 @@
 #include "distributed/transaction_management.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
+#include "storage/lmgr.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -127,7 +128,7 @@ ReplicateAllReferenceTablesToNode(char *nodeName, int nodePort)
 {
 	List *referenceTableList = ReferenceTableOidList();
 	ListCell *referenceTableCell = NULL;
-	List *workerNodeList = ActiveWorkerNodeList();
+	List *workerNodeList = ActivePrimaryNodeList();
 	uint32 workerCount = 0;
 	Oid firstReferenceTableId = InvalidOid;
 	uint32 referenceTableColocationId = INVALID_COLOCATION_ID;
@@ -226,10 +227,13 @@ ReplicateSingleShardTableToAllWorkers(Oid relationId)
 static void
 ReplicateShardToAllWorkers(ShardInterval *shardInterval)
 {
-	/* we do not use pgDistNode, we only obtain a lock on it to prevent modifications */
-	Relation pgDistNode = heap_open(DistNodeRelationId(), AccessShareLock);
-	List *workerNodeList = ActiveWorkerNodeList();
+	List *workerNodeList = NULL;
 	ListCell *workerNodeCell = NULL;
+
+	/* prevent concurrent pg_dist_node changes */
+	LockRelationOid(DistNodeRelationId(), RowShareLock);
+
+	workerNodeList = ActivePrimaryNodeList();
 
 	/*
 	 * We will iterate over all worker nodes and if healthy placement is not exist at
@@ -245,8 +249,6 @@ ReplicateShardToAllWorkers(ShardInterval *shardInterval)
 
 		ReplicateShardToNode(shardInterval, nodeName, nodePort);
 	}
-
-	heap_close(pgDistNode, NoLock);
 }
 
 
@@ -364,7 +366,7 @@ uint32
 CreateReferenceTableColocationId()
 {
 	uint32 colocationId = INVALID_COLOCATION_ID;
-	List *workerNodeList = ActiveWorkerNodeList();
+	List *workerNodeList = ActivePrimaryNodeList();
 	int shardCount = 1;
 	int replicationFactor = list_length(workerNodeList);
 	Oid distributionColumnType = InvalidOid;
@@ -382,13 +384,13 @@ CreateReferenceTableColocationId()
 
 
 /*
- * DeleteAllReferenceTablePlacementsFromNode function iterates over list of reference
+ * DeleteAllReferenceTablePlacementsFromNodeGroup function iterates over list of reference
  * tables and deletes all reference table placements from pg_dist_placement table
- * for given worker node. However, it does not modify replication factor of the colocation
+ * for given group. However, it does not modify replication factor of the colocation
  * group of reference tables. It is caller's responsibility to do that if it is necessary.
  */
 void
-DeleteAllReferenceTablePlacementsFromNode(char *workerName, uint32 workerPort)
+DeleteAllReferenceTablePlacementsFromNodeGroup(uint32 groupId)
 {
 	List *referenceTableList = ReferenceTableOidList();
 	ListCell *referenceTableCell = NULL;
@@ -401,7 +403,7 @@ DeleteAllReferenceTablePlacementsFromNode(char *workerName, uint32 workerPort)
 
 	/*
 	 * We sort the reference table list to prevent deadlocks in concurrent
-	 * DeleteAllReferenceTablePlacementsFromNode calls.
+	 * DeleteAllReferenceTablePlacementsFromNodeGroup calls.
 	 */
 	referenceTableList = SortList(referenceTableList, CompareOids);
 	foreach(referenceTableCell, referenceTableList)
@@ -409,11 +411,9 @@ DeleteAllReferenceTablePlacementsFromNode(char *workerName, uint32 workerPort)
 		GroupShardPlacement *placement = NULL;
 		StringInfo deletePlacementCommand = makeStringInfo();
 
-		uint32 workerGroup = GroupForNode(workerName, workerPort);
-
 		Oid referenceTableId = lfirst_oid(referenceTableCell);
 		List *placements = GroupShardPlacementsForTableOnGroup(referenceTableId,
-															   workerGroup);
+															   groupId);
 		if (list_length(placements) == 0)
 		{
 			/* this happens if the node was previously disabled */

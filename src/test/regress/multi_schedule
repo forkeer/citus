@@ -23,10 +23,7 @@ test: multi_table_ddl
 test: multi_name_lengths
 test: multi_metadata_access
 
-# ---
-# Tests for partitioning support
-# ---
-test: multi_partitioning_utils
+test: multi_read_from_secondaries
 
 # ----------
 # The following distributed tests depend on creating a partitioned table and
@@ -41,6 +38,12 @@ test: multi_behavioral_analytics_create_table
 test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_queries multi_insert_select_non_pushable_queries
 test: multi_insert_select
 
+# ---
+# Tests for partitioning support
+# ---
+test: multi_partitioning_utils
+test: multi_partitioning
+
 # ----------
 # Miscellaneous tests to check our query planning behavior
 # ----------
@@ -48,6 +51,8 @@ test: multi_deparse_shard_query multi_distributed_transaction_id
 test: multi_basic_queries multi_complex_expressions 
 test: multi_explain
 test: multi_subquery multi_subquery_complex_queries multi_subquery_behavioral_analytics
+test: multi_subquery_complex_reference_clause
+test: multi_subquery_in_where_reference_clause
 test: multi_subquery_union multi_subquery_in_where_clause multi_subquery_misc
 test: multi_reference_table
 test: multi_outer_join_reference
@@ -64,7 +69,8 @@ test: multi_task_assignment_policy multi_cross_shard
 test: multi_utility_statements
 test: multi_dropped_column_aliases
 test: multi_binary_master_copy_format
-test: multi_prepare_sql multi_prepare_plsql
+test: multi_prepare_sql
+test: multi_prepare_plsql
 test: multi_sql_function
 test: multi_view
 
@@ -153,6 +159,7 @@ test: multi_repartition_udt
 test: multi_repartitioned_subquery_udf
 test: multi_modifying_xacts
 test: multi_transaction_recovery
+test: multi_subtransactions
 
 # ---------
 # multi_copy creates hash and range-partitioned tables and performs COPY
@@ -247,3 +254,8 @@ test: multi_multiuser
 # changed the table they belonged to during a session
 # --------
 test: multi_cache_invalidation
+
+# ---------
+# multi_task_string_size tests task string size checks
+# ---------
+test: multi_task_string_size

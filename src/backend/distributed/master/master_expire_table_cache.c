@@ -60,7 +60,7 @@ master_expire_table_cache(PG_FUNCTION_ARGS)
 	CheckCitusVersion(ERROR);
 
 	cacheEntry = DistributedTableCacheEntry(relationId);
-	workerNodeList = ActiveWorkerNodeList();
+	workerNodeList = ActivePrimaryNodeList();
 	shardCount = cacheEntry->shardIntervalArrayLength;
 	shardIntervalArray = cacheEntry->sortedShardIntervalArray;
 
@@ -183,7 +183,7 @@ DropShardsFromWorker(WorkerNode *workerNode, Oid relationId, List *shardInterval
 		}
 	}
 
-	if (relationKind == RELKIND_RELATION)
+	if (RegularTable(relationId))
 	{
 		appendStringInfo(workerCommand, DROP_REGULAR_TABLE_COMMAND, shardNames->data);
 	}
@@ -194,7 +194,8 @@ DropShardsFromWorker(WorkerNode *workerNode, Oid relationId, List *shardInterval
 	else
 	{
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("expire target is not a regular or foreign table")));
+						errmsg("expire target is not a regular, foreign or partitioned "
+							   "table")));
 	}
 
 	connection = GetNodeConnection(connectionFlag, workerNode->workerName,

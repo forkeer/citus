@@ -21,13 +21,19 @@
 #include "pgstat.h"
 
 #include "access/xact.h"
+#include "catalog/pg_extension.h"
+#include "commands/extension.h"
 #include "libpq/pqsignal.h"
+#include "catalog/namespace.h"
+#include "distributed/distributed_deadlock_detection.h"
 #include "distributed/maintenanced.h"
 #include "distributed/metadata_cache.h"
+#include "nodes/makefuncs.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "tcop/tcopprot.h"
 
@@ -69,9 +75,12 @@ typedef struct MaintenanceDaemonDBData
 	/* information: which user to use */
 	Oid userOid;
 	bool daemonStarted;
+	pid_t workerPid;
 	Latch *latch; /* pointer to the background worker's latch */
 } MaintenanceDaemonDBData;
 
+/* config variable for distributed deadlock detection timeout */
+double DistributedDeadlockDetectionTimeoutFactor = 2.0;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static MaintenanceDaemonControlData *MaintenanceDaemonControl = NULL;
@@ -82,6 +91,8 @@ static void MaintenanceDaemonSigHupHandler(SIGNAL_ARGS);
 static size_t MaintenanceDaemonShmemSize(void);
 static void MaintenanceDaemonShmemInit(void);
 static void MaintenanceDaemonErrorContext(void *arg);
+static bool LockCitusExtension(void);
+
 
 /*
  * InitializeMaintenanceDaemon, called at server start, is responsible for
@@ -162,6 +173,7 @@ InitializeMaintenanceDaemonBackend(void)
 		}
 
 		dbData->daemonStarted = true;
+		dbData->workerPid = 0;
 		LWLockRelease(&MaintenanceDaemonControl->lock);
 
 		WaitForBackgroundWorkerStartup(handle, &pid);
@@ -209,13 +221,26 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 						   HASH_FIND, NULL);
 	if (!myDbData)
 	{
-		/* should never happen */
-		ereport(ERROR, (errmsg("got lost finding myself")));
+		/*
+		 * When the database crashes, background workers are restarted, but
+		 * the state in shared memory is lost. In that case, we exit and
+		 * wait for a session to call InitializeMaintenanceDaemonBackend
+		 * to properly add it to the hash.
+		 */
+		proc_exit(0);
 	}
-	LWLockRelease(&MaintenanceDaemonControl->lock);
 
+	/* from this point, DROP DATABASE will attempt to kill the worker */
+	myDbData->workerPid = MyProcPid;
+
+	/* wire up signals */
+	pqsignal(SIGTERM, die);
+	pqsignal(SIGHUP, MaintenanceDaemonSigHupHandler);
+	BackgroundWorkerUnblockSignals();
 
 	myDbData->latch = MyLatch;
+
+	LWLockRelease(&MaintenanceDaemonControl->lock);
 
 	/*
 	 * Setup error context so log messages can be properly attributed. Some of
@@ -229,10 +254,6 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	errorCallback.previous = error_context_stack;
 	error_context_stack = &errorCallback;
 
-	/* wire up signals */
-	pqsignal(SIGTERM, die);
-	pqsignal(SIGHUP, MaintenanceDaemonSigHupHandler);
-	BackgroundWorkerUnblockSignals();
 
 	elog(LOG, "starting maintenance daemon on database %u user %u",
 		 databaseOid, myDbData->userOid);
@@ -248,9 +269,19 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	{
 		int rc;
 		int latchFlags = WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH;
-		int timeout = 10000; /* wake up at least every so often */
+		double timeout = 10000.0; /* use this if the deadlock detection is disabled */
+		bool foundDeadlock = false;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * XXX: We clear the metadata cache before every iteration because otherwise
+		 * it might contain stale OIDs. It appears that in some cases invalidation
+		 * messages for a DROP EXTENSION may arrive during deadlock detection and
+		 * this causes us to cache a stale pg_dist_node OID. We'd actually expect
+		 * all invalidations to arrive after obtaining a lock in LockCitusExtension.
+		 */
+		ClearMetadataOIDCache();
 
 		/*
 		 * Perform Work.  If a specific task needs to be called sooner than
@@ -258,13 +289,58 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		 * tasks should do their own time math about whether to re-run checks.
 		 */
 
+		/* the config value -1 disables the distributed deadlock detection  */
+		if (DistributedDeadlockDetectionTimeoutFactor != -1.0)
+		{
+			StartTransactionCommand();
+
+			/*
+			 * We skip the deadlock detection if citus extension
+			 * is not accessible.
+			 *
+			 * Similarly, we skip to run the deadlock checks if
+			 * there exists any version mismatch or the extension
+			 * is not fully created yet.
+			 */
+			if (!LockCitusExtension())
+			{
+				ereport(DEBUG1, (errmsg("could not lock the citus extension, "
+										"skipping deadlock detection")));
+			}
+			else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
+			{
+				foundDeadlock = CheckForDistributedDeadlocks();
+			}
+
+			CommitTransactionCommand();
+
+			/*
+			 * If we find any deadlocks, run the distributed deadlock detection
+			 * more often since it is quite possible that there are other
+			 * deadlocks need to be resolved.
+			 *
+			 * Thus, we use 1/20 of the calculated value. With the default
+			 * values (i.e., deadlock_timeout 1 seconds,
+			 * citus.distributed_deadlock_detection_factor 2), we'd be able to cancel
+			 * ~10 distributed deadlocks per second.
+			 */
+			timeout =
+				DistributedDeadlockDetectionTimeoutFactor * (double) DeadlockTimeout;
+
+			if (foundDeadlock)
+			{
+				timeout = timeout / 20.0;
+			}
+		}
+
 		/*
-		 * Wait until timeout, or until somebody wakes us up.
+		 * Wait until timeout, or until somebody wakes us up. Also cast the timeout to
+		 * integer where we've calculated it using double for not losing the precision.
 		 */
 #if (PG_VERSION_NUM >= 100000)
-		rc = WaitLatch(MyLatch, latchFlags, timeout, PG_WAIT_EXTENSION);
+		rc = WaitLatch(MyLatch, latchFlags, (long) timeout, PG_WAIT_EXTENSION);
 #else
-		rc = WaitLatch(MyLatch, latchFlags, timeout);
+		rc = WaitLatch(MyLatch, latchFlags, (long) timeout);
 #endif
 
 		/* emergency bailout if postmaster has died */
@@ -426,4 +502,66 @@ MaintenanceDaemonErrorContext(void *arg)
 	MaintenanceDaemonDBData *myDbData = (MaintenanceDaemonDBData *) arg;
 	errcontext("Citus maintenance daemon for database %u user %u",
 			   myDbData->databaseOid, myDbData->userOid);
+}
+
+
+/*
+ * LockCitusExtension acquires a lock on the Citus extension or returns
+ * false if the extension does not exist or is being dropped.
+ */
+static bool
+LockCitusExtension(void)
+{
+	Oid recheckExtensionOid = InvalidOid;
+
+	Oid extensionOid = get_extension_oid("citus", true);
+	if (extensionOid == InvalidOid)
+	{
+		/* citus extension does not exist */
+		return false;
+	}
+
+	LockDatabaseObject(ExtensionRelationId, extensionOid, 0, AccessShareLock);
+
+	/*
+	 * The extension may have been dropped and possibly recreated prior to
+	 * obtaining a lock. Check whether we still get the expected OID.
+	 */
+	recheckExtensionOid = get_extension_oid("citus", true);
+	if (recheckExtensionOid != extensionOid)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * StopMaintenanceDaemon stops the maintenance daemon for the
+ * given database and removes it from the maintenance daemon
+ * control hash.
+ */
+void
+StopMaintenanceDaemon(Oid databaseId)
+{
+	bool found = false;
+	MaintenanceDaemonDBData *dbData = NULL;
+	pid_t workerPid = 0;
+
+	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
+
+	dbData = (MaintenanceDaemonDBData *) hash_search(MaintenanceDaemonControl->dbHash,
+													 &databaseId, HASH_REMOVE, &found);
+	if (found)
+	{
+		workerPid = dbData->workerPid;
+	}
+
+	LWLockRelease(&MaintenanceDaemonControl->lock);
+
+	if (workerPid > 0)
+	{
+		kill(workerPid, SIGTERM);
+	}
 }

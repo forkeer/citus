@@ -19,6 +19,14 @@
 
 extern bool EnableVersionChecks;
 
+/* managed via guc.c */
+typedef enum
+{
+	USE_SECONDARY_NODES_NEVER = 0,
+	USE_SECONDARY_NODES_ALWAYS = 1
+} ReadFromSecondariesType;
+extern int ReadFromSecondaries;
+
 /*
  * Representation of a table's metadata that is frequently used for
  * distributed execution. Cached.
@@ -78,11 +86,14 @@ extern List * DistTableOidList(void);
 extern List * ShardPlacementList(uint64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
+extern void ClearMetadataOIDCache(void);
 
 extern bool CitusHasBeenLoaded(void);
 extern bool CheckCitusVersion(int elevel);
 extern bool CheckAvailableVersion(int elevel);
 bool MajorVersionsCompatible(char *leftVersion, char *rightVersion);
+
+extern void EnsureModificationsCanRun(void);
 
 /* access WorkerNodeHash */
 extern HTAB * GetWorkerNodeHash(void);
@@ -111,6 +122,11 @@ extern Oid DistPlacementGroupidIndexId(void);
 /* function oids */
 extern Oid CitusExtraDataContainerFuncId(void);
 extern Oid CitusWorkerHashFunctionId(void);
+
+/* nodeRole enum oids */
+extern Oid PrimaryNodeRoleId(void);
+extern Oid SecondaryNodeRoleId(void);
+extern Oid UnavailableNodeRoleId(void);
 
 /* user related functions */
 extern Oid CitusExtensionOwner(void);

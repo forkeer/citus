@@ -399,7 +399,7 @@ master_get_active_worker_nodes(PG_FUNCTION_ARGS)
 		/* switch to memory context appropriate for multiple function calls */
 		oldContext = MemoryContextSwitchTo(functionContext->multi_call_memory_ctx);
 
-		workerNodeList = ActiveWorkerNodeList();
+		workerNodeList = ActiveReadableNodeList();
 		workerNodeCount = (uint32) list_length(workerNodeList);
 
 		functionContext->user_fctx = workerNodeList;
@@ -721,7 +721,7 @@ ShardStorageType(Oid relationId)
 	char shardStorageType = 0;
 
 	char relationType = get_rel_relkind(relationId);
-	if (relationType == RELKIND_RELATION)
+	if (RegularTable(relationId))
 	{
 		shardStorageType = SHARD_STORAGE_TABLE;
 	}

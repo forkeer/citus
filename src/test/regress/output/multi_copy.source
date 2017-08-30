@@ -468,7 +468,11 @@ HINT:  Consider using hash partitioning.
 \c - - - 57637
 -- Test copy from the worker node
 COPY customer_worker_copy_append FROM '@abs_srcdir@/data/customer.1.data' with (delimiter '|', master_host 'localhost', master_port 57636);
+-- Make sure we don't use 2PC when connecting to master, even if requested
+BEGIN;
+SET LOCAL citus.multi_shard_commit_protocol TO '2pc';
 COPY customer_worker_copy_append FROM '@abs_srcdir@/data/customer.2.data' with (delimiter '|', master_host 'localhost', master_port 57636);
+COMMIT;
 -- Test if there is no relation to copy data with the worker copy
 COPY lineitem_copy_none FROM '@abs_srcdir@/data/lineitem.1.data' with (delimiter '|', master_host 'localhost', master_port 57636);
 WARNING:  relation "lineitem_copy_none" does not exist
@@ -764,12 +768,12 @@ SELECT shardid, nodename, nodeport
 (6 rows)
 
 -- add the node back
-SELECT master_activate_node('localhost', :worker_1_port);
+SELECT 1 FROM master_activate_node('localhost', :worker_1_port);
 NOTICE:  Replicating reference table "nation" to the node localhost:57637
 NOTICE:  Replicating reference table "supplier" to the node localhost:57637
-       master_activate_node        
------------------------------------
- (1,1,localhost,57637,default,f,t)
+ ?column? 
+----------
+        1
 (1 row)
 
 RESET citus.shard_replication_factor;
@@ -1046,6 +1050,34 @@ SELECT create_distributed_table('tt1','id');
 \copy tt1 from STDIN;
 DROP TABLE tt1;
 END;
+-- Test dropping a column in front of the partition column
+CREATE TABLE drop_copy_test_table (col1 int, col2 int, col3 int, col4 int);
+SELECT create_distributed_table('drop_copy_test_table','col3');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+ALTER TABLE drop_copy_test_table drop column col1;
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
+COPY drop_copy_test_table (col2,col3,col4) from STDIN with CSV;
+SELECT * FROM drop_copy_test_table WHERE col3 = 1;
+ col2 | col3 | col4 
+------+------+------
+      |    1 |     
+(1 row)
+
+ALTER TABLE drop_copy_test_table drop column col4;
+COPY drop_copy_test_table (col2,col3) from STDIN with CSV;
+SELECT * FROM drop_copy_test_table WHERE col3 = 1;
+ col2 | col3 
+------+------
+      |    1
+      |    1
+(2 rows)
+
+DROP TABLE drop_copy_test_table;
 -- There should be no "tt1" shard on the worker nodes
 \c - - - :worker_1_port
 SELECT relname FROM pg_class WHERE relname LIKE 'tt1%';
