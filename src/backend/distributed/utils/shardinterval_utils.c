@@ -8,6 +8,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "stdint.h"
 #include "postgres.h"
 
 #include "access/nbtree.h"
@@ -15,7 +16,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/shard_pruning.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/pg_dist_partition.h"
@@ -390,7 +391,7 @@ SingleReplicatedTable(Oid relationId)
 		uint64 shardId = (*shardIdPointer);
 		List *shardPlacementList = ShardPlacementList(shardId);
 
-		if (shardPlacementList->length > 1)
+		if (list_length(shardPlacementList) != 1)
 		{
 			return false;
 		}

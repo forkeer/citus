@@ -15,6 +15,7 @@
 #define MULTI_LOGICAL_PLANNER_H
 
 #include "distributed/citus_nodes.h"
+#include "distributed/errormessage.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/relation_restriction_equivalence.h"
 #include "nodes/nodes.h"
@@ -173,6 +174,8 @@ typedef struct MultiExtendedOp
 	Node *limitCount;
 	Node *limitOffset;
 	Node *havingQual;
+	List *distinctClause;
+	bool hasDistinctOn;
 } MultiExtendedOp;
 
 
@@ -183,9 +186,20 @@ extern bool SubqueryPushdown;
 /* Function declarations for building logical plans */
 extern MultiTreeRoot * MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 											  PlannerRestrictionContext *
-											  plannerRestrictionContext,
-											  ParamListInfo boundParams);
-extern bool NeedsDistributedPlanning(Query *queryTree);
+											  plannerRestrictionContext);
+extern bool SingleRelationRepartitionSubquery(Query *queryTree);
+extern DeferredErrorMessage * DeferErrorIfCannotPushdownSubquery(Query *subqueryTree,
+																 bool
+																 outerMostQueryHasLimit);
+extern DeferredErrorMessage * DeferErrorIfUnsupportedUnionQuery(Query *queryTree);
+extern PlannerRestrictionContext * FilterPlannerRestrictionForQuery(
+	PlannerRestrictionContext *plannerRestrictionContext,
+	Query *query);
+extern bool SafeToPushdownWindowFunction(Query *query, StringInfo *errorDetail);
+extern bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
+extern bool FindNodeCheckInRangeTableList(List *rtable, bool (*check)(Node *));
+extern bool QueryContainsDistributedTableRTE(Query *query);
+extern bool ContainsReadIntermediateResultFunction(Node *node);
 extern MultiNode * ParentNode(MultiNode *multiNode);
 extern MultiNode * ChildNode(MultiUnaryNode *multiNode);
 extern MultiNode * GrandChildNode(MultiUnaryNode *multiNode);
@@ -199,6 +213,7 @@ extern List * FindNodesOfType(MultiNode *node, int type);
 extern List * JoinClauseList(List *whereClauseList);
 extern bool IsJoinClause(Node *clause);
 extern List * SubqueryEntryList(Query *queryTree);
+extern DeferredErrorMessage * DeferErrorIfQueryNotSupported(Query *queryTree);
 extern bool ExtractRangeTableIndexWalker(Node *node, List **rangeTableIndexList);
 extern List * WhereClauseList(FromExpr *fromExpr);
 extern List * QualifierList(FromExpr *fromExpr);
@@ -206,8 +221,6 @@ extern List * TableEntryList(List *rangeTableList);
 extern List * UsedTableEntryList(Query *query);
 extern bool ExtractRangeTableRelationWalker(Node *node, List **rangeTableList);
 extern bool ExtractRangeTableEntryWalker(Node *node, List **rangeTableList);
-extern bool ExtractRangeTableRelationWalkerWithRTEExpand(Node *node,
-														 List **rangeTableList);
 extern List * pull_var_clause_default(Node *node);
 extern bool OperatorImplementsEquality(Oid opno);
 

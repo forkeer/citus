@@ -20,6 +20,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_router_planner.h"
+#include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -53,7 +54,11 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 		Task *task = (Task *) lfirst(taskCell);
 		Query *query = originalQuery;
 
-		if (task->insertSelectQuery)
+		if (UpdateOrDeleteQuery(query) && list_length(taskList))
+		{
+			query = copyObject(originalQuery);
+		}
+		else if (task->insertSelectQuery)
 		{
 			/* for INSERT..SELECT, adjust shard names in SELECT part */
 			RangeTblEntry *copiedInsertRte = NULL;
@@ -61,6 +66,7 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 			Query *copiedSubquery = NULL;
 			List *relationShardList = task->relationShardList;
 			ShardInterval *shardInterval = LoadShardInterval(task->anchorShardId);
+			char partitionMethod = 0;
 
 			query = copyObject(originalQuery);
 
@@ -68,7 +74,13 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 			copiedSubqueryRte = ExtractSelectRangeTableEntry(query);
 			copiedSubquery = copiedSubqueryRte->subquery;
 
-			AddShardIntervalRestrictionToSelect(copiedSubquery, shardInterval);
+			/* there are no restrictions to add for reference tables */
+			partitionMethod = PartitionMethod(shardInterval->relationId);
+			if (partitionMethod != DISTRIBUTE_BY_NONE)
+			{
+				AddShardIntervalRestrictionToSelect(copiedSubquery, shardInterval);
+			}
+
 			ReorderInsertSelectTargetLists(query, copiedInsertRte, copiedSubqueryRte);
 
 			/* setting an alias simplifies deparsing of RETURNING */
@@ -262,7 +274,8 @@ ConvertRteToSubqueryWithEmptyResult(RangeTblEntry *rte)
 
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
-		FormData_pg_attribute *attributeForm = tupleDescriptor->attrs[columnIndex];
+		FormData_pg_attribute *attributeForm = TupleDescAttr(tupleDescriptor,
+															 columnIndex);
 		TargetEntry *targetEntry = NULL;
 		StringInfo resname = NULL;
 		Const *constValue = NULL;

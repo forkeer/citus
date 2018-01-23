@@ -1,5 +1,5 @@
 -- this test file aims to test UPSERT feature on Citus
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 980000;
+SET citus.next_shard_id TO 980000;
 CREATE TABLE upsert_test
 (
 	part_key int UNIQUE,
@@ -241,8 +241,6 @@ SELECT master_create_worker_shards('dropcol_distributed', 4, 1);
 INSERT INTO dropcol_distributed AS dropcol (key, keep1, keep2) VALUES (1, '5', 5) ON CONFLICT(key)
 	DO UPDATE SET keep1 = dropcol.keep1;
 ALTER TABLE dropcol_distributed DROP COLUMN drop2;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 INSERT INTO dropcol_distributed (key, keep1, keep2) VALUES (1, '5', 5) ON CONFLICT(key)
 	DO UPDATE SET keep1 = dropcol_distributed.keep1;
 ALTER TABLE dropcol_distributed DROP COLUMN keep2;
@@ -255,8 +253,8 @@ INSERT INTO dropcol_distributed AS dropcol (key, keep1) VALUES (1, '5') ON CONFL
 -- subquery in the SET clause
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key) DO
 	UPDATE SET other_col = (SELECT count(*) from upsert_test);
-ERROR:  cannot perform distributed planning for the given modifications
-DETAIL:  Subqueries are not supported in distributed modifications.
+ERROR:  subqueries are not supported in modifications across multiple shards
+DETAIL:  Consider using an equality filter on partition column "part_key" to target a single shard.
 -- non mutable function call in the SET
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key) DO
 	UPDATE SET other_col = random()::int;

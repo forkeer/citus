@@ -35,6 +35,7 @@
 #include "distributed/resource_lock.h"
 #include "distributed/transmit.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/version_compat.h"
 #include "executor/spi.h"
 #include "mb/pg_wchar.h"
 #include "storage/lmgr.h"
@@ -151,7 +152,7 @@ worker_range_partition_table(PG_FUNCTION_ARGS)
 
 	/* close partition files and atomically rename (commit) them */
 	ClosePartitionFiles(partitionFileArray, fileCount);
-	RemoveDirectory(taskDirectory);
+	CitusRemoveDirectory(taskDirectory);
 	RenameDirectory(taskAttemptDirectory, taskDirectory);
 
 	PG_RETURN_VOID();
@@ -191,7 +192,7 @@ worker_hash_partition_table(PG_FUNCTION_ARGS)
 	CheckCitusVersion(ERROR);
 
 	/* use column's type information to get the hashing function */
-	hashFunction = GetFunctionInfo(partitionColumnType, HASH_AM_OID, HASHPROC);
+	hashFunction = GetFunctionInfo(partitionColumnType, HASH_AM_OID, HASHSTANDARD_PROC);
 
 	/* create hash partition context object */
 	partitionContext = palloc0(sizeof(HashPartitionContext));
@@ -212,7 +213,7 @@ worker_hash_partition_table(PG_FUNCTION_ARGS)
 
 	/* close partition files and atomically rename (commit) them */
 	ClosePartitionFiles(partitionFileArray, fileCount);
-	RemoveDirectory(taskDirectory);
+	CitusRemoveDirectory(taskDirectory);
 	RenameDirectory(taskAttemptDirectory, taskDirectory);
 
 	PG_RETURN_VOID();
@@ -332,13 +333,13 @@ InitTaskDirectory(uint64 jobId, uint32 taskId)
 	jobDirectoryExists = DirectoryExists(jobDirectoryName);
 	if (!jobDirectoryExists)
 	{
-		CreateDirectory(jobDirectoryName);
+		CitusCreateDirectory(jobDirectoryName);
 	}
 
 	taskDirectoryExists = DirectoryExists(taskDirectoryName);
 	if (!taskDirectoryExists)
 	{
-		CreateDirectory(taskDirectoryName);
+		CitusCreateDirectory(taskDirectoryName);
 	}
 
 	UnlockJobResource(jobId, AccessExclusiveLock);
@@ -370,7 +371,7 @@ InitTaskAttemptDirectory(uint64 jobId, uint32 taskId)
 	 * If this task previously failed, and gets re-executed and improbably draws
 	 * the same randomId, the task will fail to create the directory.
 	 */
-	CreateDirectory(taskAttemptDirectoryName);
+	CitusCreateDirectory(taskAttemptDirectoryName);
 
 	return taskAttemptDirectoryName;
 }
@@ -409,7 +410,7 @@ OpenPartitionFiles(StringInfo directoryName, uint32 fileCount)
 	{
 		StringInfo filePath = PartitionFilename(directoryName, fileIndex);
 
-		fileDescriptor = PathNameOpenFile(filePath->data, fileFlags, fileMode);
+		fileDescriptor = PathNameOpenFilePerm(filePath->data, fileFlags, fileMode);
 		if (fileDescriptor < 0)
 		{
 			ereport(ERROR, (errcode_for_file_access(),
@@ -601,7 +602,7 @@ DirectoryExists(StringInfo directoryName)
 
 /* Creates a new directory with the given directory name. */
 void
-CreateDirectory(StringInfo directoryName)
+CitusCreateDirectory(StringInfo directoryName)
 {
 	int makeOK = mkdir(directoryName->data, S_IRWXU);
 	if (makeOK != 0)
@@ -614,13 +615,13 @@ CreateDirectory(StringInfo directoryName)
 
 
 /*
- * RemoveDirectory first checks if the given directory exists. If it does, the
+ * CitusRemoveDirectory first checks if the given directory exists. If it does, the
  * function recursively deletes the contents of the given directory, and then
  * deletes the directory itself. This function is modeled on the Boost file
  * system library's remove_all() method.
  */
 void
-RemoveDirectory(StringInfo filename)
+CitusRemoveDirectory(StringInfo filename)
 {
 	struct stat fileStat;
 	int removed = 0;
@@ -673,7 +674,7 @@ RemoveDirectory(StringInfo filename)
 			fullFilename = makeStringInfo();
 			appendStringInfo(fullFilename, "%s/%s", directoryName, baseFilename);
 
-			RemoveDirectory(fullFilename);
+			CitusRemoveDirectory(fullFilename);
 
 			FreeStringInfo(fullFilename);
 		}
@@ -868,7 +869,7 @@ FilterAndPartitionTable(const char *filterQuery,
 			heap_deform_tuple(row, rowDescriptor, valueArray, isNullArray);
 
 			AppendCopyRowData(valueArray, isNullArray, rowDescriptor,
-							  rowOutputState, columnOutputFunctions);
+							  rowOutputState, columnOutputFunctions, NULL);
 
 			rowText = rowOutputState->fe_msgbuf;
 

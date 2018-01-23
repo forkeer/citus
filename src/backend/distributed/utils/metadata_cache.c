@@ -7,6 +7,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include "stdint.h"
 #include "postgres.h"
 
 #include "miscadmin.h"
@@ -31,6 +32,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/pg_dist_local_group.h"
+#include "distributed/pg_dist_node_metadata.h"
 #include "distributed/pg_dist_node.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
@@ -99,6 +101,7 @@ typedef struct MetadataCacheData
 	Oid distShardRelationId;
 	Oid distPlacementRelationId;
 	Oid distNodeRelationId;
+	Oid distNodeNodeIdIndexId;
 	Oid distLocalGroupRelationId;
 	Oid distColocationRelationId;
 	Oid distColocationConfigurationIndexId;
@@ -113,9 +116,14 @@ typedef struct MetadataCacheData
 	Oid distPlacementGroupidIndexId;
 	Oid distTransactionRelationId;
 	Oid distTransactionGroupIndexId;
+	Oid distTransactionRecordIndexId;
+	Oid copyFormatTypeId;
+	Oid readIntermediateResultFuncId;
 	Oid extraDataContainerFuncId;
 	Oid workerHashFunctionId;
 	Oid extensionOwner;
+	Oid binaryCopyFormatId;
+	Oid textCopyFormatId;
 	Oid primaryNodeRoleId;
 	Oid secondaryNodeRoleId;
 	Oid unavailableNodeRoleId;
@@ -174,6 +182,7 @@ static void RegisterWorkerNodeCacheCallbacks(void);
 static void RegisterLocalGroupIdCacheCallbacks(void);
 static uint32 WorkerNodeHashCode(const void *key, Size keySize);
 static void ResetDistTableCacheEntry(DistTableCacheEntry *cacheEntry);
+static void CreateDistTableCache(void);
 static void InvalidateDistRelationCacheCallback(Datum argument, Oid relationId);
 static void InvalidateNodeRelationCacheCallback(Datum argument, Oid relationId);
 static void InvalidateLocalGroupIdRelationCacheCallback(Datum argument, Oid relationId);
@@ -190,6 +199,7 @@ static void CachedRelationLookup(const char *relationName, Oid *cachedOid);
 static ShardPlacement * ResolveGroupShardPlacement(
 	GroupShardPlacement *groupShardPlacement, ShardCacheEntry *shardEntry);
 static WorkerNode * LookupNodeForGroup(uint32 groupid);
+static Oid LookupEnumValueId(Oid typeId, char *valueName);
 
 
 /* exports for SQL callable functions */
@@ -409,7 +419,7 @@ LoadShardPlacement(uint64 shardId, uint64 placementId)
 
 /*
  * FindShardPlacementOnGroup returns the shard placement for the given shard
- * on the given group, or returns NULL of no placement for the shard exists
+ * on the given group, or returns NULL if no placement for the shard exists
  * on the group.
  */
 ShardPlacement *
@@ -642,11 +652,18 @@ LookupShardCacheEntry(int64 shardId)
 
 		if (!shardEntry->tableEntry->isValid)
 		{
+			Oid oldRelationId = shardEntry->tableEntry->relationId;
+			Oid currentRelationId = LookupShardRelation(shardId);
+
 			/*
-			 * The cache entry might not be valid right now. Reload cache entry
-			 * and recheck (as the offset might have changed).
+			 * The relation OID to which the shard belongs could have changed,
+			 * most notably when the extension is dropped and a shard ID is
+			 * reused. Reload the cache entries for both old and new relation
+			 * ID and then look up the shard entry again.
 			 */
-			LookupDistTableCacheEntry(shardEntry->tableEntry->relationId);
+			LookupDistTableCacheEntry(oldRelationId);
+			LookupDistTableCacheEntry(currentRelationId);
+
 			recheck = true;
 		}
 	}
@@ -1646,6 +1663,17 @@ DistNodeRelationId(void)
 }
 
 
+/* return oid of pg_dist_node's primary key index */
+Oid
+DistNodeNodeIdIndexId(void)
+{
+	CachedRelationLookup("pg_dist_node_pkey",
+						 &MetadataCache.distNodeNodeIdIndexId);
+
+	return MetadataCache.distNodeNodeIdIndexId;
+}
+
+
 /* return oid of pg_dist_local_group relation */
 Oid
 DistLocalGroupIdRelationId(void)
@@ -1789,6 +1817,17 @@ DistTransactionGroupIndexId(void)
 }
 
 
+/* return oid of pg_dist_transaction_unique_constraint */
+Oid
+DistTransactionRecordIndexId(void)
+{
+	CachedRelationLookup("pg_dist_transaction_unique_constraint",
+						 &MetadataCache.distTransactionRecordIndexId);
+
+	return MetadataCache.distTransactionRecordIndexId;
+}
+
+
 /* return oid of pg_dist_placement_groupid_index */
 Oid
 DistPlacementGroupidIndexId(void)
@@ -1797,6 +1836,70 @@ DistPlacementGroupidIndexId(void)
 						 &MetadataCache.distPlacementGroupidIndexId);
 
 	return MetadataCache.distPlacementGroupidIndexId;
+}
+
+
+/* return oid of the read_intermediate_result(text,citus_copy_format) function */
+Oid
+CitusReadIntermediateResultFuncId(void)
+{
+	if (MetadataCache.readIntermediateResultFuncId == InvalidOid)
+	{
+		List *functionNameList = list_make2(makeString("pg_catalog"),
+											makeString("read_intermediate_result"));
+		Oid copyFormatTypeOid = CitusCopyFormatTypeId();
+		Oid paramOids[2] = { TEXTOID, copyFormatTypeOid };
+		bool missingOK = false;
+
+		MetadataCache.readIntermediateResultFuncId =
+			LookupFuncName(functionNameList, 2, paramOids, missingOK);
+	}
+
+	return MetadataCache.readIntermediateResultFuncId;
+}
+
+
+/* return oid of the citus.copy_format enum type */
+Oid
+CitusCopyFormatTypeId(void)
+{
+	if (MetadataCache.copyFormatTypeId == InvalidOid)
+	{
+		char *typeName = "citus_copy_format";
+		MetadataCache.copyFormatTypeId = GetSysCacheOid2(TYPENAMENSP,
+														 PointerGetDatum(typeName),
+														 PG_CATALOG_NAMESPACE);
+	}
+
+	return MetadataCache.copyFormatTypeId;
+}
+
+
+/* return oid of the 'binary' citus_copy_format enum value */
+Oid
+BinaryCopyFormatId(void)
+{
+	if (MetadataCache.binaryCopyFormatId == InvalidOid)
+	{
+		Oid copyFormatTypeId = CitusCopyFormatTypeId();
+		MetadataCache.binaryCopyFormatId = LookupEnumValueId(copyFormatTypeId, "binary");
+	}
+
+	return MetadataCache.binaryCopyFormatId;
+}
+
+
+/* return oid of the 'text' citus_copy_format enum value */
+Oid
+TextCopyFormatId(void)
+{
+	if (MetadataCache.textCopyFormatId == InvalidOid)
+	{
+		Oid copyFormatTypeId = CitusCopyFormatTypeId();
+		MetadataCache.textCopyFormatId = LookupEnumValueId(copyFormatTypeId, "text");
+	}
+
+	return MetadataCache.textCopyFormatId;
 }
 
 
@@ -1968,14 +2071,24 @@ LookupNodeRoleValueId(char *valueName)
 	}
 	else
 	{
-		Datum nodeRoleIdDatum = ObjectIdGetDatum(nodeRoleTypId);
-		Datum valueDatum = CStringGetDatum(valueName);
-
-		Datum valueIdDatum = DirectFunctionCall2(enum_in, valueDatum, nodeRoleIdDatum);
-
-		Oid valueId = DatumGetObjectId(valueIdDatum);
+		Oid valueId = LookupEnumValueId(nodeRoleTypId, valueName);
 		return valueId;
 	}
+}
+
+
+/*
+ * LookupEnumValueId looks up the OID of an enum value.
+ */
+static Oid
+LookupEnumValueId(Oid typeId, char *valueName)
+{
+	Datum typeIdDatum = ObjectIdGetDatum(typeId);
+	Datum valueDatum = CStringGetDatum(valueName);
+	Datum valueIdDatum = DirectFunctionCall2(enum_in, valueDatum, typeIdDatum);
+	Oid valueId = DatumGetObjectId(valueIdDatum);
+
+	return valueId;
 }
 
 
@@ -2313,13 +2426,7 @@ InitializeDistTableCache(void)
 	DistShardScanKey[0].sk_attno = Anum_pg_dist_shard_logicalrelid;
 
 	/* initialize the per-table hash table */
-	MemSet(&info, 0, sizeof(info));
-	info.keysize = sizeof(Oid);
-	info.entrysize = sizeof(DistTableCacheEntry);
-	info.hash = tag_hash;
-	DistTableCacheHash =
-		hash_create("Distributed Relation Cache", 32, &info,
-					HASH_ELEM | HASH_FUNCTION);
+	CreateDistTableCache();
 
 	/* initialize the per-shard hash table */
 	MemSet(&info, 0, sizeof(info));
@@ -2694,18 +2801,58 @@ InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 	 */
 	if (relationId != InvalidOid && relationId == MetadataCache.distPartitionRelationId)
 	{
-		ClearMetadataOIDCache();
+		InvalidateMetadataSystemCache();
 	}
 }
 
 
 /*
- * ClearMetadataOIDCache resets all the cached OIDs and the extensionLoaded flag.
+ * FlushDistTableCache flushes the entire distributed relation cache, frees
+ * all entries, and recreates the cache.
  */
 void
-ClearMetadataOIDCache(void)
+FlushDistTableCache(void)
+{
+	DistTableCacheEntry *cacheEntry = NULL;
+	HASH_SEQ_STATUS status;
+
+	hash_seq_init(&status, DistTableCacheHash);
+
+	while ((cacheEntry = (DistTableCacheEntry *) hash_seq_search(&status)) != NULL)
+	{
+		ResetDistTableCacheEntry(cacheEntry);
+	}
+
+	hash_destroy(DistTableCacheHash);
+	CreateDistTableCache();
+}
+
+
+/* CreateDistTableCache initializes the per-table hash table */
+static void
+CreateDistTableCache(void)
+{
+	HASHCTL info;
+	MemSet(&info, 0, sizeof(info));
+	info.keysize = sizeof(Oid);
+	info.entrysize = sizeof(DistTableCacheEntry);
+	info.hash = tag_hash;
+	DistTableCacheHash =
+		hash_create("Distributed Relation Cache", 32, &info,
+					HASH_ELEM | HASH_FUNCTION);
+}
+
+
+/*
+ * InvalidateMetadataSystemCache resets all the cached OIDs and the extensionLoaded flag,
+ * and invalidates the worker node and local group ID caches.
+ */
+void
+InvalidateMetadataSystemCache(void)
 {
 	memset(&MetadataCache, 0, sizeof(MetadataCache));
+	workerNodeHashValid = false;
+	LocalGroupId = -1;
 }
 
 
@@ -3132,4 +3279,52 @@ CitusInvalidateRelcacheByShardId(int64 shardId)
 
 	/* bump command counter, to force invalidation to take effect */
 	CommandCounterIncrement();
+}
+
+
+/*
+ * DistNodeMetadata returns the single metadata jsonb object stored in
+ * pg_dist_node_metadata.
+ */
+Datum
+DistNodeMetadata(void)
+{
+	Datum metadata = 0;
+	SysScanDesc scanDescriptor = NULL;
+	ScanKeyData scanKey[1];
+	const int scanKeyCount = 0;
+	HeapTuple heapTuple = NULL;
+	Oid metadataTableOid = InvalidOid;
+	Relation pgDistNodeMetadata = NULL;
+	TupleDesc tupleDescriptor = NULL;
+
+	metadataTableOid = get_relname_relid("pg_dist_node_metadata", PG_CATALOG_NAMESPACE);
+	if (metadataTableOid == InvalidOid)
+	{
+		ereport(ERROR, (errmsg("pg_dist_node_metadata was not found")));
+	}
+
+	pgDistNodeMetadata = heap_open(metadataTableOid, AccessShareLock);
+	scanDescriptor = systable_beginscan(pgDistNodeMetadata,
+										InvalidOid, false,
+										NULL, scanKeyCount, scanKey);
+	tupleDescriptor = RelationGetDescr(pgDistNodeMetadata);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	if (HeapTupleIsValid(heapTuple))
+	{
+		bool isNull = false;
+		metadata = heap_getattr(heapTuple, Anum_pg_dist_node_metadata_metadata,
+								tupleDescriptor, &isNull);
+		Assert(!isNull);
+	}
+	else
+	{
+		ereport(ERROR, (errmsg("could not find any entries in pg_dist_metadata")));
+	}
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgDistNodeMetadata, AccessShareLock);
+
+	return metadata;
 }

@@ -28,8 +28,10 @@
 
 
 int NodeConnectionTimeout = 5000;
+int CitusSSLMode = CITUS_SSL_MODE_PREFER;
 HTAB *ConnectionHash = NULL;
 MemoryContext ConnectionContext = NULL;
+
 
 static uint32 ConnectionHashHash(const void *key, Size keysize);
 static int ConnectionHashCompare(const void *a, const void *b, Size keysize);
@@ -269,42 +271,6 @@ FindAvailableConnection(dlist_head *connections, uint32 flags)
 
 
 /*
- * Return MultiConnection associated with the libpq connection.
- *
- * Note that this is comparatively expensive. Should only be used for
- * backward-compatibility purposes.
- */
-MultiConnection *
-GetConnectionFromPGconn(struct pg_conn *pqConn)
-{
-	HASH_SEQ_STATUS status;
-	ConnectionHashEntry *entry;
-
-	hash_seq_init(&status, ConnectionHash);
-	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
-	{
-		dlist_head *connections = entry->connections;
-		dlist_iter iter;
-
-		/* check connection cache for a connection that's not already in use */
-		dlist_foreach(iter, connections)
-		{
-			MultiConnection *connection =
-				dlist_container(MultiConnection, connectionNode, iter.cur);
-
-			if (connection->pgConn == pqConn)
-			{
-				hash_seq_term(&status);
-				return connection;
-			}
-		}
-	}
-
-	return NULL;
-}
-
-
-/*
  * CloseNodeConnectionsAfterTransaction sets the sessionLifespan flag of the connections
  * to a particular node as false. This is mainly used when a worker leaves the cluster.
  */
@@ -372,31 +338,6 @@ CloseConnection(MultiConnection *connection)
 	else
 	{
 		ereport(ERROR, (errmsg("closing untracked connection")));
-	}
-}
-
-
-/*
- * Close a previously established connection.
- *
- * This function closes the MultiConnection associatated with the libpq
- * connection.
- *
- * Note that this is comparatively expensive. Should only be used for
- * backward-compatibility purposes.
- */
-void
-CloseConnectionByPGconn(PGconn *pqConn)
-{
-	MultiConnection *connection = GetConnectionFromPGconn(pqConn);
-
-	if (connection)
-	{
-		CloseConnection(connection);
-	}
-	else
-	{
-		ereport(WARNING, (errmsg("could not find connection to close")));
 	}
 }
 
@@ -652,14 +593,15 @@ StartConnectionEstablishment(ConnectionHashKey *key)
 	char nodePortString[12];
 	const char *clientEncoding = GetDatabaseEncodingName();
 	MultiConnection *connection = NULL;
+	const char *sslmode = CitusSSLModeString();
 
 	const char *keywords[] = {
-		"host", "port", "dbname", "user",
+		"host", "port", "dbname", "user", "sslmode",
 		"client_encoding", "fallback_application_name",
 		NULL
 	};
 	const char *values[] = {
-		key->hostname, nodePortString, key->database, key->user,
+		key->hostname, nodePortString, key->database, key->user, sslmode,
 		clientEncoding, "citus", NULL
 	};
 
@@ -682,6 +624,52 @@ StartConnectionEstablishment(ConnectionHashKey *key)
 	PQsetnonblocking(connection->pgConn, true);
 
 	return connection;
+}
+
+
+/*
+ * CitusSSLModeString returns the current value of citus.sslmode.
+ */
+char *
+CitusSSLModeString(void)
+{
+	switch (CitusSSLMode)
+	{
+		case CITUS_SSL_MODE_DISABLE:
+		{
+			return "disable";
+		}
+
+		case CITUS_SSL_MODE_ALLOW:
+		{
+			return "allow";
+		}
+
+		case CITUS_SSL_MODE_PREFER:
+		{
+			return "prefer";
+		}
+
+		case CITUS_SSL_MODE_REQUIRE:
+		{
+			return "require";
+		}
+
+		case CITUS_SSL_MODE_VERIFY_CA:
+		{
+			return "verify-ca";
+		}
+
+		case CITUS_SSL_MODE_VERIFY_FULL:
+		{
+			return "verify-full";
+		}
+
+		default:
+		{
+			ereport(ERROR, (errmsg("unrecognized value for citus.sslmode")));
+		}
+	}
 }
 
 
@@ -730,6 +718,9 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 			/* reset per-transaction state */
 			ResetRemoteTransaction(connection);
 			ResetShardPlacementAssociation(connection);
+
+			/* reset copy state */
+			connection->copyBytesWrittenSinceLastFlush = 0;
 
 			UnclaimConnection(connection);
 		}

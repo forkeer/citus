@@ -22,7 +22,6 @@
 #include "distributed/backend_data.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/connection_management.h"
-#include "distributed/connection_management.h"
 #include "distributed/distributed_deadlock_detection.h"
 #include "distributed/maintenanced.h"
 #include "distributed/master_metadata_utility.h"
@@ -32,7 +31,7 @@
 #include "distributed/multi_explain.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
@@ -41,8 +40,11 @@
 #include "distributed/placement_connection.h"
 #include "distributed/remote_commands.h"
 #include "distributed/shared_library_init.h"
+#include "distributed/statistics_collection.h"
+#include "distributed/subplan_execution.h"
 #include "distributed/task_tracker.h"
 #include "distributed/transaction_management.h"
+#include "distributed/transaction_recovery.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "postmaster/postmaster.h"
@@ -61,10 +63,11 @@ void _PG_init(void);
 static void multi_log_hook(ErrorData *edata);
 static void CreateRequiredDirectories(void);
 static void RegisterCitusConfigVariables(void);
-static void WarningForEnableDeadlockPrevention(bool newval, void *extra);
 static bool ErrorIfNotASuitableDeadlockFactor(double *newval, void **extra,
 											  GucSource source);
 static void NormalizeWorkerListPath(void);
+static bool StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource
+											 source);
 
 
 /* *INDENT-OFF* */
@@ -107,6 +110,16 @@ static const struct config_enum_entry multi_shard_commit_protocol_options[] = {
 	{ NULL, 0, false }
 };
 
+static const struct config_enum_entry citus_ssl_mode_options[] = {
+	{ "disable", CITUS_SSL_MODE_DISABLE, false },
+	{ "allow", CITUS_SSL_MODE_ALLOW, false },
+	{ "prefer", CITUS_SSL_MODE_PREFER, false },
+	{ "require", CITUS_SSL_MODE_REQUIRE, false },
+	{ "verify-ca", CITUS_SSL_MODE_VERIFY_CA, false },
+	{ "verify-full", CITUS_SSL_MODE_VERIFY_FULL, false },
+	{ NULL, 0, false }
+};
+
 static const struct config_enum_entry multi_task_query_log_level_options[] = {
 	{ "off", MULTI_TASK_QUERY_INFO_OFF, false },
 	{ "debug", DEBUG2, false },
@@ -114,6 +127,12 @@ static const struct config_enum_entry multi_task_query_log_level_options[] = {
 	{ "notice", NOTICE, false },
 	{ "warning", WARNING, false },
 	{ "error", ERROR, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry multi_shard_modify_connection_options[] = {
+	{ "parallel", PARALLEL_CONNECTION, false },
+	{ "sequential", SEQUENTIAL_CONNECTION, false },
 	{ NULL, 0, false }
 };
 
@@ -152,8 +171,13 @@ _PG_init(void)
 	/*
 	 * Extend the database directory structure before continuing with
 	 * initialization - one of the later steps might require them to exist.
+	 * If in a sub-process (windows / EXEC_BACKEND) this already has been
+	 * done.
 	 */
-	CreateRequiredDirectories();
+	if (!IsUnderPostmaster)
+	{
+		CreateRequiredDirectories();
+	}
 
 	/*
 	 * Register Citus configuration variables. Do so before intercepting
@@ -165,8 +189,11 @@ _PG_init(void)
 	/* make our additional node types known */
 	RegisterNodes();
 
+	/* make our custom scan nodes known */
+	RegisterCitusCustomScanMethods();
+
 	/* intercept planner */
-	planner_hook = multi_planner;
+	planner_hook = distributed_planner;
 
 	/* register utility hook */
 #if (PG_VERSION_NUM >= 100000)
@@ -217,7 +244,7 @@ multi_log_hook(ErrorData *edata)
 		MyBackendGotCancelledDueToDeadlock())
 	{
 		edata->sqlerrcode = ERRCODE_T_R_DEADLOCK_DETECTED;
-		edata->message = "canceling the transaction since it has "
+		edata->message = "canceling the transaction since it was "
 						 "involved in a distributed deadlock";
 	}
 }
@@ -294,6 +321,19 @@ RegisterCitusConfigVariables(void)
 		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 	NormalizeWorkerListPath();
+
+	DefineCustomEnumVariable(
+		"citus.sslmode",
+		gettext_noop("SSL mode to use for connections to worker nodes."),
+		gettext_noop("When connecting to a worker node, specify whether the SSL mode"
+					 "mode for the connection is 'disable', 'allow', 'prefer' "
+					 "(the default), 'require', 'verify-ca' or 'verify-full'."),
+		&CitusSSLMode,
+		CITUS_SSL_MODE_PREFER,
+		citus_ssl_mode_options,
+		PGC_POSTMASTER,
+		GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.binary_master_copy_format",
@@ -421,6 +461,20 @@ RegisterCitusConfigVariables(void)
 		0,
 		ErrorIfNotASuitableDeadlockFactor, NULL, NULL);
 
+	DefineCustomIntVariable(
+		"citus.recover_2pc_interval",
+		gettext_noop("Sets the time to wait between recovering 2PCs."),
+		gettext_noop("2PC transaction recovery needs to run every so often "
+					 "to clean up records in pg_dist_transaction and "
+					 "potentially roll failed 2PCs forward. This setting "
+					 "determines how often recovery should run, "
+					 "use -1 to disable."),
+		&Recover2PCInterval,
+		60000, -1, 7 * 24 * 3600 * 1000,
+		PGC_SIGHUP,
+		GUC_UNIT_MS,
+		NULL, NULL, NULL);
+
 	DefineCustomBoolVariable(
 		"citus.enable_deadlock_prevention",
 		gettext_noop("Prevents transactions from expanding to multiple nodes"),
@@ -432,7 +486,7 @@ RegisterCitusConfigVariables(void)
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
-		NULL, WarningForEnableDeadlockPrevention, NULL);
+		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.enable_ddl_propagation",
@@ -489,6 +543,17 @@ RegisterCitusConfigVariables(void)
 					 "creation time, and later reuse the initially read value."),
 		&ShardMaxSize,
 		1048576, 256, INT_MAX, /* max allowed size not set to MAX_KILOBYTES on purpose */
+		PGC_USERSET,
+		GUC_UNIT_KB,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.max_intermediate_result_size",
+		gettext_noop("Sets the maximum size of the intermediate results in KB for "
+					 "CTEs and complex subqueries."),
+		NULL,
+		&MaxIntermediateResult,
+		1048576, -1, MAX_KILOBYTES,
 		PGC_USERSET,
 		GUC_UNIT_KB,
 		NULL, NULL, NULL);
@@ -634,13 +699,11 @@ RegisterCitusConfigVariables(void)
 		"citus.multi_shard_commit_protocol",
 		gettext_noop("Sets the commit protocol for commands modifying multiple shards."),
 		gettext_noop("When a failure occurs during commands that modify multiple "
-					 "shards (currently, only COPY on distributed tables modifies more "
-					 "than one shard), two-phase commit is required to ensure data is "
-					 "never lost. Change this setting to '2pc' from its default '1pc' to "
-					 "enable 2 PC. You must also set max_prepared_transactions on the "
-					 "worker nodes. Recovery from failed 2PCs is currently manual."),
+					 "shards, two-phase commit is required to ensure data is never lost "
+					 "and this is the default. However, changing to 1pc may give small "
+					 "performance benefits."),
 		&MultiShardCommitProtocol,
-		COMMIT_PROTOCOL_1PC,
+		COMMIT_PROTOCOL_2PC,
 		multi_shard_commit_protocol_options,
 		PGC_USERSET,
 		0,
@@ -694,6 +757,16 @@ RegisterCitusConfigVariables(void)
 		0,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.enable_repartition_joins",
+		gettext_noop("Allows Citus to use task-tracker executor when necessary."),
+		NULL,
+		&EnableRepartitionJoins,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
 	DefineCustomEnumVariable(
 		"citus.shard_placement_policy",
 		gettext_noop("Sets the policy to use when choosing nodes for shard placement."),
@@ -726,6 +799,16 @@ RegisterCitusConfigVariables(void)
 		NULL,
 		&MultiTaskQueryLogLevel,
 		MULTI_TASK_QUERY_INFO_OFF, multi_task_query_log_level_options,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.multi_shard_modify_mode",
+		gettext_noop("Sets the connection type for multi shard modify queries"),
+		NULL,
+		&MultiShardConnectionType,
+		PARALLEL_CONNECTION, multi_shard_modify_connection_options,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -773,6 +856,36 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
+		"citus.next_shard_id",
+		gettext_noop("Set the next shard ID to use in shard creation."),
+		gettext_noop("Shard IDs are normally generated using a sequence. If "
+					 "next_shard_id is set to a non-zero value, shard IDs will "
+					 "instead be generated by incrementing from the value of "
+					 "this GUC and this will be reflected in the GUC. This is "
+					 "mainly useful to ensure consistent shard IDs when running "
+					 "tests in parallel."),
+		&NextShardId,
+		0, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.next_placement_id",
+		gettext_noop("Set the next placement ID to use in placement creation."),
+		gettext_noop("Placement IDs are normally generated using a sequence. If "
+					 "next_placement_id is set to a non-zero value, placement IDs will "
+					 "instead be generated by incrementing from the value of "
+					 "this GUC and this will be reflected in the GUC. This is "
+					 "mainly useful to ensure consistent placement IDs when running "
+					 "tests in parallel."),
+		&NextPlacementId,
+		0, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
 		"citus.max_task_string_size",
 		gettext_noop("Sets the maximum size (in bytes) of a worker task call string."),
 		gettext_noop("Active worker tasks' are tracked in a shared hash table "
@@ -785,20 +898,26 @@ RegisterCitusConfigVariables(void)
 		0,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.enable_statistics_collection",
+		gettext_noop("Enables sending basic usage statistics to Citus."),
+		gettext_noop("Citus uploads daily anonymous usage reports containing "
+					 "rounded node count, shard size, distributed table count, "
+					 "and operating system name. This configuration value controls "
+					 "whether these reports are sent."),
+		&EnableStatisticsCollection,
+#ifdef HAVE_LIBCURL
+		true,
+#else
+		false,
+#endif
+		PGC_SIGHUP,
+		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
+		&StatisticsCollectionGucCheckHook,
+		NULL, NULL);
+
 	/* warn about config items in the citus namespace that are not registered above */
 	EmitWarningsOnPlaceholders("citus");
-}
-
-
-/*
- * Inform the users about the deprecated flag.
- */
-static void
-WarningForEnableDeadlockPrevention(bool newval, void *extra)
-{
-	ereport(WARNING, (errcode(ERRCODE_WARNING_DEPRECATED_FEATURE),
-					  errmsg("citus.enable_deadlock_prevention is deprecated and it has "
-							 "no effect. The flag will be removed in the next release.")));
 }
 
 
@@ -865,4 +984,26 @@ NormalizeWorkerListPath(void)
 	SetConfigOption("citus.worker_list_file", absoluteFileName, PGC_POSTMASTER,
 					PGC_S_OVERRIDE);
 	free(absoluteFileName);
+}
+
+
+static bool
+StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource source)
+{
+#ifdef HAVE_LIBCURL
+	return true;
+#else
+
+	/* if libcurl is not installed, only accept false */
+	if (*newval)
+	{
+		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		GUC_check_errdetail("Citus was compiled without libcurl support.");
+		return false;
+	}
+	else
+	{
+		return true;
+	}
+#endif
 }

@@ -16,26 +16,36 @@
 
 #include "postgres.h"
 
+#include <time.h>
 
 #include "miscadmin.h"
 #include "pgstat.h"
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_extension.h"
+#include "citus_version.h"
+#include "catalog/pg_namespace.h"
 #include "commands/extension.h"
 #include "libpq/pqsignal.h"
 #include "catalog/namespace.h"
 #include "distributed/distributed_deadlock_detection.h"
 #include "distributed/maintenanced.h"
+#include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/statistics_collection.h"
+#include "distributed/transaction_recovery.h"
 #include "nodes/makefuncs.h"
 #include "postmaster/bgworker.h"
+#include "nodes/makefuncs.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "tcop/tcopprot.h"
+#include "utils/memutils.h"
+#include "utils/lsyscache.h"
 
 
 /*
@@ -46,7 +56,7 @@ typedef struct MaintenanceDaemonControlData
 	/*
 	 * Lock protecting the shared memory state.  This is to be taken when
 	 * looking up (shared mode) or inserting (exclusive mode) per-database
-	 * data in dbHash.
+	 * data in MaintenanceDaemonDBHash.
 	 */
 	int trancheId;
 #if (PG_VERSION_NUM >= 100000)
@@ -55,12 +65,6 @@ typedef struct MaintenanceDaemonControlData
 	LWLockTranche lockTranche;
 #endif
 	LWLock lock;
-
-	/*
-	 * Hash-table of workers, one entry for each database with citus
-	 * activated.
-	 */
-	HTAB *dbHash;
 } MaintenanceDaemonControlData;
 
 
@@ -81,9 +85,16 @@ typedef struct MaintenanceDaemonDBData
 
 /* config variable for distributed deadlock detection timeout */
 double DistributedDeadlockDetectionTimeoutFactor = 2.0;
+int Recover2PCInterval = 60000;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static MaintenanceDaemonControlData *MaintenanceDaemonControl = NULL;
+
+/*
+ * Hash-table of workers, one entry for each database with citus
+ * activated.
+ */
+static HTAB *MaintenanceDaemonDBHash;
 
 static volatile sig_atomic_t got_SIGHUP = false;
 
@@ -102,7 +113,10 @@ static bool LockCitusExtension(void);
 void
 InitializeMaintenanceDaemon(void)
 {
-	RequestAddinShmemSpace(MaintenanceDaemonShmemSize());
+	if (!IsUnderPostmaster)
+	{
+		RequestAddinShmemSpace(MaintenanceDaemonShmemSize());
+	}
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = MaintenanceDaemonShmemInit;
@@ -123,7 +137,7 @@ InitializeMaintenanceDaemonBackend(void)
 
 	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
 
-	dbData = (MaintenanceDaemonDBData *) hash_search(MaintenanceDaemonControl->dbHash,
+	dbData = (MaintenanceDaemonDBData *) hash_search(MaintenanceDaemonDBHash,
 													 &MyDatabaseId,
 													 HASH_ENTER_NULL, &found);
 
@@ -209,7 +223,11 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 {
 	Oid databaseOid = DatumGetObjectId(main_arg);
 	MaintenanceDaemonDBData *myDbData = NULL;
+	TimestampTz nextStatsCollectionTime USED_WITH_LIBCURL_ONLY =
+		TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 60 * 1000);
+	bool retryStatsCollection USED_WITH_LIBCURL_ONLY = false;
 	ErrorContextCallback errorCallback;
+	TimestampTz lastRecoveryTime = 0;
 
 	/*
 	 * Look up this worker's configuration.
@@ -217,8 +235,7 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_SHARED);
 
 	myDbData = (MaintenanceDaemonDBData *)
-			   hash_search(MaintenanceDaemonControl->dbHash, &databaseOid,
-						   HASH_FIND, NULL);
+			   hash_search(MaintenanceDaemonDBHash, &databaseOid, HASH_FIND, NULL);
 	if (!myDbData)
 	{
 		/*
@@ -275,13 +292,13 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * XXX: We clear the metadata cache before every iteration because otherwise
-		 * it might contain stale OIDs. It appears that in some cases invalidation
-		 * messages for a DROP EXTENSION may arrive during deadlock detection and
+		 * XXX: Each task should clear the metadata cache before every iteration
+		 * by calling InvalidateMetadataSystemCache(), because otherwise it
+		 * might contain stale OIDs. It appears that in some cases invalidation
+		 * messages for a DROP EXTENSION may arrive during these tasks and
 		 * this causes us to cache a stale pg_dist_node OID. We'd actually expect
 		 * all invalidations to arrive after obtaining a lock in LockCitusExtension.
 		 */
-		ClearMetadataOIDCache();
 
 		/*
 		 * Perform Work.  If a specific task needs to be called sooner than
@@ -289,9 +306,117 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		 * tasks should do their own time math about whether to re-run checks.
 		 */
 
+#ifdef HAVE_LIBCURL
+		if (EnableStatisticsCollection &&
+			GetCurrentTimestamp() >= nextStatsCollectionTime)
+		{
+			bool statsCollectionSuccess = false;
+			InvalidateMetadataSystemCache();
+			StartTransactionCommand();
+
+			/*
+			 * Lock the extension such that it cannot be dropped or created
+			 * concurrently. Skip statistics collection if citus extension is
+			 * not accessible.
+			 *
+			 * Similarly, we skip statistics collection if there exists any
+			 * version mismatch or the extension is not fully created yet.
+			 */
+			if (!LockCitusExtension())
+			{
+				ereport(DEBUG1, (errmsg("could not lock the citus extension, "
+										"skipping statistics collection")));
+			}
+			else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
+			{
+				FlushDistTableCache();
+				WarnIfSyncDNS();
+				statsCollectionSuccess = CollectBasicUsageStatistics();
+				if (statsCollectionSuccess)
+				{
+					/*
+					 * Checking for updates only when collecting statistics succeeds,
+					 * so we don't log update messages twice when we retry statistics
+					 * collection in a minute.
+					 */
+					CheckForUpdates();
+				}
+			}
+
+			/*
+			 * If statistics collection was successful the next collection is
+			 * 24-hours later. Also, if this was a retry attempt we don't do
+			 * any more retries until 24-hours later, so we limit number of
+			 * retries to one.
+			 */
+			if (statsCollectionSuccess || retryStatsCollection)
+			{
+				nextStatsCollectionTime =
+					TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												STATS_COLLECTION_TIMEOUT_MILLIS);
+				retryStatsCollection = false;
+			}
+			else
+			{
+				nextStatsCollectionTime =
+					TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												STATS_COLLECTION_RETRY_TIMEOUT_MILLIS);
+				retryStatsCollection = true;
+			}
+
+			CommitTransactionCommand();
+		}
+#endif
+
+		/*
+		 * If enabled, run 2PC recovery on primary nodes (where !RecoveryInProgress()),
+		 * since we'll write to the pg_dist_transaction log.
+		 */
+		if (Recover2PCInterval > 0 && !RecoveryInProgress() &&
+			TimestampDifferenceExceeds(lastRecoveryTime, GetCurrentTimestamp(),
+									   Recover2PCInterval))
+		{
+			int recoveredTransactionCount = 0;
+
+			InvalidateMetadataSystemCache();
+			StartTransactionCommand();
+
+			if (!LockCitusExtension())
+			{
+				ereport(DEBUG1, (errmsg("could not lock the citus extension, "
+										"skipping 2PC recovery")));
+			}
+			else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
+			{
+				/*
+				 * Record last recovery time at start to ensure we run once per
+				 * Recover2PCInterval even if RecoverTwoPhaseCommits takes some time.
+				 */
+				lastRecoveryTime = GetCurrentTimestamp();
+
+				recoveredTransactionCount = RecoverTwoPhaseCommits();
+			}
+
+			CommitTransactionCommand();
+
+			if (recoveredTransactionCount > 0)
+			{
+				ereport(LOG, (errmsg("maintenance daemon recovered %d distributed "
+									 "transactions",
+									 recoveredTransactionCount)));
+			}
+
+			/* make sure we don't wait too long */
+			timeout = Min(timeout, Recover2PCInterval);
+		}
+
 		/* the config value -1 disables the distributed deadlock detection  */
 		if (DistributedDeadlockDetectionTimeoutFactor != -1.0)
 		{
+			double deadlockTimeout =
+				DistributedDeadlockDetectionTimeoutFactor * (double) DeadlockTimeout;
+
+			InvalidateMetadataSystemCache();
 			StartTransactionCommand();
 
 			/*
@@ -324,13 +449,13 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 			 * citus.distributed_deadlock_detection_factor 2), we'd be able to cancel
 			 * ~10 distributed deadlocks per second.
 			 */
-			timeout =
-				DistributedDeadlockDetectionTimeoutFactor * (double) DeadlockTimeout;
-
 			if (foundDeadlock)
 			{
-				timeout = timeout / 20.0;
+				deadlockTimeout = deadlockTimeout / 20.0;
 			}
+
+			/* make sure we don't wait too long */
+			timeout = Min(timeout, deadlockTimeout);
 		}
 
 		/*
@@ -459,10 +584,9 @@ MaintenanceDaemonShmemInit(void)
 	hashInfo.hash = tag_hash;
 	hashFlags = (HASH_ELEM | HASH_FUNCTION);
 
-	MaintenanceDaemonControl->dbHash =
-		ShmemInitHash("Maintenance Database Hash",
-					  max_worker_processes, max_worker_processes,
-					  &hashInfo, hashFlags);
+	MaintenanceDaemonDBHash = ShmemInitHash("Maintenance Database Hash",
+											max_worker_processes, max_worker_processes,
+											&hashInfo, hashFlags);
 
 	LWLockRelease(AddinShmemInitLock);
 
@@ -551,7 +675,7 @@ StopMaintenanceDaemon(Oid databaseId)
 
 	LWLockAcquire(&MaintenanceDaemonControl->lock, LW_EXCLUSIVE);
 
-	dbData = (MaintenanceDaemonDBData *) hash_search(MaintenanceDaemonControl->dbHash,
+	dbData = (MaintenanceDaemonDBData *) hash_search(MaintenanceDaemonDBHash,
 													 &databaseId, HASH_REMOVE, &found);
 	if (found)
 	{

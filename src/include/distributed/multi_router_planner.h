@@ -17,7 +17,7 @@
 #include "distributed/errormessage.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "nodes/parsenodes.h"
 
 
@@ -26,17 +26,18 @@
 
 extern bool EnableRouterExecution;
 
-extern MultiPlan * CreateRouterPlan(Query *originalQuery, Query *query,
-									RelationRestrictionContext *restrictionContext);
-extern MultiPlan * CreateModifyPlan(Query *originalQuery, Query *query,
-									PlannerRestrictionContext *
-									plannerRestrictionContext);
+extern DistributedPlan * CreateRouterPlan(Query *originalQuery, Query *query,
+										  RelationRestrictionContext *restrictionContext);
+extern DistributedPlan * CreateModifyPlan(Query *originalQuery, Query *query,
+										  PlannerRestrictionContext *
+										  plannerRestrictionContext);
 extern DeferredErrorMessage * PlanRouterQuery(Query *originalQuery,
 											  RelationRestrictionContext *
 											  restrictionContext,
 											  List **placementList, uint64 *anchorShardId,
 											  List **relationShardList, bool
-											  replacePrunedQueryWithDummy);
+											  replacePrunedQueryWithDummy,
+											  bool *multiShardModifyQuery);
 extern List * RouterInsertTaskList(Query *query, DeferredErrorMessage **planningError);
 extern List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree,
@@ -52,6 +53,7 @@ extern RangeTblEntry * ExtractDistributedInsertValuesRTE(Query *query);
 extern bool IsMultiRowInsert(Query *query);
 extern void AddShardIntervalRestrictionToSelect(Query *subqery,
 												ShardInterval *shardInterval);
+extern bool UpdateOrDeleteQuery(Query *query);
 
 
 #endif /* MULTI_ROUTER_PLANNER_H */

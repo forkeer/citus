@@ -1,4 +1,4 @@
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1600000;
+SET citus.next_shard_id TO 1600000;
 
 \c "dbname=regression options='-c\ citus.use_secondary_nodes=always'"
 
@@ -32,6 +32,24 @@ SELECT a FROM dest_table WHERE a = 1;
 
 -- real-time selects are also allowed
 SELECT a FROM dest_table;
+
+-- subqueries are also allowed
+SET client_min_messages TO DEBUG1;
+SELECT
+   foo.a
+FROM
+    (
+	     WITH cte AS (
+	    SELECT 
+	    	DISTINCT dest_table.a 
+	     FROM 
+	     	dest_table, source_table 
+	     WHERE 
+	     	source_table.a = dest_table.a AND 
+	     dest_table.b IN (1,2,3,4)
+	     ) SELECT * FROM cte ORDER BY 1 DESC LIMIT 5
+     ) as foo;
+SET client_min_messages TO DEFAULT;
 
 -- insert into is definitely not allowed
 INSERT INTO dest_table (a, b)

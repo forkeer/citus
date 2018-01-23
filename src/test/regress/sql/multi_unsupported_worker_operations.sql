@@ -4,7 +4,7 @@
 
 -- Tests for ensuring unsupported functions on workers error out.
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1270000;
+SET citus.next_shard_id TO 1270000;
 ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART 1370000;
 ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART 1370000;
 
@@ -137,14 +137,6 @@ SELECT master_remove_node('localhost', 5432);
 \c - - - :worker_1_port
 TRUNCATE mx_table;
 SELECT count(*) FROM mx_table;
-
--- INSERT / SELECT pulls results to worker
-BEGIN;
-SET LOCAL client_min_messages TO DEBUG;
-INSERT INTO mx_table_2 SELECT * FROM mx_table;
-END;
-
-SELECT count(*) FROM mx_table_2;
 
 -- mark_tables_colocated
 UPDATE pg_dist_partition SET colocationid = 0 WHERE logicalrelid='mx_table_2'::regclass;

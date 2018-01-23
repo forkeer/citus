@@ -36,8 +36,6 @@
 #define JOB_CLEANUP_QUERY "SELECT task_tracker_cleanup_job("UINT64_FORMAT ")"
 #define JOB_CLEANUP_TASK_ID INT_MAX
 
-#define MULTI_TASK_QUERY_INFO_OFF 0  /* do not log multi-task queries */
-
 
 /* Enumeration to track one task's execution status */
 typedef enum
@@ -60,7 +58,11 @@ typedef enum
 	EXEC_TASK_TRACKER_RETRY = 13,
 	EXEC_TASK_TRACKER_FAILED = 14,
 	EXEC_SOURCE_TASK_TRACKER_RETRY = 15,
-	EXEC_SOURCE_TASK_TRACKER_FAILED = 16
+	EXEC_SOURCE_TASK_TRACKER_FAILED = 16,
+
+	/* transactional operations */
+	EXEC_BEGIN_START = 20,
+	EXEC_BEGIN_RUNNING = 21
 } TaskExecStatus;
 
 
@@ -109,6 +111,19 @@ typedef enum
 
 
 /*
+ * DistributedExecutionStats holds the execution related stats.
+ *
+ * totalIntermediateResultSize is a counter to keep the size
+ * of the intermediate results of complex subqueries and CTEs
+ * so that we can put a limit on the size.
+ */
+typedef struct DistributedExecutionStats
+{
+	uint64 totalIntermediateResultSize;
+} DistributedExecutionStats;
+
+
+/*
  * TaskExecution holds state that relates to a task's execution. In the case of
  * the real-time executor, this struct encapsulates all information necessary to
  * run the task. The task tracker executor however manages its connection logic
@@ -130,6 +145,7 @@ struct TaskExecution
 	uint32 querySourceNodeIndex; /* only applies to map fetch tasks */
 	int32 dataFetchTaskIndex;
 	uint32 failureCount;
+	bool criticalErrorOccurred;
 };
 
 
@@ -156,6 +172,7 @@ typedef struct TaskTracker
 {
 	uint32 workerPort;              /* node's port; part of hash table key */
 	char workerName[WORKER_LENGTH]; /* node's name; part of hash table key */
+	char *userName;                 /* which user to connect as */
 	TrackerStatus trackerStatus;
 	int32 connectionId;
 	uint32 connectPollCount;
@@ -187,6 +204,7 @@ typedef struct WorkerNodeState
 extern int RemoteTaskCheckInterval;
 extern int MaxAssignTaskBatchSize;
 extern int TaskExecutorType;
+extern bool EnableRepartitionJoins;
 extern bool BinaryMasterCopyFormat;
 extern int MultiTaskQueryLogLevel;
 
@@ -196,13 +214,19 @@ extern void MultiRealTimeExecute(Job *job);
 extern void MultiTaskTrackerExecute(Job *job);
 
 /* Function declarations common to more than one executor */
-extern MultiExecutorType JobExecutorType(MultiPlan *multiPlan);
+extern MultiExecutorType JobExecutorType(DistributedPlan *distributedPlan);
 extern void RemoveJobDirectory(uint64 jobId);
 extern TaskExecution * InitTaskExecution(Task *task, TaskExecStatus initialStatus);
+extern bool CheckIfSizeLimitIsExceeded(DistributedExecutionStats *executionStats);
 extern void CleanupTaskExecution(TaskExecution *taskExecution);
+extern void ErrorSizeLimitIsExceeded(void);
 extern bool TaskExecutionFailed(TaskExecution *taskExecution);
 extern void AdjustStateForFailure(TaskExecution *taskExecution);
 extern int MaxMasterConnectionCount(void);
+extern void PrepareMasterJobDirectory(Job *workerJob);
 
+
+extern TupleTableSlot * RealTimeExecScan(CustomScanState *node);
+extern TupleTableSlot * TaskTrackerExecScan(CustomScanState *node);
 
 #endif /* MULTI_SERVER_EXECUTOR_H */

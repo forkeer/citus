@@ -49,6 +49,7 @@ static bool ParseBoolField(PGresult *result, int rowIndex, int colIndex);
 static TimestampTz ParseTimestampTzField(PGresult *result, int rowIndex, int colIndex);
 static void ReturnWaitGraph(WaitGraph *waitGraph, FunctionCallInfo fcinfo);
 static WaitGraph * BuildLocalWaitGraph(void);
+static bool IsProcessWaitingForSafeOperations(PGPROC *proc);
 static void LockLockData(void);
 static void UnlockLockData(void);
 static void AddEdgesForLockWaits(WaitGraph *waitGraph, PGPROC *waitingProc,
@@ -447,6 +448,12 @@ BuildLocalWaitGraph(void)
 			continue;
 		}
 
+		/* skip if the process is blocked for relation extension */
+		if (IsProcessWaitingForSafeOperations(currentProc))
+		{
+			continue;
+		}
+
 		AddProcToVisit(&remaining, currentProc);
 	}
 
@@ -456,6 +463,12 @@ BuildLocalWaitGraph(void)
 
 		/* only blocked processes result in wait edges */
 		if (!IsProcessWaitingForLock(waitingProc))
+		{
+			continue;
+		}
+
+		/* skip if the process is blocked for relation extension */
+		if (IsProcessWaitingForSafeOperations(waitingProc))
 		{
 			continue;
 		}
@@ -476,6 +489,50 @@ BuildLocalWaitGraph(void)
 	UnlockLockData();
 
 	return waitGraph;
+}
+
+
+/*
+ * IsProcessWaitingForSafeOperations returns true if the given PROC
+ * waiting on relation extension locks, page locks or speculative locks.
+ *
+ * The function also returns true if the waiting process is an autovacuum
+ * process given that autovacuum cannot contribute to any distributed
+ * deadlocks.
+ *
+ * In general for the purpose of distributed deadlock detection, we should
+ * skip if the process blocked on the locks that may not be part of deadlocks.
+ * Those locks are held for a short duration while the relation or the index
+ * is actually  extended on the disk and released as soon as the extension is
+ * done, even before the execution of the command that triggered the extension
+ * finishes. Thus, recording such waits on our lock graphs could yield detecting
+ * wrong distributed deadlocks.
+ */
+static bool
+IsProcessWaitingForSafeOperations(PGPROC *proc)
+{
+	PROCLOCK *waitProcLock = NULL;
+	LOCK *waitLock = NULL;
+	PGXACT *pgxact = NULL;
+
+	if (proc->waitStatus != STATUS_WAITING)
+	{
+		return false;
+	}
+
+	/* get the transaction that the backend associated with */
+	pgxact = &ProcGlobal->allPgXact[proc->pgprocno];
+	if (pgxact->vacuumFlags & PROC_IS_AUTOVACUUM)
+	{
+		return true;
+	}
+
+	waitProcLock = proc->waitProcLock;
+	waitLock = waitProcLock->tag.myLock;
+
+	return waitLock->tag.locktag_type == LOCKTAG_RELATION_EXTEND ||
+		   waitLock->tag.locktag_type == LOCKTAG_PAGE ||
+		   waitLock->tag.locktag_type == LOCKTAG_SPECULATIVE_TOKEN;
 }
 
 
@@ -550,9 +607,13 @@ AddEdgesForLockWaits(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 	{
 		PGPROC *currentProc = procLock->tag.myProc;
 
-		/* skip processes from the same lock group and ones that don't conflict */
+		/*
+		 * Skip processes from the same lock group, processes that don't conflict,
+		 * and processes that are waiting on safe operations.
+		 */
 		if (!IsSameLockGroup(waitingProc, currentProc) &&
-			IsConflictingLockMask(procLock->holdMask, conflictMask))
+			IsConflictingLockMask(procLock->holdMask, conflictMask) &&
+			!IsProcessWaitingForSafeOperations(currentProc))
 		{
 			AddWaitEdge(waitGraph, waitingProc, currentProc, remaining);
 		}
@@ -590,9 +651,13 @@ AddEdgesForWaitQueue(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 	{
 		int awaitMask = LOCKBIT_ON(currentProc->waitLockMode);
 
-		/* skip processes from the same lock group and ones that don't conflict */
+		/*
+		 * Skip processes from the same lock group, processes that don't conflict,
+		 * and processes that are waiting on safe operations.
+		 */
 		if (!IsSameLockGroup(waitingProc, currentProc) &&
-			IsConflictingLockMask(awaitMask, conflictMask))
+			IsConflictingLockMask(awaitMask, conflictMask) &&
+			!IsProcessWaitingForSafeOperations(currentProc))
 		{
 			AddWaitEdge(waitGraph, waitingProc, currentProc, remaining);
 		}
@@ -621,7 +686,9 @@ AddWaitEdge(WaitGraph *waitGraph, PGPROC *waitingProc, PGPROC *blockingProc,
 	GetBackendDataForProc(waitingProc, &waitingBackendData);
 	GetBackendDataForProc(blockingProc, &blockingBackendData);
 
-	curEdge->isBlockingXactWaiting = IsProcessWaitingForLock(blockingProc);
+	curEdge->isBlockingXactWaiting =
+		IsProcessWaitingForLock(blockingProc) &&
+		!IsProcessWaitingForSafeOperations(blockingProc);
 	if (curEdge->isBlockingXactWaiting)
 	{
 		AddProcToVisit(remaining, blockingProc);

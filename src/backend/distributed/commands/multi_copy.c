@@ -69,6 +69,7 @@
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shard_pruning.h"
+#include "distributed/version_compat.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "tsearch/ts_locale.h"
@@ -96,22 +97,18 @@ static void OpenCopyConnections(CopyStmt *copyStatement,
 								ShardConnections *shardConnections, bool stopOnFailure,
 								bool useBinaryCopyFormat);
 
-static bool CanUseBinaryCopyFormat(TupleDesc tupleDescription);
 static bool BinaryOutputFunctionDefined(Oid typeId);
 static List * MasterShardPlacementList(uint64 shardId);
 static List * RemoteFinalizedShardPlacementList(uint64 shardId);
-
 static void SendCopyBinaryHeaders(CopyOutState copyOutState, int64 shardId,
 								  List *connectionList);
 static void SendCopyBinaryFooters(CopyOutState copyOutState, int64 shardId,
 								  List *connectionList);
-
 static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId,
 										 bool useBinaryCopyFormat);
 static void SendCopyDataToAll(StringInfo dataBuffer, int64 shardId, List *connectionList);
 static void SendCopyDataToPlacement(StringInfo dataBuffer, int64 shardId,
 									MultiConnection *connection);
-static void EndRemoteCopy(int64 shardId, List *connectionList, bool stopOnFailure);
 static void ReportCopyError(MultiConnection *connection, PGresult *result);
 static uint32 AvailableColumnCount(TupleDesc tupleDescriptor);
 static int64 StartCopyToNewShard(ShardConnections *shardConnections,
@@ -121,6 +118,17 @@ static int64 CreateEmptyShard(char *relationName);
 static int64 RemoteCreateEmptyShard(char *relationName);
 static void MasterUpdateShardStatistics(uint64 shardId);
 static void RemoteUpdateShardStatistics(uint64 shardId);
+
+static void ConversionPathForTypes(Oid inputType, Oid destType, CopyCoercionData *result);
+static Oid TypeForColumnName(Oid relationId, TupleDesc tupleDescriptor, char *columnName);
+static Oid * TypeArrayFromTupleDescriptor(TupleDesc tupleDescriptor);
+static CopyCoercionData * ColumnCoercionPaths(TupleDesc destTupleDescriptor,
+											  TupleDesc inputTupleDescriptor,
+											  Oid destRelId, List *columnNameList,
+											  Oid *finalColumnTypeArray);
+static FmgrInfo * TypeOutputFunctions(uint32 columnCount, Oid *typeIdArray,
+									  bool binaryFormat);
+static Datum CoerceColumnValue(Datum inputValue, CopyCoercionData *coercionPath);
 
 /* Private functions copied and adapted from copy.c in PostgreSQL */
 static void CopySendData(CopyOutState outputState, const void *databuf, int datasize);
@@ -334,7 +342,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	/* build the list of column names for remote COPY statements */
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
-		Form_pg_attribute currentColumn = tupleDescriptor->attrs[columnIndex];
+		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
 		char *columnName = NameStr(currentColumn->attname);
 
 		if (currentColumn->attisdropped)
@@ -597,7 +605,7 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 		/* replicate row to shard placements */
 		resetStringInfo(copyOutState->fe_msgbuf);
 		AppendCopyRowData(columnValues, columnNulls, tupleDescriptor,
-						  copyOutState, columnOutputFunctions);
+						  copyOutState, columnOutputFunctions, NULL);
 		SendCopyDataToAll(copyOutState->fe_msgbuf, currentShardId,
 						  shardConnections->connectionList);
 
@@ -809,9 +817,18 @@ OpenCopyConnections(CopyStmt *copyStatement, ShardConnections *shardConnections,
 		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
 		char *nodeUser = CurrentUserName();
 		MultiConnection *connection = NULL;
-		uint32 connectionFlags = FOR_DML | CONNECTION_PER_PLACEMENT;
+		uint32 connectionFlags = FOR_DML;
 		StringInfo copyCommand = NULL;
 		PGresult *result = NULL;
+
+		/*
+		 * Make sure we use a separate connection per placement for hash-distributed
+		 * tables in order to allow multi-shard modifications in the same transaction.
+		 */
+		if (placement->partitionMethod == DISTRIBUTE_BY_HASH)
+		{
+			connectionFlags |= CONNECTION_PER_PLACEMENT;
+		}
 
 		connection = GetPlacementConnection(connectionFlags, placement, nodeUser);
 
@@ -883,7 +900,7 @@ OpenCopyConnections(CopyStmt *copyStatement, ShardConnections *shardConnections,
  * worker nodes for user-defined types. If the function can not detect a binary
  * output function for any of the column, it returns false.
  */
-static bool
+bool
 CanUseBinaryCopyFormat(TupleDesc tupleDescription)
 {
 	bool useBinaryCopyFormat = true;
@@ -892,11 +909,8 @@ CanUseBinaryCopyFormat(TupleDesc tupleDescription)
 
 	for (columnIndex = 0; columnIndex < totalColumnCount; columnIndex++)
 	{
-		Form_pg_attribute currentColumn = tupleDescription->attrs[columnIndex];
+		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescription, columnIndex);
 		Oid typeId = InvalidOid;
-		char typeCategory = '\0';
-		bool typePreferred = false;
-		bool binaryOutputFunctionDefined = false;
 
 		if (currentColumn->attisdropped)
 		{
@@ -904,28 +918,45 @@ CanUseBinaryCopyFormat(TupleDesc tupleDescription)
 		}
 
 		typeId = currentColumn->atttypid;
-
-		/* built-in types may also don't have binary output function */
-		binaryOutputFunctionDefined = BinaryOutputFunctionDefined(typeId);
-		if (!binaryOutputFunctionDefined)
+		if (!CanUseBinaryCopyFormatForType(typeId))
 		{
 			useBinaryCopyFormat = false;
 			break;
 		}
-
-		if (typeId >= FirstNormalObjectId)
-		{
-			get_type_category_preferred(typeId, &typeCategory, &typePreferred);
-			if (typeCategory == TYPCATEGORY_ARRAY ||
-				typeCategory == TYPCATEGORY_COMPOSITE)
-			{
-				useBinaryCopyFormat = false;
-				break;
-			}
-		}
 	}
 
 	return useBinaryCopyFormat;
+}
+
+
+/*
+ * CanUseBinaryCopyFormatForType determines whether it is safe to use the
+ * binary copy format for the given type. The binary copy format cannot
+ * be used for arrays or composite types that contain user-defined types,
+ * or when there is no binary output function defined.
+ */
+bool
+CanUseBinaryCopyFormatForType(Oid typeId)
+{
+	if (!BinaryOutputFunctionDefined(typeId))
+	{
+		return false;
+	}
+
+	if (typeId >= FirstNormalObjectId)
+	{
+		char typeCategory = '\0';
+		bool typePreferred = false;
+
+		get_type_category_preferred(typeId, &typeCategory, &typePreferred);
+		if (typeCategory == TYPCATEGORY_ARRAY ||
+			typeCategory == TYPCATEGORY_COMPOSITE)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
@@ -1135,7 +1166,7 @@ SendCopyDataToPlacement(StringInfo dataBuffer, int64 shardId, MultiConnection *c
 	if (!PutRemoteCopyData(connection, dataBuffer->data, dataBuffer->len))
 	{
 		ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
-						errmsg("failed to COPY to shard %ld on %s:%d",
+						errmsg("failed to COPY to shard " INT64_FORMAT " on %s:%d",
 							   shardId, connection->hostname, connection->port),
 						errdetail("failed to send %d bytes %s", dataBuffer->len,
 								  dataBuffer->data)));
@@ -1148,7 +1179,7 @@ SendCopyDataToPlacement(StringInfo dataBuffer, int64 shardId, MultiConnection *c
  * If stopOnFailure is true, then EndRemoteCopy reports an error on failure,
  * otherwise it reports a warning or continues.
  */
-static void
+void
 EndRemoteCopy(int64 shardId, List *connectionList, bool stopOnFailure)
 {
 	ListCell *connectionCell = NULL;
@@ -1162,12 +1193,14 @@ EndRemoteCopy(int64 shardId, List *connectionList, bool stopOnFailure)
 		/* end the COPY input */
 		if (!PutRemoteCopyEnd(connection, NULL))
 		{
-			if (stopOnFailure)
+			if (!stopOnFailure)
 			{
-				ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
-								errmsg("failed to COPY to shard %ld on %s:%d",
-									   shardId, connection->hostname, connection->port)));
+				continue;
 			}
+
+			ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
+							errmsg("failed to COPY to shard " INT64_FORMAT " on %s:%d",
+								   shardId, connection->hostname, connection->port)));
 
 			continue;
 		}
@@ -1205,17 +1238,8 @@ ReportCopyError(MultiConnection *connection, PGresult *result)
 	}
 	else
 	{
-		/* probably a connection problem, get the message from the connection */
-		char *lastNewlineIndex = NULL;
-
-		remoteMessage = PQerrorMessage(connection->pgConn);
-		lastNewlineIndex = strrchr(remoteMessage, '\n');
-
-		/* trim trailing newline, if any */
-		if (lastNewlineIndex != NULL)
-		{
-			*lastNewlineIndex = '\0';
-		}
+		/* trim the trailing characters */
+		remoteMessage = pchomp(PQerrorMessage(connection->pgConn));
 
 		ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
 						errmsg("failed to complete COPY on %s:%d", connection->hostname,
@@ -1226,28 +1250,195 @@ ReportCopyError(MultiConnection *connection, PGresult *result)
 
 
 /*
- * ColumnOutputFunctions walks over a table's columns, and finds each column's
- * type information. The function then resolves each type's output function,
- * and stores and returns these output functions in an array.
+ * ConversionPathForTypes fills *result with all the data necessary for converting
+ * Datums of type inputType to Datums of type destType.
  */
-FmgrInfo *
-ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat)
+static void
+ConversionPathForTypes(Oid inputType, Oid destType, CopyCoercionData *result)
 {
-	uint32 columnCount = (uint32) rowDescriptor->natts;
+	Oid coercionFuncId = InvalidOid;
+	CoercionPathType coercionType = COERCION_PATH_RELABELTYPE;
+
+	if (destType == inputType)
+	{
+		result->coercionType = COERCION_PATH_RELABELTYPE;
+		return;
+	}
+
+	coercionType = find_coercion_pathway(destType, inputType,
+										 COERCION_EXPLICIT,
+										 &coercionFuncId);
+
+	switch (coercionType)
+	{
+		case COERCION_PATH_NONE:
+		{
+			ereport(ERROR, (errmsg("cannot cast %d to %d", inputType, destType)));
+		}
+
+		case COERCION_PATH_ARRAYCOERCE:
+		{
+			ereport(ERROR, (errmsg("can not run query which uses an implicit coercion"
+								   " between array types")));
+		}
+
+		case COERCION_PATH_COERCEVIAIO:
+		{
+			result->coercionType = COERCION_PATH_COERCEVIAIO;
+
+			{
+				bool typisvarlena = false; /* ignored */
+				Oid iofunc = InvalidOid;
+				getTypeOutputInfo(inputType, &iofunc, &typisvarlena);
+				fmgr_info(iofunc, &(result->outputFunction));
+			}
+
+			{
+				Oid iofunc = InvalidOid;
+				getTypeInputInfo(destType, &iofunc, &(result->typioparam));
+				fmgr_info(iofunc, &(result->inputFunction));
+			}
+
+			return;
+		}
+
+		case COERCION_PATH_FUNC:
+		{
+			result->coercionType = COERCION_PATH_FUNC;
+			fmgr_info(coercionFuncId, &(result->coerceFunction));
+			return;
+		}
+
+		case COERCION_PATH_RELABELTYPE:
+		{
+			result->coercionType = COERCION_PATH_RELABELTYPE;
+			return; /* the types are binary compatible, no need to call a function */
+		}
+
+		default:
+			Assert(false); /* there are no other options for this enum */
+	}
+}
+
+
+/*
+ * Returns the type of the provided column of the provided tuple. Throws an error if the
+ * column does not exist or is dropped.
+ *
+ * tupleDescriptor and relationId must refer to the same table.
+ */
+static Oid
+TypeForColumnName(Oid relationId, TupleDesc tupleDescriptor, char *columnName)
+{
+	AttrNumber destAttrNumber = get_attnum(relationId, columnName);
+	Form_pg_attribute attr = NULL;
+
+	if (destAttrNumber == InvalidAttrNumber)
+	{
+		ereport(ERROR, (errmsg("invalid attr? %s", columnName)));
+	}
+
+	attr = TupleDescAttr(tupleDescriptor, destAttrNumber - 1);
+	return attr->atttypid;
+}
+
+
+/*
+ * Walks a TupleDesc and returns an array of the types of each attribute. Will return
+ * InvalidOid in the place of dropped attributes.
+ */
+static Oid *
+TypeArrayFromTupleDescriptor(TupleDesc tupleDescriptor)
+{
+	int columnCount = tupleDescriptor->natts;
+	Oid *typeArray = palloc0(columnCount * sizeof(Oid));
+	int columnIndex = 0;
+
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDescriptor, columnIndex);
+		if (attr->attisdropped)
+		{
+			typeArray[columnIndex] = InvalidOid;
+		}
+		else
+		{
+			typeArray[columnIndex] = attr->atttypid;
+		}
+	}
+
+	return typeArray;
+}
+
+
+/*
+ * ColumnCoercionPaths scans the input and output tuples looking for mismatched types,
+ * it then returns an array of coercion functions to use on the input tuples, and an
+ * array of types which descript the output tuple
+ */
+static CopyCoercionData *
+ColumnCoercionPaths(TupleDesc destTupleDescriptor, TupleDesc inputTupleDescriptor,
+					Oid destRelId, List *columnNameList,
+					Oid *finalColumnTypeArray)
+{
+	int columnIndex = 0;
+	int columnCount = inputTupleDescriptor->natts;
+	CopyCoercionData *coercePaths = palloc0(columnCount * sizeof(CopyCoercionData));
+	Oid *inputTupleTypes = TypeArrayFromTupleDescriptor(inputTupleDescriptor);
+	ListCell *currentColumnName = list_head(columnNameList);
+
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		Oid destTupleType = InvalidOid;
+		Oid inputTupleType = inputTupleTypes[columnIndex];
+		char *columnName = lfirst(currentColumnName);
+
+		if (inputTupleType == InvalidOid)
+		{
+			/* this was a dropped column and will not be in the incoming tuples */
+			continue;
+		}
+
+		destTupleType = TypeForColumnName(destRelId, destTupleDescriptor, columnName);
+
+		finalColumnTypeArray[columnIndex] = destTupleType;
+
+		ConversionPathForTypes(inputTupleType, destTupleType,
+							   &coercePaths[columnIndex]);
+
+		currentColumnName = lnext(currentColumnName);
+
+		if (currentColumnName == NULL)
+		{
+			/* the rest of inputTupleDescriptor are dropped columns, return early! */
+			break;
+		}
+	}
+
+	return coercePaths;
+}
+
+
+/*
+ * TypeOutputFunctions takes an array of types and returns an array of output functions
+ * for those types.
+ */
+static FmgrInfo *
+TypeOutputFunctions(uint32 columnCount, Oid *typeIdArray, bool binaryFormat)
+{
 	FmgrInfo *columnOutputFunctions = palloc0(columnCount * sizeof(FmgrInfo));
 
 	uint32 columnIndex = 0;
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		FmgrInfo *currentOutputFunction = &columnOutputFunctions[columnIndex];
-		Form_pg_attribute currentColumn = rowDescriptor->attrs[columnIndex];
-		Oid columnTypeId = currentColumn->atttypid;
-		Oid outputFunctionId = InvalidOid;
+		Oid columnTypeId = typeIdArray[columnIndex];
 		bool typeVariableLength = false;
+		Oid outputFunctionId = InvalidOid;
 
-		if (currentColumn->attisdropped)
+		/* If there are any dropped columns it'll show up as a NULL */
+		if (columnTypeId == InvalidOid)
 		{
-			/* dropped column, leave the output function NULL */
 			continue;
 		}
 		else if (binaryFormat)
@@ -1267,6 +1458,23 @@ ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat)
 
 
 /*
+ * ColumnOutputFunctions is a wrapper around TypeOutputFunctions, it takes a
+ * tupleDescriptor and returns an array of output functions, one for each column in
+ * the tuple.
+ */
+FmgrInfo *
+ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat)
+{
+	uint32 columnCount = (uint32) rowDescriptor->natts;
+	Oid *columnTypes = TypeArrayFromTupleDescriptor(rowDescriptor);
+	FmgrInfo *outputFunctions =
+		TypeOutputFunctions(columnCount, columnTypes, binaryFormat);
+
+	return outputFunctions;
+}
+
+
+/*
  * AppendCopyRowData serializes one row using the column output functions,
  * and appends the data to the row output state object's message buffer.
  * This function is modeled after the CopyOneRowTo() function in
@@ -1276,7 +1484,8 @@ ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat)
  */
 void
 AppendCopyRowData(Datum *valueArray, bool *isNullArray, TupleDesc rowDescriptor,
-				  CopyOutState rowOutputState, FmgrInfo *columnOutputFunctions)
+				  CopyOutState rowOutputState, FmgrInfo *columnOutputFunctions,
+				  CopyCoercionData *columnCoercionPaths)
 {
 	uint32 totalColumnCount = (uint32) rowDescriptor->natts;
 	uint32 availableColumnCount = AvailableColumnCount(rowDescriptor);
@@ -1291,10 +1500,15 @@ AppendCopyRowData(Datum *valueArray, bool *isNullArray, TupleDesc rowDescriptor,
 	}
 	for (columnIndex = 0; columnIndex < totalColumnCount; columnIndex++)
 	{
-		Form_pg_attribute currentColumn = rowDescriptor->attrs[columnIndex];
+		Form_pg_attribute currentColumn = TupleDescAttr(rowDescriptor, columnIndex);
 		Datum value = valueArray[columnIndex];
 		bool isNull = isNullArray[columnIndex];
 		bool lastColumn = false;
+
+		if (!isNull && columnCoercionPaths != NULL)
+		{
+			value = CoerceColumnValue(value, &columnCoercionPaths[columnIndex]);
+		}
 
 		if (currentColumn->attisdropped)
 		{
@@ -1355,6 +1569,54 @@ AppendCopyRowData(Datum *valueArray, bool *isNullArray, TupleDesc rowDescriptor,
 
 
 /*
+ * CoerceColumnValue follows the instructions in *coercionPath and uses them to convert
+ * inputValue into a Datum of the correct type.
+ */
+static Datum
+CoerceColumnValue(Datum inputValue, CopyCoercionData *coercionPath)
+{
+	switch (coercionPath->coercionType)
+	{
+		case 0:
+		{
+			return inputValue; /* this was a dropped column */
+		}
+
+		case COERCION_PATH_RELABELTYPE:
+		{
+			return inputValue; /* no need to do anything */
+		}
+
+		case COERCION_PATH_FUNC:
+		{
+			FmgrInfo *coerceFunction = &(coercionPath->coerceFunction);
+			Datum outputValue = FunctionCall1(coerceFunction, inputValue);
+			return outputValue;
+		}
+
+		case COERCION_PATH_COERCEVIAIO:
+		{
+			FmgrInfo *outFunction = &(coercionPath->outputFunction);
+			Datum textRepr = FunctionCall1(outFunction, inputValue);
+
+			FmgrInfo *inFunction = &(coercionPath->inputFunction);
+			Oid typioparam = coercionPath->typioparam;
+			Datum outputValue = FunctionCall3(inFunction, textRepr, typioparam,
+											  Int32GetDatum(-1));
+
+			return outputValue;
+		}
+
+		default:
+		{
+			/* this should never happen */
+			ereport(ERROR, (errmsg("unsupported coercion type")));
+		}
+	}
+}
+
+
+/*
  * AvailableColumnCount returns the number of columns in a tuple descriptor, excluding
  * columns that were dropped.
  */
@@ -1366,7 +1628,7 @@ AvailableColumnCount(TupleDesc tupleDescriptor)
 
 	for (columnIndex = 0; columnIndex < tupleDescriptor->natts; columnIndex++)
 	{
-		Form_pg_attribute currentColumn = tupleDescriptor->attrs[columnIndex];
+		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
 
 		if (!currentColumn->attisdropped)
 		{
@@ -1838,7 +2100,12 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 
 	/* prevent concurrent placement changes and non-commutative DML statements */
 	LockShardListMetadata(shardIntervalList, ShareLock);
-	LockShardListResources(shardIntervalList, ShareLock);
+
+	/*
+	 * Prevent concurrent UPDATE/DELETE on replication factor >1
+	 * (see AcquireExecutorMultiShardLocks() at multi_router_executor.c)
+	 */
+	LockShardListResources(shardIntervalList, RowExclusiveLock);
 
 	/* keep the table metadata to avoid looking it up for every tuple */
 	copyDest->tableMetadata = cacheEntry;
@@ -1861,9 +2128,19 @@ CitusCopyDestReceiverStartup(DestReceiver *dest, int operation,
 	copyOutState->rowcontext = GetPerTupleMemoryContext(copyDest->executorState);
 	copyDest->copyOutState = copyOutState;
 
-	/* prepare output functions */
-	copyDest->columnOutputFunctions =
-		ColumnOutputFunctions(inputTupleDescriptor, copyOutState->binary);
+	/* prepare functions to call on received tuples */
+	{
+		TupleDesc destTupleDescriptor = distributedRelation->rd_att;
+		int columnCount = inputTupleDescriptor->natts;
+		Oid *finalTypeArray = palloc0(columnCount * sizeof(Oid));
+
+		copyDest->columnCoercionPaths =
+			ColumnCoercionPaths(destTupleDescriptor, inputTupleDescriptor,
+								tableId, columnNameList, finalTypeArray);
+
+		copyDest->columnOutputFunctions =
+			TypeOutputFunctions(columnCount, finalTypeArray, copyOutState->binary);
+	}
 
 	/* ensure the column names are properly quoted in the COPY statement */
 	foreach(columnNameCell, columnNameList)
@@ -1914,6 +2191,7 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 	HTAB *shardConnectionHash = copyDest->shardConnectionHash;
 	CopyOutState copyOutState = copyDest->copyOutState;
 	FmgrInfo *columnOutputFunctions = copyDest->columnOutputFunctions;
+	CopyCoercionData *columnCoercionPaths = copyDest->columnCoercionPaths;
 
 	bool stopOnFailure = copyDest->stopOnFailure;
 
@@ -1945,6 +2223,8 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 	 */
 	if (partitionColumnIndex != INVALID_PARTITION_COLUMN_INDEX)
 	{
+		CopyCoercionData *coercePath = &columnCoercionPaths[partitionColumnIndex];
+
 		if (columnNulls[partitionColumnIndex])
 		{
 			Oid relationId = copyDest->distributedRelationId;
@@ -1961,6 +2241,9 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 
 		/* find the partition column value */
 		partitionColumnValue = columnValues[partitionColumnIndex];
+
+		/* annoyingly this is evaluated twice, but at least we don't crash! */
+		partitionColumnValue = CoerceColumnValue(partitionColumnValue, coercePath);
 	}
 
 	/*
@@ -2003,7 +2286,7 @@ CitusCopyDestReceiverReceive(TupleTableSlot *slot, DestReceiver *dest)
 	/* replicate row to shard placements */
 	resetStringInfo(copyOutState->fe_msgbuf);
 	AppendCopyRowData(columnValues, columnNulls, tupleDescriptor,
-					  copyOutState, columnOutputFunctions);
+					  copyOutState, columnOutputFunctions, columnCoercionPaths);
 	SendCopyDataToAll(copyOutState->fe_msgbuf, shardId, shardConnections->connectionList);
 
 	MemoryContextSwitchTo(oldContext);
@@ -2072,6 +2355,11 @@ CitusCopyDestReceiverDestroy(DestReceiver *destReceiver)
 	if (copyDest->columnOutputFunctions)
 	{
 		pfree(copyDest->columnOutputFunctions);
+	}
+
+	if (copyDest->columnCoercionPaths)
+	{
+		pfree(copyDest->columnCoercionPaths);
 	}
 
 	pfree(copyDest);

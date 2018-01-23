@@ -18,6 +18,10 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
+#include "utils/palloc.h"
+
+
+#define MAX_PUT_COPY_DATA_BUFFER_SIZE (8 * 1024 * 1024)
 
 
 /* GUC, determining whether statements sent to remote nodes are logged */
@@ -55,6 +59,8 @@ IsResponseOK(PGresult *result)
  *
  * Note that this might require network IO. If that's not acceptable, use
  * NonblockingForgetResults().
+ *
+ * ClearResults is variant of this function which can also raise errors.
  */
 void
 ForgetResults(MultiConnection *connection)
@@ -77,6 +83,52 @@ ForgetResults(MultiConnection *connection)
 		}
 		PQclear(result);
 	}
+}
+
+
+/*
+ * ClearResults clears a connection from pending activity,
+ * returns true if all pending commands return success. It raises
+ * error if raiseErrors flag is set, any command fails and transaction
+ * is marked critical.
+ *
+ * Note that this might require network IO. If that's not acceptable, use
+ * NonblockingForgetResults().
+ */
+bool
+ClearResults(MultiConnection *connection, bool raiseErrors)
+{
+	bool success = true;
+
+	while (true)
+	{
+		PGresult *result = GetRemoteCommandResult(connection, raiseErrors);
+		if (result == NULL)
+		{
+			break;
+		}
+
+		/*
+		 * End any pending copy operation. Transaction will be marked
+		 * as failed by the following part.
+		 */
+		if (PQresultStatus(result) == PGRES_COPY_IN)
+		{
+			PQputCopyEnd(connection->pgConn, NULL);
+		}
+
+		if (!IsResponseOK(result))
+		{
+			ReportResultError(connection, result, WARNING);
+			MarkRemoteTransactionFailed(connection, raiseErrors);
+
+			success = false;
+		}
+
+		PQclear(result);
+	}
+
+	return success;
 }
 
 
@@ -130,7 +182,8 @@ NonblockingForgetResults(MultiConnection *connection)
 		}
 
 		result = PQgetResult(pgConn);
-		if (PQresultStatus(result) == PGRES_COPY_IN)
+		if (PQresultStatus(result) == PGRES_COPY_IN ||
+			PQresultStatus(result) == PGRES_COPY_OUT)
 		{
 			/* in copy, can't reliably recover without blocking */
 			return false;
@@ -191,7 +244,7 @@ ReportConnectionError(MultiConnection *connection, int elevel)
 	int nodePort = connection->port;
 
 	ereport(elevel, (errmsg("connection error: %s:%d", nodeName, nodePort),
-					 errdetail("%s", PQerrorMessage(connection->pgConn))));
+					 errdetail("%s", pchomp(PQerrorMessage(connection->pgConn)))));
 }
 
 
@@ -229,16 +282,7 @@ ReportResultError(MultiConnection *connection, PGresult *result, int elevel)
 		 */
 		if (messagePrimary == NULL)
 		{
-			char *lastNewlineIndex = NULL;
-
-			messagePrimary = PQerrorMessage(connection->pgConn);
-			lastNewlineIndex = strrchr(messagePrimary, '\n');
-
-			/* trim trailing newline, if any */
-			if (lastNewlineIndex != NULL)
-			{
-				*lastNewlineIndex = '\0';
-			}
+			messagePrimary = pchomp(PQerrorMessage(connection->pgConn));
 		}
 
 		ereport(elevel, (errcode(sqlState), errmsg("%s", messagePrimary),
@@ -255,6 +299,28 @@ ReportResultError(MultiConnection *connection, PGresult *result, int elevel)
 	}
 	PG_END_TRY();
 }
+
+
+/* *INDENT-OFF* */
+#if (PG_VERSION_NUM < 100000)
+
+/*
+ * Make copy of string with all trailing newline characters removed.
+ */
+char *
+pchomp(const char *in)
+{
+	size_t		n;
+
+	n = strlen(in);
+	while (n > 0 && in[n - 1] == '\n')
+		n--;
+	return pnstrdup(in, n);
+}
+
+#endif
+
+/* *INDENT-ON* */
 
 
 /*
@@ -362,7 +428,7 @@ SendRemoteCommandParams(MultiConnection *connection, const char *command,
 	 * Don't try to send command if connection is entirely gone
 	 * (PQisnonblocking() would crash).
 	 */
-	if (!pgConn)
+	if (!pgConn || PQstatus(pgConn) != CONNECTION_OK)
 	{
 		return 0;
 	}
@@ -395,7 +461,7 @@ SendRemoteCommand(MultiConnection *connection, const char *command)
 	 * Don't try to send command if connection is entirely gone
 	 * (PQisnonblocking() would crash).
 	 */
-	if (!pgConn)
+	if (!pgConn || PQstatus(pgConn) != CONNECTION_OK)
 	{
 		return 0;
 	}
@@ -518,11 +584,20 @@ PutRemoteCopyData(MultiConnection *connection, const char *buffer, int nbytes)
 	 * until the socket is writable to prevent the internal libpq buffers
 	 * from growing excessively.
 	 *
-	 * In the future, we could reduce the frequency of these pushbacks to
-	 * achieve higher throughput.
+	 * We currently allow the internal buffer to grow to 8MB before
+	 * providing back pressure based on experimentation that showed
+	 * throughput get worse at 4MB and lower due to the number of CPU
+	 * cycles spent in networking system calls.
 	 */
 
-	return FinishConnectionIO(connection, allowInterrupts);
+	connection->copyBytesWrittenSinceLastFlush += nbytes;
+	if (connection->copyBytesWrittenSinceLastFlush > MAX_PUT_COPY_DATA_BUFFER_SIZE)
+	{
+		connection->copyBytesWrittenSinceLastFlush = 0;
+		return FinishConnectionIO(connection, allowInterrupts);
+	}
+
+	return true;
 }
 
 
@@ -553,6 +628,8 @@ PutRemoteCopyEnd(MultiConnection *connection, const char *errormsg)
 	}
 
 	/* see PutRemoteCopyData() */
+
+	connection->copyBytesWrittenSinceLastFlush = 0;
 
 	return FinishConnectionIO(connection, allowInterrupts);
 }
@@ -704,6 +781,7 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 
 		while (pendingConnectionsStartIndex < totalConnectionCount)
 		{
+			bool cancellationReceived = false;
 			int eventIndex = 0;
 			int eventCount = 0;
 			long timeout = -1;
@@ -760,16 +838,19 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 					if (InterruptHoldoffCount > 0 && (QueryCancelPending ||
 													  ProcDiePending))
 					{
-						/* return immediately in case of cancellation */
-						FreeWaitEventSet(waitEventSet);
-						return;
+						/*
+						 * Break out of event loop immediately in case of cancellation.
+						 * We cannot use "return" here inside a PG_TRY() block since
+						 * then the exception stack won't be reset.
+						 */
+						cancellationReceived = true;
+						break;
 					}
 
 					continue;
 				}
 
 				connection = (MultiConnection *) event->user_data;
-				connectionIndex = event->pos + pendingConnectionsStartIndex;
 
 				if (event->events & WL_SOCKET_WRITEABLE)
 				{
@@ -782,12 +863,18 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 					else if (sendStatus == 0)
 					{
 						/* done writing, only wait for read events */
-						ModifyWaitEvent(waitEventSet, connectionIndex, WL_SOCKET_READABLE,
+						ModifyWaitEvent(waitEventSet, event->pos, WL_SOCKET_READABLE,
 										NULL);
 					}
 				}
 
-				if (event->events & WL_SOCKET_READABLE)
+				/*
+				 * Check whether the connection is done is the socket is either readable
+				 * or writable. If it was only writable, we performed a PQflush which
+				 * might have read from the socket, meaning we may not see the socket
+				 * becoming readable again, so better to check it now.
+				 */
+				if (event->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE))
 				{
 					int receiveStatus = PQconsumeInput(connection->pgConn);
 					if (receiveStatus == 0)
@@ -804,9 +891,28 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 
 				if (connectionIsReady)
 				{
+					/*
+					 * All pending connections are kept at the end of the allConnections
+					 * array and the connectionReady array matches the allConnections
+					 * array. The wait event set corresponds to the pending connections
+					 * subarray so we can get the index in the allConnections array by
+					 * taking the event index + the offset of the subarray.
+					 */
+					connectionIndex = event->pos + pendingConnectionsStartIndex;
+
 					connectionReady[connectionIndex] = true;
+
+					/*
+					 * When a connection is ready, we should build a new wait event
+					 * set that excludes this connection.
+					 */
 					rebuildWaitEventSet = true;
 				}
+			}
+
+			if (cancellationReceived)
+			{
+				break;
 			}
 
 			/* move non-ready connections to the back of the array */
@@ -815,9 +921,24 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 			{
 				if (connectionReady[connectionIndex])
 				{
+					/*
+					 * Replace the ready connection with a connection from
+					 * the start of the pending connections subarray. This
+					 * may be the connection itself, in which case this is
+					 * a noop.
+					 */
 					allConnections[connectionIndex] =
 						allConnections[pendingConnectionsStartIndex];
+
+					/* offset of the pending connections subarray is now 1 higher */
 					pendingConnectionsStartIndex++;
+
+					/*
+					 * We've moved a pending connection into this position,
+					 * so we must reset the ready flag. Otherwise, we'd
+					 * falsely interpret it as ready in the next round.
+					 */
+					connectionReady[connectionIndex] = false;
 				}
 			}
 		}
@@ -845,8 +966,8 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 
 /*
  * BuildWaitEventSet creates a WaitEventSet for the given array of connections
- * which can be used to wait for any of the sockets to become read-ready, or
- * write-ready in case there is data to send.
+ * which can be used to wait for any of the sockets to become read-ready or
+ * write-ready.
  */
 static WaitEventSet *
 BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
@@ -864,14 +985,12 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 	{
 		MultiConnection *connection = allConnections[connectionIndex];
 		int socket = PQsocket(connection->pgConn);
-		int eventMask = WL_SOCKET_READABLE;
 
-		int sendStatus = PQflush(connection->pgConn);
-		if (sendStatus == 1)
-		{
-			/* we have data to send, wake up when the socket is ready to write */
-			eventMask = WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE;
-		}
+		/*
+		 * Always start by polling for both readability (server sent bytes)
+		 * and writeability (server is ready to receive bytes).
+		 */
+		int eventMask = WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE;
 
 		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, (void *) connection);
 	}

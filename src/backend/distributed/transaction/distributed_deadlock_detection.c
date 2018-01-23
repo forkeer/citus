@@ -134,7 +134,7 @@ CheckForDistributedDeadlocks(void)
 	{
 		bool deadlockFound = false;
 		List *deadlockPath = NIL;
-		TransactionNode *transactionNodeStack[edgeCount];
+		TransactionNode *transactionNodeStack[edgeCount + 1];
 
 		/* we're only interested in finding deadlocks originating from this node */
 		if (transactionNode->transactionId.initiatorNodeIdentifier != localGroupId)
@@ -307,7 +307,7 @@ PrependOutgoingNodesToQueue(TransactionNode *transactionNode, int currentStackDe
 		queuedNode->transactionNode = waitForTransaction;
 		queuedNode->currentStackDepth = currentStackDepth;
 
-		*toBeVisitedNodes = lappend(*toBeVisitedNodes, queuedNode);
+		*toBeVisitedNodes = lcons(queuedNode, *toBeVisitedNodes);
 	}
 }
 
@@ -599,7 +599,7 @@ LogCancellingBackend(TransactionNode *transactionNode)
 
 	appendStringInfo(logMessage, "Cancelling the following backend "
 								 "to resolve distributed deadlock "
-								 "(transaction numner = %ld, pid = %d)",
+								 "(transaction numner = " UINT64_FORMAT ", pid = %d)",
 					 transactionNode->transactionId.transactionNumber,
 					 transactionNode->initiatorProc->pid);
 
@@ -625,7 +625,8 @@ LogTransactionNode(TransactionNode *transactionNode)
 	logMessage = makeStringInfo();
 	transactionId = &(transactionNode->transactionId);
 
-	appendStringInfo(logMessage, "[DistributedTransactionId: (%d, %ld, %s)] = ",
+	appendStringInfo(logMessage,
+					 "[DistributedTransactionId: (%d, " UINT64_FORMAT ", %s)] = ",
 					 transactionId->initiatorNodeIdentifier,
 					 transactionId->transactionNumber,
 					 timestamptz_to_str(transactionId->timestamp));
@@ -685,7 +686,7 @@ WaitsForToString(List *waitsFor)
 			appendStringInfoString(transactionIdStr, ",");
 		}
 
-		appendStringInfo(transactionIdStr, "%ld",
+		appendStringInfo(transactionIdStr, UINT64_FORMAT,
 						 waitingNode->transactionId.transactionNumber);
 	}
 

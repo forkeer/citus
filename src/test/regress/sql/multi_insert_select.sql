@@ -2,8 +2,8 @@
 -- MULTI_INSERT_SELECT
 --
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 13300000;
-ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 13300000;
+SET citus.next_shard_id TO 13300000;
+SET citus.next_placement_id TO 13300000;
 
 -- create co-located tables
 SET citus.shard_count = 4;
@@ -297,6 +297,7 @@ ON (f.id = f2.id)) as outer_most
 GROUP BY
   outer_most.id;
 
+
 -- subqueries in WHERE clause
 INSERT INTO raw_events_second
             (user_id)
@@ -478,24 +479,45 @@ SET client_min_messages TO INFO;
 truncate agg_events;
 SET client_min_messages TO DEBUG2;
 
--- we do not support DISTINCT ON clauses
+-- DISTINCT ON clauses are supported
+-- distinct on(non-partition column)
+-- values are pulled to master
 INSERT INTO agg_events (value_1_agg, user_id)
   SELECT
     DISTINCT ON (value_1) value_1, user_id
   FROM
     raw_events_first;
 
--- We do not support some CTEs
+SELECT user_id, value_1_agg FROM agg_events ORDER BY 1,2;
+
+-- we don't want to see constraint vialotions, so truncate first
+SET client_min_messages TO INFO;
+truncate agg_events;
+SET client_min_messages TO DEBUG2;
+
+-- distinct on(partition column)
+-- queries are forwared to workers
+INSERT INTO agg_events (value_1_agg, user_id)
+  SELECT
+    DISTINCT ON (user_id) value_1, user_id
+  FROM
+    raw_events_first;
+
+SELECT user_id, value_1_agg FROM agg_events ORDER BY 1,2;
+
+-- We support CTEs
+BEGIN;
 WITH fist_table_agg AS
-  (SELECT sum(value_1) as v1_agg, user_id FROM raw_events_first GROUP BY user_id)
+  (SELECT max(value_1)+1 as v1_agg, user_id FROM raw_events_first GROUP BY user_id)
 INSERT INTO agg_events
             (value_1_agg, user_id)
             SELECT
               v1_agg, user_id
             FROM
               fist_table_agg;
+ROLLBACK;
 
--- We don't support CTEs that consist of const values as well
+-- We don't support CTEs that are referenced in the target list
 INSERT INTO agg_events
   WITH sub_cte AS (SELECT 1)
   SELECT
@@ -516,11 +538,14 @@ FROM
 
 ROLLBACK;
 
--- We do not support any set operations
+-- We do support set operations through recursive planning
+BEGIN;
+SET LOCAL client_min_messages TO DEBUG;
 INSERT INTO
   raw_events_first(user_id)
   (SELECT user_id FROM raw_events_first) INTERSECT
   (SELECT user_id FROM raw_events_first);
+ROLLBACK;
 
 -- If the query is router plannable then it is executed via the coordinator
 INSERT INTO
@@ -773,7 +798,7 @@ FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
         GROUP  BY raw_events_second.user_id) AS foo;
 
 
--- INSERT partition column does not match with SELECT partition column
+-- INSERT returns NULL partition key value via coordinator
 INSERT INTO agg_events
             (value_4_agg,
              value_1_agg,
@@ -852,8 +877,7 @@ SELECT
 FROM
   reference_table;
 
--- unsupported joins between subqueries
--- we do not return bare partition column on the inner query
+-- foo2 is recursively planned and INSERT...SELECT is done via coordinator
 INSERT INTO agg_events
             (user_id)
 SELECT f2.id FROM
@@ -881,6 +905,7 @@ ON (f.id = f2.id);
 -- the second part of the query is not routable since
 -- GROUP BY not on the partition column (i.e., value_1) and thus join
 -- on f.id = f2.id is not on the partition key (instead on the sum of partition key)
+-- but we still recursively plan foo2 and run the query
 INSERT INTO agg_events
             (user_id)
 SELECT f.id FROM
@@ -1293,8 +1318,8 @@ SET client_min_messages TO INFO;
 -- avoid constraint violations
 TRUNCATE raw_events_first;
 
--- we don't support LIMIT even if it exists in the subqueries 
--- in where clause
+-- we don't support LIMIT for subquery pushdown, but
+-- we recursively plan the query and run it via coordinator
 INSERT INTO agg_events(user_id)
 SELECT user_id 
 FROM   users_table 
@@ -1696,7 +1721,7 @@ RETURNING *;
 
 RESET client_min_messages;
 
--- INSERT ... SELECT and multi-shard SELECT in the same transaction is unsupported
+-- INSERT ... SELECT and multi-shard SELECT in the same transaction is supported
 TRUNCATE raw_events_first;
 
 BEGIN;
@@ -1866,6 +1891,25 @@ SELECT * FROM ref_table ORDER BY user_id, value_1;
 
 DROP TABLE ref_table;
 
+-- Select from reference table into reference table
+CREATE TABLE ref1 (d timestamptz);
+SELECT create_reference_table('ref1');
+
+CREATE TABLE ref2 (d date);
+SELECT create_reference_table('ref2');
+INSERT INTO ref2 VALUES ('2017-10-31');
+
+INSERT INTO ref1 SELECT * FROM ref2;
+SELECT count(*) from ref1;
+
+-- also test with now()
+INSERT INTO ref1 SELECT now() FROM ref2;
+SELECT count(*) from ref1;
+
+
+DROP TABLE ref1;
+DROP TABLE ref2;
+
 -- Select into an append-partitioned table is not supported
 CREATE TABLE insert_append_table (user_id int, value_4 bigint);
 SELECT create_distributed_table('insert_append_table', 'user_id', 'append');
@@ -1918,6 +1962,115 @@ SELECT * FROM drop_col_table WHERE col2 = '1';
 
 RESET client_min_messages;
 
+-- make sure casts are handled correctly
+CREATE TABLE coerce_events(user_id int, time timestamp, value_1 numeric);
+SELECT create_distributed_table('coerce_events', 'user_id');
+
+CREATE TABLE coerce_agg (user_id int, value_1_agg int);
+SELECT create_distributed_table('coerce_agg', 'user_id');
+
+INSERT INTO coerce_events(user_id, value_1) VALUES (1, 1), (2, 2), (10, 10);
+
+-- numeric -> int (straight function)
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+ORDER BY 2 DESC, 1 DESC
+LIMIT 5;
+
+-- int -> text
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE text;
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+
+SELECT * FROM coerce_agg;
+
+TRUNCATE coerce_agg;
+
+-- int -> char(1)
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE char(1);
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+
+SELECT * FROM coerce_agg;
+
+TRUNCATE coerce_agg;
+TRUNCATE coerce_events;
+
+-- char(5) -> char(1)
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE char(5);
+INSERT INTO coerce_events(user_id, value_1) VALUES (1, 'aaaaa'), (2, 'bbbbb');
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+
+-- char(1) -> char(5)
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE char(1) USING value_1::char(1);
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE char(5);
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+SELECT * FROM coerce_agg;
+
+TRUNCATE coerce_agg;
+TRUNCATE coerce_events;
+
+-- integer -> integer (check VALUE < 5)
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE integer USING NULL;
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE integer USING NULL;
+ALTER TABLE coerce_agg ADD CONSTRAINT small_number CHECK (value_1_agg < 5);
+
+INSERT INTO coerce_events (user_id, value_1) VALUES (1, 1), (10, 10);
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop;
+
+SELECT * FROM coerce_agg;
+
+-- integer[3] -> text[3]
+TRUNCATE coerce_events;
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE integer[3] USING NULL;
+INSERT INTO coerce_events(user_id, value_1) VALUES (1, '{1,1,1}'), (2, '{2,2,2}');
+ALTER TABLE coerce_agg DROP COLUMN value_1_agg;
+ALTER TABLE coerce_agg ADD COLUMN value_1_agg text[3];
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+
+SELECT * FROM coerce_agg;
+
+-- wrap in a transaction to improve performance
+BEGIN;
+DROP TABLE coerce_events;
+DROP TABLE coerce_agg;
 DROP TABLE drop_col_table;
 DROP TABLE raw_table;
 DROP TABLE summary_table;
@@ -1930,3 +2083,4 @@ DROP TABLE table_with_serial;
 DROP TABLE text_table;
 DROP TABLE char_table;
 DROP TABLE table_with_starts_with_defaults;
+COMMIT;

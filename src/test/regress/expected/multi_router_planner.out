@@ -1,4 +1,4 @@
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 840000;
+SET citus.next_shard_id TO 840000;
 -- ===================================================================
 -- test router planner functionality for single shard select queries
 -- ===================================================================
@@ -325,12 +325,23 @@ DEBUG:  Plan is router executable
 ----+-----------+----+-------
 (0 rows)
 
--- CTE joins are not supported if table shards are at different workers
+-- CTE joins are supported because they are both planned recursively
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 2)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+DEBUG:  generating subplan 67_1 for CTE id_author: SELECT id, author_id FROM public.articles_hash WHERE (author_id = 1)
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  generating subplan 67_2 for CTE id_title: SELECT id, title FROM public.articles_hash WHERE (author_id = 2)
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  Plan 67 query after replacing subqueries and CTEs: SELECT id_author.id, id_author.author_id, id_title.id, id_title.title FROM (SELECT intermediate_result.id, intermediate_result.author_id FROM read_intermediate_result('67_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint)) id_author, (SELECT intermediate_result.id, intermediate_result.title FROM read_intermediate_result('67_2'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, title character varying(20))) id_title WHERE (id_author.id = id_title.id)
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ id | author_id | id | title 
+----+-----------+----+-------
+(0 rows)
+
 -- recursive CTEs are supported when filtered on partition column
 CREATE TABLE company_employees (company_id int, employee_id int, manager_id int); 
 SELECT master_create_distributed_table('company_employees', 'company_id', 'hash');
@@ -402,8 +413,7 @@ WITH RECURSIVE hierarchy as (
 			ON (h.employee_id = ce.manager_id AND
 				h.company_id = ce.company_id))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+ERROR:  recursive CTEs are not supported in distributed queries
 -- logically wrong query, query involves different shards
 -- from the same table
 WITH RECURSIVE hierarchy as (
@@ -417,16 +427,14 @@ WITH RECURSIVE hierarchy as (
 				h.company_id = ce.company_id AND
 				ce.company_id = 2))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+ERROR:  recursive CTEs are not supported in distributed queries
 -- CTE with queries other than SELECT is not supported
 WITH new_article AS (
     INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
 )
 SELECT * FROM new_article;
 DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+ERROR:  data-modifying statements are not supported in the WITH clauses of distributed queries
 -- Modifying statement in nested CTE case is covered by PostgreSQL itself
 WITH new_article AS (
     WITH nested_cte AS (
@@ -518,10 +526,18 @@ DEBUG:  Plan is router executable
  43 |         3 | affixal      |      12723 |        3
 (10 rows)
 
--- they are not supported if multiple workers are involved
-SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 2;
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+-- they are supported via (sub)query pushdown if multiple workers are involved
+SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 2 ORDER BY 4 DESC, 1 DESC, 2 DESC LIMIT 5;
+DEBUG:  push down of limit count: 5
+ id | author_id |   title    | word_count | position 
+----+-----------+------------+------------+----------
+ 12 |         2 | archiblast |      18185 |        3
+ 42 |         2 | ausable    |      15885 |        3
+  2 |         2 | abducing   |      13642 |        3
+ 41 |         1 | aznavour   |      11814 |        3
+ 32 |         2 | amazon     |      11342 |        3
+(5 rows)
+
 -- unless the query can be transformed into a join
 SELECT * FROM articles_hash
 WHERE author_id IN (SELECT author_id FROM articles_hash WHERE author_id = 2)
@@ -569,8 +585,8 @@ DEBUG:  pruning merge fetch taskId 10
 DETAIL:  Creating dependency on merge taskId 14
 DEBUG:  pruning merge fetch taskId 11
 DETAIL:  Creating dependency on merge taskId 14
-ERROR:  cannot use real time executor with repartition jobs
-HINT:  Set citus.task_executor_type to "task-tracker".
+ERROR:  the query contains a join that requires repartitioning
+HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
 SELECT articles_hash.id,test.word_count
 FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test 
 WHERE test.id = articles_hash.id and articles_hash.author_id = 1
@@ -603,11 +619,12 @@ DEBUG:  pruning merge fetch taskId 10
 DETAIL:  Creating dependency on merge taskId 9
 DEBUG:  pruning merge fetch taskId 11
 DETAIL:  Creating dependency on merge taskId 14
-ERROR:  cannot use real time executor with repartition jobs
-HINT:  Set citus.task_executor_type to "task-tracker".
+ERROR:  the query contains a join that requires repartitioning
+HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
 -- subqueries are not supported in SELECT clause
 SELECT a.title AS name, (SELECT a2.id FROM articles_single_shard_hash a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles_hash a;
+DEBUG:  skipping recursive planning for the subquery since it contains references to outer queries
 ERROR:  could not run distributed query with subquery outside the FROM and WHERE clauses
 HINT:  Consider using an equality filter on the distributed table's partition column.
 -- simple lookup query
@@ -700,16 +717,24 @@ DEBUG:  Plan is router executable
 
 	
 -- following join is not router plannable since there are no
--- workers containing both shards, added a CTE to make this fail
--- at logical planner
+-- workers containing both shards, but will work through recursive
+-- planning
 WITH single_shard as (SELECT * FROM articles_single_shard_hash)
 SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, single_shard b
 	WHERE a.author_id = 2 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Found no worker with all shard placements
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+DEBUG:  generating subplan 97_1 for CTE single_shard: SELECT id, author_id, title, word_count FROM public.articles_single_shard_hash
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  Plan 97 query after replacing subqueries and CTEs: SELECT a.author_id AS first_author, b.word_count AS second_word_count FROM public.articles_hash a, (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('97_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) b WHERE ((a.author_id = 2) AND (a.author_id = b.author_id)) LIMIT 3
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ first_author | second_word_count 
+--------------+-------------------
+(0 rows)
+
 -- single shard select with limit is router plannable
 SELECT *
 	FROM articles_hash
@@ -881,27 +906,72 @@ DEBUG:  Plan is router executable
  az
 (4 rows)
 
--- union queries are not supported if not router plannable
--- there is an inconsistency on shard pruning between
--- ubuntu/mac disabling log messages for this queries only
+-- top-level union queries are supported through recursive planning
 SET client_min_messages to 'NOTICE';
-(SELECT * FROM articles_hash WHERE author_id = 1)
+(
+  (SELECT * FROM articles_hash WHERE author_id = 1)
+  UNION
+  (SELECT * FROM articles_hash WHERE author_id = 3)
+)
 UNION
-(SELECT * FROM articles_hash WHERE author_id = 2);
-ERROR:  could not run distributed query with UNION, INTERSECT, or EXCEPT
-HINT:  Consider using an equality filter on the distributed table's partition column.
+(SELECT * FROM articles_hash WHERE author_id = 2)
+ORDER BY 1,2,3;
+ id | author_id |    title     | word_count 
+----+-----------+--------------+------------
+  1 |         1 | arsenous     |       9572
+  2 |         2 | abducing     |      13642
+  3 |         3 | asternal     |      10480
+ 11 |         1 | alamo        |       1347
+ 12 |         2 | archiblast   |      18185
+ 13 |         3 | aseyev       |       2255
+ 21 |         1 | arcading     |       5890
+ 22 |         2 | antipope     |       2728
+ 23 |         3 | abhorring    |       6799
+ 31 |         1 | athwartships |       7271
+ 32 |         2 | amazon       |      11342
+ 33 |         3 | autochrome   |       8180
+ 41 |         1 | aznavour     |      11814
+ 42 |         2 | ausable      |      15885
+ 43 |         3 | affixal      |      12723
+(15 rows)
+
+-- unions in subqueries are supported with subquery pushdown
 SELECT * FROM (
 	(SELECT * FROM articles_hash WHERE author_id = 1)
 	UNION
-	(SELECT * FROM articles_hash WHERE author_id = 2)) uu;
-ERROR:  cannot push down this subquery
-DETAIL:  Currently all leaf queries need to have same filters on partition column
+	(SELECT * FROM articles_hash WHERE author_id = 2)) uu
+ORDER BY 1, 2
+LIMIT 5;
+ id | author_id |   title    | word_count 
+----+-----------+------------+------------
+  1 |         1 | arsenous   |       9572
+  2 |         2 | abducing   |      13642
+ 11 |         1 | alamo      |       1347
+ 12 |         2 | archiblast |      18185
+ 21 |         1 | arcading   |       5890
+(5 rows)
+
 -- error out for queries with repartition jobs
 SELECT *
 	FROM articles_hash a, articles_hash b
 	WHERE a.id = b.id  AND a.author_id = 1;
-ERROR:  cannot use real time executor with repartition jobs
-HINT:  Set citus.task_executor_type to "task-tracker".
+ERROR:  the query contains a join that requires repartitioning
+HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
+-- by setting enable_repartition_joins we can make this query run
+SET citus.enable_repartition_joins TO ON;
+SELECT *
+	FROM articles_hash a, articles_hash b
+	WHERE a.id = b.id  AND a.author_id = 1;
+ id | author_id |    title     | word_count | id | author_id |    title     | word_count 
+----+-----------+--------------+------------+----+-----------+--------------+------------
+ 41 |         1 | aznavour     |      11814 | 41 |         1 | aznavour     |      11814
+ 11 |         1 | alamo        |       1347 | 11 |         1 | alamo        |       1347
+ 31 |         1 | athwartships |       7271 | 31 |         1 | athwartships |       7271
+  1 |         1 | arsenous     |       9572 |  1 |         1 | arsenous     |       9572
+ 21 |         1 | arcading     |       5890 | 21 |         1 | arcading     |       5890
+(5 rows)
+
+SET citus.enable_repartition_joins TO OFF;
 -- queries which hit more than 1 shards are not router plannable or executable
 -- handled by real-time executor
 SELECT *
@@ -1228,13 +1298,13 @@ DEBUG:  Plan is router executable
 SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
 	WHERE author_id = 1 or author_id = 2;
-ERROR:  could not run distributed query with window functions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+ERROR:  could not run distributed query because the window function that is used cannot be pushed down
+HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions inside a subquery with a PARTITION BY clause containing the distribution column
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
 	FROM articles_hash
 	WHERE author_id = 5 or author_id = 2;
-ERROR:  could not run distributed query with window functions
-HINT:  Consider using an equality filter on the distributed table's partition column.
+ERROR:  could not run distributed query because the window function that is used cannot be pushed down
+HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions inside a subquery with a PARTITION BY clause containing the distribution column
 -- where false queries are router plannable
 SELECT * 
 	FROM articles_hash
@@ -1664,8 +1734,8 @@ DEBUG:  pruning merge fetch taskId 19
 DETAIL:  Creating dependency on merge taskId 9
 DEBUG:  pruning merge fetch taskId 22
 DETAIL:  Creating dependency on merge taskId 9
-ERROR:  cannot use real time executor with repartition jobs
-HINT:  Set citus.task_executor_type to "task-tracker".
+ERROR:  the query contains a join that requires repartitioning
+HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
 -- join between a range partitioned table and reference table is router plannable
 SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1;
@@ -2151,8 +2221,7 @@ GRANT INSERT ON ALL TABLES IN SCHEMA public TO router_user;
 BEGIN;
 INSERT INTO failure_test VALUES (1, 1);
 WARNING:  connection error: localhost:57638
-DETAIL:  no connection to the server
-
+DETAIL:  FATAL:  role "router_user" does not exist
 SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
 	WHERE shardid IN (
 		SELECT shardid FROM pg_dist_shard
@@ -2170,8 +2239,7 @@ SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
 ROLLBACK;
 INSERT INTO failure_test VALUES (2, 1);
 WARNING:  connection error: localhost:57638
-DETAIL:  no connection to the server
-
+DETAIL:  FATAL:  role "router_user" does not exist
 SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
 	WHERE shardid IN (
 		SELECT shardid FROM pg_dist_shard

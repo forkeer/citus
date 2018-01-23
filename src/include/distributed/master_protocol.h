@@ -72,9 +72,10 @@
 #define CREATE_SCHEMA_COMMAND "CREATE SCHEMA IF NOT EXISTS %s AUTHORIZATION %s"
 #define CREATE_EMPTY_SHARD_QUERY "SELECT master_create_empty_shard('%s')"
 #define FINALIZED_SHARD_PLACEMENTS_QUERY \
-	"SELECT placementid, nodename, nodeport FROM pg_dist_shard_placement WHERE shardstate = 1 AND shardid = %ld"
+	"SELECT placementid, nodename, nodeport FROM pg_dist_shard_placement WHERE shardstate = 1 AND shardid = " \
+	INT64_FORMAT
 #define UPDATE_SHARD_STATISTICS_QUERY \
-	"SELECT master_update_shard_statistics(%ld)"
+	"SELECT master_update_shard_statistics(" INT64_FORMAT ")"
 #define PARTITION_METHOD_QUERY "SELECT part_method FROM master_get_table_metadata('%s');"
 
 /* Enumeration that defines the shard placement policy to use while staging */
@@ -92,6 +93,8 @@ extern int ShardCount;
 extern int ShardReplicationFactor;
 extern int ShardMaxSize;
 extern int ShardPlacementPolicy;
+extern int NextShardId;
+extern int NextPlacementId;
 
 
 extern bool IsCoordinator(void);
@@ -139,6 +142,9 @@ extern Datum master_get_table_ddl_events(PG_FUNCTION_ARGS);
 extern Datum master_get_new_shardid(PG_FUNCTION_ARGS);
 extern Datum master_get_new_placementid(PG_FUNCTION_ARGS);
 extern Datum master_get_active_worker_nodes(PG_FUNCTION_ARGS);
+extern Datum master_get_round_robin_candidate_nodes(PG_FUNCTION_ARGS);
+extern Datum master_stage_shard_row(PG_FUNCTION_ARGS);
+extern Datum master_stage_shard_placement_row(PG_FUNCTION_ARGS);
 
 /* Function declarations to help with data staging and deletion */
 extern Datum master_create_empty_shard(PG_FUNCTION_ARGS);

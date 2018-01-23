@@ -22,7 +22,8 @@ CREATE TABLE lineitem_alter (
 	l_shipinstruct char(25) not null,
 	l_shipmode char(10) not null,
 	l_comment varchar(44) not null
-	);
+	)
+  WITH ( fillfactor = 80 );
 SELECT master_create_distributed_table('lineitem_alter', 'l_orderkey', 'append');
  master_create_distributed_table 
 ---------------------------------
@@ -30,10 +31,26 @@ SELECT master_create_distributed_table('lineitem_alter', 'l_orderkey', 'append')
 (1 row)
 
 \copy lineitem_alter FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+-- verify that the storage options made it to the table definitions
+SELECT relname, reloptions FROM pg_class WHERE relname = 'lineitem_alter';
+    relname     |   reloptions    
+----------------+-----------------
+ lineitem_alter | {fillfactor=80}
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'lineitem_alter%' ORDER BY relname;
+        relname        |   reloptions    
+-----------------------+-----------------
+ lineitem_alter_220000 | {fillfactor=80}
+ lineitem_alter_220001 | {fillfactor=80}
+ lineitem_alter_220002 | {fillfactor=80}
+ lineitem_alter_220003 | {fillfactor=80}
+(4 rows)
+
+\c - - - :master_port
 -- Verify that we can add columns
 ALTER TABLE lineitem_alter ADD COLUMN float_column FLOAT;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 ALTER TABLE lineitem_alter ADD COLUMN date_column DATE;
 ALTER TABLE lineitem_alter ADD COLUMN int_column1 INTEGER DEFAULT 1;
 ALTER TABLE lineitem_alter ADD COLUMN int_column2 INTEGER DEFAULT 2;
@@ -117,8 +134,6 @@ SELECT int_column1, count(*) FROM lineitem_alter GROUP BY int_column1;
 
 -- Verify that SET|DROP DEFAULT works
 ALTER TABLE lineitem_alter ALTER COLUMN float_column SET DEFAULT 1;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 ALTER TABLE lineitem_alter ALTER COLUMN int_column1 DROP DEFAULT;
 -- \copy to verify that default values take effect
 \copy lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
@@ -332,7 +347,7 @@ SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.lineite
 ALTER TABLE lineitem_alter ADD COLUMN int_column3 INTEGER,
 	ALTER COLUMN int_column1 SET STATISTICS 10;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, ATTACH|DETACH PARTITION and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, SET (), RESET (), ATTACH|DETACH PARTITION and TYPE subcommands are supported.
 ALTER TABLE lineitem_alter DROP COLUMN int_column1, DROP COLUMN int_column2;
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.lineitem_alter'::regclass;
      Column      |         Type          | Modifiers 
@@ -364,12 +379,12 @@ ERROR:  cannot execute ALTER TABLE command involving partition column
 -- Verify that we error out on unsupported statement types
 ALTER TABLE lineitem_alter ALTER COLUMN l_orderkey SET STATISTICS 100;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, ATTACH|DETACH PARTITION and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, SET (), RESET (), ATTACH|DETACH PARTITION and TYPE subcommands are supported.
 ALTER TABLE lineitem_alter DROP CONSTRAINT IF EXISTS non_existent_contraint;
 NOTICE:  constraint "non_existent_contraint" of relation "lineitem_alter" does not exist, skipping
 ALTER TABLE lineitem_alter SET WITHOUT OIDS;
 ERROR:  alter table command is currently unsupported
-DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, ATTACH|DETACH PARTITION and TYPE subcommands are supported.
+DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT, ADD|DROP CONSTRAINT, SET (), RESET (), ATTACH|DETACH PARTITION and TYPE subcommands are supported.
 -- Verify that we error out in case of postgres errors on supported statement
 -- types
 ALTER TABLE lineitem_alter ADD COLUMN new_column non_existent_type;
@@ -381,9 +396,7 @@ ERROR:  column "null_column" contains null values
 CONTEXT:  while executing command on localhost:57638
 ALTER TABLE lineitem_alter ALTER COLUMN l_partkey SET DEFAULT 'a';
 ERROR:  invalid input syntax for integer: "a"
--- Verify that we error out on non-column RENAME statements
-ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
-ERROR:  renaming distributed tables is currently unsupported
+-- Verify that we error out on RENAME CONSTRAINT statement
 ALTER TABLE lineitem_alter RENAME CONSTRAINT constraint_a TO constraint_b;
 ERROR:  renaming constraints belonging to distributed tables is currently unsupported
 -- Verify that IF EXISTS works as expected with RENAME statements
@@ -526,8 +539,6 @@ ALTER TABLE lineitem_alter_220000 ADD COLUMN first integer;
 -- and try to add it in a multi-statement block, which fails
 BEGIN;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 ALTER TABLE lineitem_alter ADD COLUMN first integer;
 ERROR:  column "first" of relation "lineitem_alter_220000" already exists
 CONTEXT:  while executing command on localhost:57638
@@ -539,7 +550,7 @@ SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
 (0 rows)
 
 -- Create single-shard table (to avoid deadlocks in the upcoming test hackery)
-CREATE TABLE single_shard_items (id integer, name text);
+CREATE TABLE single_shard_items (id integer NOT NULL, name text);
 SELECT master_create_distributed_table('single_shard_items', 'id', 'hash');
  master_create_distributed_table 
 ---------------------------------
@@ -552,6 +563,80 @@ SELECT master_create_worker_shards('single_shard_items', 1, 2);
  
 (1 row)
 
+-- Verify that ALTER TABLE .. REPLICATION IDENTITY [USING INDEX]* .. works
+CREATE UNIQUE INDEX replica_idx on single_shard_items(id);
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+ relreplident 
+--------------
+ d
+(1 row)
+
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+ run_command_on_workers 
+------------------------
+ (localhost,57637,t,d)
+ (localhost,57638,t,d)
+(2 rows)
+
+ALTER TABLE single_shard_items REPLICA IDENTITY nothing;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+ relreplident 
+--------------
+ n
+(1 row)
+
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+ run_command_on_workers 
+------------------------
+ (localhost,57637,t,n)
+ (localhost,57638,t,n)
+(2 rows)
+
+ALTER TABLE single_shard_items REPLICA IDENTITY full;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+ relreplident 
+--------------
+ f
+(1 row)
+
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+ run_command_on_workers 
+------------------------
+ (localhost,57637,t,f)
+ (localhost,57638,t,f)
+(2 rows)
+
+ALTER TABLE single_shard_items REPLICA IDENTITY USING INDEX replica_idx;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+ relreplident 
+--------------
+ i
+(1 row)
+
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+ run_command_on_workers 
+------------------------
+ (localhost,57637,t,i)
+ (localhost,57638,t,i)
+(2 rows)
+
+ALTER TABLE single_shard_items REPLICA IDENTITY default, REPLICA IDENTITY USING INDEX replica_idx, REPLICA IDENTITY nothing;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+ relreplident 
+--------------
+ n
+(1 row)
+
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+ run_command_on_workers 
+------------------------
+ (localhost,57637,t,n)
+ (localhost,57638,t,n)
+(2 rows)
+
+ALTER TABLE single_shard_items ADD COLUMN test_col int, REPLICA IDENTITY full;
+DROP INDEX replica_idx;
+ALTER TABLE single_shard_items REPLICA IDENTITY default;
 -- Drop the column from the worker...
 \c - - - :worker_2_port
 ALTER TABLE lineitem_alter_220000 DROP COLUMN first;
@@ -583,11 +668,9 @@ SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'single_shard_item
 (0 rows)
 
 -- Now try with 2pc off
-RESET citus.multi_shard_commit_protocol;
+SET citus.multi_shard_commit_protocol TO '1pc';
 BEGIN;
 CREATE INDEX single_index_2 ON single_shard_items(id);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 CREATE INDEX single_index_3 ON single_shard_items(name);
 COMMIT;
 WARNING:  duplicate key value violates unique constraint "ddl_commands_command_key"
@@ -607,15 +690,17 @@ DROP EVENT TRIGGER log_ddl_tag;
 DROP FUNCTION log_ddl_tag();
 DROP TABLE ddl_commands;
 \c - - - :master_port
--- Distributed SELECTs cannot appear after ALTER
+-- Distributed SELECTs may appear after ALTER
 BEGIN;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 SELECT count(*) FROM lineitem_alter;
-ERROR:  cannot open new connections after the first modification command within a transaction
-COMMIT;
--- but are allowed before
+ count 
+-------
+ 18000
+(1 row)
+
+ROLLBACK;
+-- and before
 BEGIN;
 SELECT count(*) FROM lineitem_alter;
  count 
@@ -716,9 +801,161 @@ ORDER BY attnum;
 (30 rows)
 
 \c - - - :master_port
+-- verify that we can rename distributed tables
+SHOW citus.enable_ddl_propagation;
+ citus.enable_ddl_propagation 
+------------------------------
+ on
+(1 row)
+
+ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
+-- verify rename is performed
+SELECT relname FROM pg_class WHERE relname = 'lineitem_renamed';
+     relname      
+------------------
+ lineitem_renamed
+(1 row)
+
+-- show rename worked on one worker, too
+\c - - - :worker_1_port
+SELECT relname FROM pg_class WHERE relname LIKE 'lineitem_renamed%'  ORDER BY relname;
+         relname         
+-------------------------
+ lineitem_renamed_220000
+ lineitem_renamed_220001
+ lineitem_renamed_220002
+ lineitem_renamed_220003
+ lineitem_renamed_220004
+ lineitem_renamed_220005
+ lineitem_renamed_220006
+ lineitem_renamed_220007
+ lineitem_renamed_220008
+ lineitem_renamed_220010
+ lineitem_renamed_220011
+ lineitem_renamed_220012
+ lineitem_renamed_220013
+ lineitem_renamed_220014
+(14 rows)
+
+\c - - - :master_port
+-- revert it to original name
+ALTER TABLE lineitem_renamed RENAME TO lineitem_alter;
+-- show rename worked on one worker, too
+\c - - - :worker_1_port
+SELECT relname FROM pg_class WHERE relname LIKE 'lineitem_alter%' AND relname <> 'lineitem_alter_220009' /* failed copy trails */ ORDER BY relname;
+        relname        
+-----------------------
+ lineitem_alter_220000
+ lineitem_alter_220001
+ lineitem_alter_220002
+ lineitem_alter_220003
+ lineitem_alter_220004
+ lineitem_alter_220005
+ lineitem_alter_220006
+ lineitem_alter_220007
+ lineitem_alter_220008
+ lineitem_alter_220010
+ lineitem_alter_220011
+ lineitem_alter_220012
+ lineitem_alter_220013
+ lineitem_alter_220014
+(14 rows)
+
+\c - - - :master_port
+-- verify that we can set and reset storage parameters
+ALTER TABLE lineitem_alter SET(fillfactor=40);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'lineitem_alter';
+    relname     |   reloptions    
+----------------+-----------------
+ lineitem_alter | {fillfactor=40}
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'lineitem_alter%' AND relname <> 'lineitem_alter_220009' /* failed copy trails */ ORDER BY relname;
+        relname        |   reloptions    
+-----------------------+-----------------
+ lineitem_alter_220000 | {fillfactor=40}
+ lineitem_alter_220001 | {fillfactor=40}
+ lineitem_alter_220002 | {fillfactor=40}
+ lineitem_alter_220003 | {fillfactor=40}
+ lineitem_alter_220004 | {fillfactor=40}
+ lineitem_alter_220005 | {fillfactor=40}
+ lineitem_alter_220006 | {fillfactor=40}
+ lineitem_alter_220007 | {fillfactor=40}
+ lineitem_alter_220008 | {fillfactor=40}
+ lineitem_alter_220010 | {fillfactor=40}
+ lineitem_alter_220011 | {fillfactor=40}
+ lineitem_alter_220012 | {fillfactor=40}
+ lineitem_alter_220013 | {fillfactor=40}
+ lineitem_alter_220014 | {fillfactor=40}
+(14 rows)
+
+\c - - - :master_port
+ALTER TABLE lineitem_alter RESET(fillfactor);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'lineitem_alter';
+    relname     | reloptions 
+----------------+------------
+ lineitem_alter | 
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'lineitem_alter%'  AND relname <> 'lineitem_alter_220009' /* failed copy trails */ ORDER BY relname;
+        relname        | reloptions 
+-----------------------+------------
+ lineitem_alter_220000 | 
+ lineitem_alter_220001 | 
+ lineitem_alter_220002 | 
+ lineitem_alter_220003 | 
+ lineitem_alter_220004 | 
+ lineitem_alter_220005 | 
+ lineitem_alter_220006 | 
+ lineitem_alter_220007 | 
+ lineitem_alter_220008 | 
+ lineitem_alter_220010 | 
+ lineitem_alter_220011 | 
+ lineitem_alter_220012 | 
+ lineitem_alter_220013 | 
+ lineitem_alter_220014 | 
+(14 rows)
+
+\c - - - :master_port
+-- verify that we can rename indexes on distributed tables
+CREATE INDEX temp_index_1 ON lineitem_alter(l_linenumber);
+ALTER INDEX temp_index_1 RENAME TO idx_lineitem_linenumber;
+-- verify rename is performed
+SELECT relname FROM pg_class WHERE relname = 'idx_lineitem_linenumber';
+         relname         
+-------------------------
+ idx_lineitem_linenumber
+(1 row)
+
+-- show rename worked on one worker, too
+\c - - - :worker_1_port
+SELECT relname FROM pg_class WHERE relname LIKE 'idx_lineitem_linenumber%' ORDER BY relname;
+            relname             
+--------------------------------
+ idx_lineitem_linenumber_220000
+ idx_lineitem_linenumber_220001
+ idx_lineitem_linenumber_220002
+ idx_lineitem_linenumber_220003
+ idx_lineitem_linenumber_220004
+ idx_lineitem_linenumber_220005
+ idx_lineitem_linenumber_220006
+ idx_lineitem_linenumber_220007
+ idx_lineitem_linenumber_220008
+ idx_lineitem_linenumber_220010
+ idx_lineitem_linenumber_220011
+ idx_lineitem_linenumber_220012
+ idx_lineitem_linenumber_220013
+ idx_lineitem_linenumber_220014
+(14 rows)
+
+\c - - - :master_port
+-- now get rid of the index
+DROP INDEX idx_lineitem_linenumber;
 -- verify that we don't intercept DDL commands if propagation is turned off
 SET citus.enable_ddl_propagation to false;
--- table rename statement can be performed now
+-- table rename statement can be performed on the coordinator only now
 ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
 -- verify rename is performed
 SELECT relname FROM pg_class WHERE relname = 'lineitem_alter' or relname = 'lineitem_renamed';
@@ -789,8 +1026,6 @@ SELECT create_distributed_table('sequence_deadlock_test', 'a');
 
 BEGIN;
 ALTER TABLE sequence_deadlock_test ADD COLUMN c int;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 DROP SEQUENCE sequence_deadlock_test_b_seq CASCADE;
 NOTICE:  drop cascades to default for table sequence_deadlock_test column b
 END;
@@ -817,7 +1052,7 @@ CREATE FUNCTION update_value() RETURNS trigger AS $up$
     END;
 $up$ LANGUAGE plpgsql;
 CREATE TRIGGER update_value
-BEFORE INSERT ON trigger_table_220056
+BEFORE INSERT ON trigger_table_220028
 FOR EACH ROW EXECUTE PROCEDURE update_value();
 \c - - - :master_port
 INSERT INTO trigger_table VALUES (1, 'trigger disabled');
@@ -828,8 +1063,6 @@ SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
 (1 row)
 
 ALTER TABLE trigger_table DISABLE TRIGGER ALL;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 INSERT INTO trigger_table VALUES (1, 'trigger disabled');
 SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
       value       | count 
@@ -887,8 +1120,6 @@ SELECT create_distributed_table('test_table_1','id');
 (1 row)
 
 ALTER TABLE test_table_1 ADD CONSTRAINT u_key UNIQUE(id);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 DROP TABLE test_table_1;
 END;
 -- There should be no test_table_1 shard on workers
@@ -899,3 +1130,92 @@ SELECT relname FROM pg_class WHERE relname LIKE 'test_table_1%';
 (0 rows)
 
 \c - - - :master_port
+-- Test WITH options on a normal simple hash-distributed table
+CREATE TABLE hash_dist(id bigint primary key, f1 text) WITH (fillfactor=40);
+SELECT create_distributed_table('hash_dist','id');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+-- verify that the storage options made it to the table definitions
+SELECT relname, reloptions FROM pg_class WHERE relname = 'hash_dist';
+  relname  |   reloptions    
+-----------+-----------------
+ hash_dist | {fillfactor=40}
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relkind = 'r' AND relname LIKE 'hash_dist%' ORDER BY relname;
+     relname      |   reloptions    
+------------------+-----------------
+ hash_dist_220033 | {fillfactor=40}
+ hash_dist_220034 | {fillfactor=40}
+ hash_dist_220035 | {fillfactor=40}
+ hash_dist_220036 | {fillfactor=40}
+(4 rows)
+
+\c - - - :master_port
+-- verify that we can set and reset index storage parameters
+ALTER INDEX hash_dist_pkey SET(fillfactor=40);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'hash_dist_pkey';
+    relname     |   reloptions    
+----------------+-----------------
+ hash_dist_pkey | {fillfactor=40}
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'hash_dist_pkey%' ORDER BY relname;
+        relname        |   reloptions    
+-----------------------+-----------------
+ hash_dist_pkey_220033 | {fillfactor=40}
+ hash_dist_pkey_220034 | {fillfactor=40}
+ hash_dist_pkey_220035 | {fillfactor=40}
+ hash_dist_pkey_220036 | {fillfactor=40}
+(4 rows)
+
+\c - - - :master_port
+ALTER INDEX hash_dist_pkey RESET(fillfactor);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'hash_dist_pkey';
+    relname     | reloptions 
+----------------+------------
+ hash_dist_pkey | 
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'hash_dist_pkey%' ORDER BY relname;
+        relname        | reloptions 
+-----------------------+------------
+ hash_dist_pkey_220033 | 
+ hash_dist_pkey_220034 | 
+ hash_dist_pkey_220035 | 
+ hash_dist_pkey_220036 | 
+(4 rows)
+
+\c - - - :master_port
+-- verify error message on ALTER INDEX, SET TABLESPACE is unsupported
+ALTER INDEX hash_dist_pkey SET TABLESPACE foo;
+ERROR:  alter index ... set tablespace ... is currently unsupported
+DETAIL:  Only RENAME TO, SET (), and RESET () are supported.
+-- verify that we can add indexes with new storage options
+CREATE UNIQUE INDEX another_index ON hash_dist(id) WITH (fillfactor=50);
+-- show the index and its storage options on coordinator, then workers
+SELECT relname, reloptions FROM pg_class WHERE relname = 'another_index';
+    relname    |   reloptions    
+---------------+-----------------
+ another_index | {fillfactor=50}
+(1 row)
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'another_index%' ORDER BY relname;
+       relname        |   reloptions    
+----------------------+-----------------
+ another_index_220033 | {fillfactor=50}
+ another_index_220034 | {fillfactor=50}
+ another_index_220035 | {fillfactor=50}
+ another_index_220036 | {fillfactor=50}
+(4 rows)
+
+\c - - - :master_port
+-- get rid of the index
+DROP INDEX another_index;

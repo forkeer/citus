@@ -35,9 +35,11 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/pg_dist_node.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
+#include "distributed/version_compat.h"
 #include "foreign/foreign.h"
 #include "nodes/pg_list.h"
 #include "utils/builtins.h"
@@ -250,6 +252,16 @@ MetadataCreateCommands(void)
 		if (ShouldSyncTableMetadata(cacheEntry->relationId))
 		{
 			propagatedTableList = lappend(propagatedTableList, cacheEntry);
+
+			if (PartitionedTable(cacheEntry->relationId))
+			{
+				char *relationName = get_rel_name(cacheEntry->relationId);
+
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot perform metadata sync for "
+									   "partitioned table \"%s\"",
+									   relationName)));
+			}
 		}
 	}
 
@@ -602,7 +614,8 @@ ShardListInsertCommand(List *shardIntervalList)
 			}
 
 			appendStringInfo(insertPlacementCommand,
-							 "(%lu, 1, %lu, %d, %lu)",
+							 "(" UINT64_FORMAT ", 1, " UINT64_FORMAT ", %d, "
+							 UINT64_FORMAT ")",
 							 shardId,
 							 placement->shardLength,
 							 placement->groupId,
@@ -652,7 +665,7 @@ ShardListInsertCommand(List *shardIntervalList)
 		}
 
 		appendStringInfo(insertShardCommand,
-						 "(%s::regclass, %lu, '%c', %s, %s)",
+						 "(%s::regclass, " UINT64_FORMAT ", '%c', %s, %s)",
 						 quote_literal_cstr(qualifiedRelationName),
 						 shardId,
 						 shardInterval->storageType,
@@ -688,7 +701,7 @@ ShardDeleteCommandList(ShardInterval *shardInterval)
 	/* create command to delete shard placements */
 	deletePlacementCommand = makeStringInfo();
 	appendStringInfo(deletePlacementCommand,
-					 "DELETE FROM pg_dist_placement WHERE shardid = %lu",
+					 "DELETE FROM pg_dist_placement WHERE shardid = " UINT64_FORMAT,
 					 shardId);
 
 	commandList = lappend(commandList, deletePlacementCommand->data);
@@ -696,7 +709,7 @@ ShardDeleteCommandList(ShardInterval *shardInterval)
 	/* create command to delete shard */
 	deleteShardCommand = makeStringInfo();
 	appendStringInfo(deleteShardCommand,
-					 "DELETE FROM pg_dist_shard WHERE shardid = %lu", shardId);
+					 "DELETE FROM pg_dist_shard WHERE shardid = " UINT64_FORMAT, shardId);
 
 	commandList = lappend(commandList, deleteShardCommand->data);
 
@@ -984,7 +997,7 @@ TypeOfColumn(Oid tableId, int16 columnId)
 {
 	Relation tableRelation = relation_open(tableId, NoLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(tableRelation);
-	Form_pg_attribute attrForm = tupleDescriptor->attrs[columnId - 1];
+	Form_pg_attribute attrForm = TupleDescAttr(tupleDescriptor, columnId - 1);
 	relation_close(tableRelation, NoLock);
 	return attrForm->atttypid;
 }

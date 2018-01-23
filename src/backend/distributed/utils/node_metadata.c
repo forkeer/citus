@@ -58,7 +58,6 @@ static void RemoveNodeFromCluster(char *nodeName, int32 nodePort);
 static Datum AddNodeMetadata(char *nodeName, int32 nodePort, int32 groupId,
 							 char *nodeRack, bool hasMetadata, bool isActive,
 							 Oid nodeRole, char *nodeCluster, bool *nodeAlreadyExists);
-static uint32 CountPrimariesWithMetadata();
 static void SetNodeState(char *nodeName, int32 nodePort, bool isActive);
 static HeapTuple GetNodeTuple(char *nodeName, int32 nodePort);
 static Datum GenerateNodeTuple(WorkerNode *workerNode);
@@ -71,6 +70,7 @@ static void InsertNodeRow(int nodeid, char *nodename, int32 nodeport, uint32 gro
 static void DeleteNodeRow(char *nodename, int32 nodeport);
 static List * ParseWorkerNodeFileAndRename(void);
 static WorkerNode * TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple);
+static void UpdateNodeLocation(int32 nodeId, char *newNodeName, int32 newNodePort);
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(master_add_node);
@@ -79,6 +79,7 @@ PG_FUNCTION_INFO_V1(master_add_secondary_node);
 PG_FUNCTION_INFO_V1(master_remove_node);
 PG_FUNCTION_INFO_V1(master_disable_node);
 PG_FUNCTION_INFO_V1(master_activate_node);
+PG_FUNCTION_INFO_V1(master_update_node);
 PG_FUNCTION_INFO_V1(master_initialize_node_metadata);
 PG_FUNCTION_INFO_V1(get_shard_id_for_distribution_column);
 
@@ -454,6 +455,103 @@ ActivateNode(char *nodeName, int nodePort)
 
 
 /*
+ * master_update_node moves the requested node to a different nodename and nodeport. It
+ * locks to ensure no queries are running concurrently; and is intended for customers who
+ * are running their own failover solution.
+ */
+Datum
+master_update_node(PG_FUNCTION_ARGS)
+{
+	int32 nodeId = PG_GETARG_INT32(0);
+
+	text *newNodeName = PG_GETARG_TEXT_P(1);
+	int32 newNodePort = PG_GETARG_INT32(2);
+
+	char *newNodeNameString = text_to_cstring(newNodeName);
+
+	CheckCitusVersion(ERROR);
+
+	/*
+	 * This lock has two purposes:
+	 * - Ensure buggy code in Citus doesn't cause failures when the nodename/nodeport of
+	 *   a node changes mid-query
+	 * - Provide fencing during failover, after this function returns all connections
+	 *   will use the new node location.
+	 *
+	 * Drawback:
+	 * - This function blocks until all previous queries have finished. This means that
+	 *   long-running queries will prevent failover.
+	 */
+	LockRelationOid(DistNodeRelationId(), AccessExclusiveLock);
+
+	if (FindWorkerNodeAnyCluster(newNodeNameString, newNodePort) != NULL)
+	{
+		ereport(ERROR, (errmsg("node at \"%s:%u\" already exists",
+							   newNodeNameString,
+							   newNodePort)));
+	}
+
+	UpdateNodeLocation(nodeId, newNodeNameString, newNodePort);
+
+	PG_RETURN_VOID();
+}
+
+
+static void
+UpdateNodeLocation(int32 nodeId, char *newNodeName, int32 newNodePort)
+{
+	const bool indexOK = true;
+	const int scanKeyCount = 1;
+
+	Relation pgDistNode = NULL;
+	TupleDesc tupleDescriptor = NULL;
+	ScanKeyData scanKey[scanKeyCount];
+	SysScanDesc scanDescriptor = NULL;
+	HeapTuple heapTuple = NULL;
+	Datum values[Natts_pg_dist_node];
+	bool isnull[Natts_pg_dist_node];
+	bool replace[Natts_pg_dist_node];
+
+	pgDistNode = heap_open(DistNodeRelationId(), RowExclusiveLock);
+	tupleDescriptor = RelationGetDescr(pgDistNode);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_node_nodeid,
+				BTEqualStrategyNumber, F_INT8EQ, Int32GetDatum(nodeId));
+
+	scanDescriptor = systable_beginscan(pgDistNode, DistNodeNodeIdIndexId(), indexOK,
+										NULL, scanKeyCount, scanKey);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	if (!HeapTupleIsValid(heapTuple))
+	{
+		ereport(ERROR, (errmsg("could not find valid entry for node \"%s:%d\"",
+							   newNodeName, newNodePort)));
+	}
+
+	memset(replace, 0, sizeof(replace));
+
+	values[Anum_pg_dist_node_nodeport - 1] = Int32GetDatum(newNodePort);
+	isnull[Anum_pg_dist_node_nodeport - 1] = false;
+	replace[Anum_pg_dist_node_nodeport - 1] = true;
+
+	values[Anum_pg_dist_node_nodename - 1] = CStringGetTextDatum(newNodeName);
+	isnull[Anum_pg_dist_node_nodename - 1] = false;
+	replace[Anum_pg_dist_node_nodename - 1] = true;
+
+	heapTuple = heap_modify_tuple(heapTuple, tupleDescriptor, values, isnull, replace);
+
+	CatalogTupleUpdate(pgDistNode, &heapTuple->t_self, heapTuple);
+
+	CitusInvalidateRelcacheByRelid(DistNodeRelationId());
+
+	CommandCounterIncrement();
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgDistNode, NoLock);
+}
+
+
+/*
  * master_initialize_node_metadata is run once, when upgrading citus. It ingests the
  * existing pg_worker_list.conf into pg_dist_node, then adds a header to the file stating
  * that it's no longer used.
@@ -762,8 +860,8 @@ RemoveNodeFromCluster(char *nodeName, int32 nodePort)
 
 
 /* CountPrimariesWithMetadata returns the number of primary nodes which have metadata. */
-static uint32
-CountPrimariesWithMetadata()
+uint32
+CountPrimariesWithMetadata(void)
 {
 	uint32 primariesWithMetadata = 0;
 	WorkerNode *workerNode = NULL;
@@ -834,7 +932,7 @@ AddNodeMetadata(char *nodeName, int32 nodePort, int32 groupId, char *nodeRack,
 	}
 	else
 	{
-		uint maxGroupId = GetMaxGroupId();
+		uint32 maxGroupId = GetMaxGroupId();
 
 		if (groupId > maxGroupId)
 		{

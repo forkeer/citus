@@ -1,4 +1,4 @@
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 750000;
+SET citus.next_shard_id TO 750000;
 -- ===================================================================
 -- test end-to-end modification functionality
 -- ===================================================================
@@ -188,7 +188,8 @@ DETAIL:  Key (id)=(32743) already exists.
 CONTEXT:  while executing command on localhost:57638
 -- INSERT, with RETURNING specified, failing with a non-constraint error
 INSERT INTO limit_orders VALUES (34153, 'LEE', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING id / 0;
-ERROR:  could not modify any active placements
+ERROR:  division by zero
+CONTEXT:  while executing command on localhost:57637
 SET client_min_messages TO DEFAULT;
 -- commands with non-constant partition values are supported
 INSERT INTO limit_orders VALUES (random() * 100, 'ORCL', 152, '2011-08-25 11:50:45',
@@ -289,24 +290,16 @@ SELECT COUNT(*) FROM limit_orders WHERE id = 246;
      0
 (1 row)
 
--- commands with no constraints on the partition key are not supported
-DELETE FROM limit_orders WHERE bidder_id = 162;
-ERROR:  cannot run DELETE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- commands with a USING clause are unsupported
 CREATE TABLE bidders ( name text, id bigint );
 DELETE FROM limit_orders USING bidders WHERE limit_orders.id = 246 AND
 											 limit_orders.bidder_id = bidders.id AND
 											 bidders.name = 'Bernie Madoff';
-ERROR:  cannot plan queries which include both local and distributed relations
+ERROR:  relation bidders is not distributed
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders DEFAULT VALUES RETURNING *)
 DELETE FROM limit_orders;
 ERROR:  common table expressions are not supported in distributed modifications
--- cursors are not supported
-DELETE FROM limit_orders WHERE CURRENT OF cursor_name;
-ERROR:  cannot run DELETE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 -- simple UPDATE
 UPDATE limit_orders SET symbol = 'GM' WHERE id = 246;
@@ -399,9 +392,8 @@ ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 \c - - - :master_port
 -- Fourth: Perform an INSERT on the remaining node
 INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
-WARNING:  relation "public.limit_orders_750000" does not exist
+ERROR:  relation "public.limit_orders_750000" does not exist
 CONTEXT:  while executing command on localhost:57637
-ERROR:  could not modify any active placements
 -- Last: Verify worker is still healthy
 SELECT count(*)
 FROM   pg_dist_shard_placement AS sp,
@@ -423,10 +415,6 @@ AND    s.logicalrelid = 'limit_orders'::regclass;
 ALTER TABLE renamed_orders RENAME TO limit_orders_750000;
 -- Third: Connect back to master node
 \c - - - :master_port
--- commands with no constraints on the partition key are not supported
-UPDATE limit_orders SET limit_price = 0.00;
-ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- attempting to change the partition key is unsupported
 UPDATE limit_orders SET id = 0 WHERE id = 246;
 ERROR:  modifying the partition value of rows is not allowed
@@ -441,7 +429,7 @@ UPDATE limit_orders SET limit_price = 0.00 FROM bidders
 					WHERE limit_orders.id = 246 AND
 						  limit_orders.bidder_id = bidders.id AND
 						  bidders.name = 'Bernie Madoff';
-ERROR:  cannot plan queries which include both local and distributed relations
+ERROR:  relation bidders is not distributed
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders DEFAULT VALUES RETURNING *)
 UPDATE limit_orders SET symbol = 'GM';
@@ -472,8 +460,6 @@ UPDATE limit_orders SET symbol = UPPER(symbol) WHERE id = 246 RETURNING id, LOWE
 (1 row)
 
 ALTER TABLE limit_orders ADD COLUMN array_of_values integer[];
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 -- updates referencing STABLE functions are allowed
 UPDATE limit_orders SET placed_at = LEAST(placed_at, now()::timestamp) WHERE id = 246;
 -- so are binary operators
@@ -517,15 +503,9 @@ SELECT array_of_values FROM limit_orders WHERE id = 246;
 (1 row)
 
 ALTER TABLE limit_orders DROP array_of_values;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 -- even in RETURNING
 UPDATE limit_orders SET placed_at = placed_at WHERE id = 246 RETURNING NOW();
 ERROR:  non-IMMUTABLE functions are not allowed in the RETURNING clause
--- cursors are not supported
-UPDATE limit_orders SET symbol = 'GM' WHERE CURRENT OF cursor_name;
-ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- check that multi-row UPDATE/DELETEs with RETURNING work
 INSERT INTO multiple_hash VALUES ('0', '1');
 INSERT INTO multiple_hash VALUES ('0', '2');
@@ -984,12 +964,12 @@ SELECT * FROM summary_table ORDER BY id;
 -- unsupported multi-shard updates
 UPDATE summary_table SET average_value = average_query.average FROM (
 	SELECT avg(value) AS average FROM raw_table) average_query;
-ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
+ERROR:  subqueries are not supported in modifications across multiple shards
+DETAIL:  Consider using an equality filter on partition column "id" to target a single shard.
 UPDATE summary_table SET average_value = average_value + 1 WHERE id =
   (SELECT id FROM raw_table WHERE value > 100);
-ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
+ERROR:  subqueries are not supported in modifications across multiple shards
+DETAIL:  Consider using an equality filter on partition column "id" to target a single shard.
 -- test complex queries
 UPDATE summary_table
 SET
@@ -1128,8 +1108,8 @@ SELECT master_modify_multiple_shards('
 		SELECT avg(value) AS average FROM raw_table WHERE id = 1
 		) average_query
 	WHERE id = 1');
-ERROR:  cannot perform distributed planning for the given modifications
-DETAIL:  Subqueries are not supported in distributed modifications.
+ERROR:  subqueries are not supported in modifications across multiple shards
+DETAIL:  Consider using an equality filter on partition column "id" to target a single shard.
 -- test connection API via using COPY
 -- COPY on SELECT part
 BEGIN;

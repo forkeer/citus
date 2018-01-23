@@ -6,14 +6,14 @@
 -- tables.
 
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 640000;
+SET citus.next_shard_id TO 640000;
 
 
 --
 -- CREATE TEST TABLES
 --
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 102080;
+SET citus.next_shard_id TO 102080;
 
 CREATE TABLE index_test_range(a int, b int, c int);
 SELECT master_create_distributed_table('index_test_range', 'a', 'range');
@@ -66,9 +66,17 @@ CREATE INDEX IF NOT EXISTS lineitem_orderkey_index on index_test_hash(a);
 -- Verify that we can create indexes concurrently
 CREATE INDEX CONCURRENTLY lineitem_concurrently_index ON lineitem (l_orderkey);
 
+-- Verify that we warn out on CLUSTER command for distributed tables and no parameter
+CLUSTER index_test_hash USING index_test_hash_index_a;
+CLUSTER;
+
 -- Verify that no-name local CREATE INDEX CONCURRENTLY works
 CREATE TABLE local_table (id integer, name text);
-CREATE INDEX CONCURRENTLY ON local_table(id);
+CREATE INDEX CONCURRENTLY local_table_index ON local_table(id);
+
+-- Vefify we don't warn out on CLUSTER command for local tables
+CLUSTER local_table USING local_table_index;
+
 DROP TABLE local_table;
 
 -- Verify that all indexes got created on the master node and one of the workers

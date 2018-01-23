@@ -1,8 +1,8 @@
 --
 -- MULTI_INSERT_SELECT
 --
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 13300000;
-ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 13300000;
+SET citus.next_shard_id TO 13300000;
+SET citus.next_placement_id TO 13300000;
 -- create co-located tables
 SET citus.shard_count = 4;
 SET citus.shard_replication_factor = 2;
@@ -139,8 +139,7 @@ FROM
 WHERE
   user_id = 0;
 WARNING:  function public.evaluate_on_master(integer) does not exist
-WARNING:  function public.evaluate_on_master(integer) does not exist
-ERROR:  could not modify any active placements
+ERROR:  function public.evaluate_on_master(integer) does not exist
 \set VERBOSITY default
 -- add one more row
 INSERT INTO raw_events_first (user_id, time) VALUES
@@ -626,19 +625,64 @@ DEBUG:  Plan is router executable
 SET client_min_messages TO INFO;
 truncate agg_events;
 SET client_min_messages TO DEBUG2;
--- we do not support DISTINCT ON clauses
+-- DISTINCT ON clauses are supported
+-- distinct on(non-partition column)
+-- values are pulled to master
 INSERT INTO agg_events (value_1_agg, user_id)
   SELECT
     DISTINCT ON (value_1) value_1, user_id
   FROM
     raw_events_first;
-DEBUG:  DISTINCT ON clauses are not allowed in distributed INSERT ... SELECT queries
+DEBUG:  DISTINCT ON (non-partition column) clauses are not allowed in distributed INSERT ... SELECT queries
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
-ERROR:  could not run distributed query with DISTINCT clause
-HINT:  Consider using an equality filter on the distributed table's partition column.
--- We do not support some CTEs
+SELECT user_id, value_1_agg FROM agg_events ORDER BY 1,2;
+ user_id | value_1_agg 
+---------+-------------
+       1 |          10
+       2 |          20
+       3 |          30
+       4 |          40
+       5 |          50
+       6 |          60
+       7 |            
+       8 |          80
+       9 |          90
+(9 rows)
+
+-- we don't want to see constraint vialotions, so truncate first
+SET client_min_messages TO INFO;
+truncate agg_events;
+SET client_min_messages TO DEBUG2;
+-- distinct on(partition column)
+-- queries are forwared to workers
+INSERT INTO agg_events (value_1_agg, user_id)
+  SELECT
+    DISTINCT ON (user_id) value_1, user_id
+  FROM
+    raw_events_first;
+DEBUG:  distributed statement: INSERT INTO public.agg_events_13300008 AS citus_table_alias (user_id, value_1_agg) SELECT DISTINCT ON (user_id) user_id, value_1 FROM public.raw_events_first_13300000 raw_events_first WHERE ((worker_hash(user_id) >= '-2147483648'::integer) AND (worker_hash(user_id) <= '-1073741825'::integer))
+DEBUG:  distributed statement: INSERT INTO public.agg_events_13300009 AS citus_table_alias (user_id, value_1_agg) SELECT DISTINCT ON (user_id) user_id, value_1 FROM public.raw_events_first_13300001 raw_events_first WHERE ((worker_hash(user_id) >= '-1073741824'::integer) AND (worker_hash(user_id) <= '-1'::integer))
+DEBUG:  distributed statement: INSERT INTO public.agg_events_13300010 AS citus_table_alias (user_id, value_1_agg) SELECT DISTINCT ON (user_id) user_id, value_1 FROM public.raw_events_first_13300002 raw_events_first WHERE ((worker_hash(user_id) >= 0) AND (worker_hash(user_id) <= 1073741823))
+DEBUG:  distributed statement: INSERT INTO public.agg_events_13300011 AS citus_table_alias (user_id, value_1_agg) SELECT DISTINCT ON (user_id) user_id, value_1 FROM public.raw_events_first_13300003 raw_events_first WHERE ((worker_hash(user_id) >= 1073741824) AND (worker_hash(user_id) <= 2147483647))
+DEBUG:  Plan is router executable
+SELECT user_id, value_1_agg FROM agg_events ORDER BY 1,2;
+ user_id | value_1_agg 
+---------+-------------
+       1 |          10
+       2 |          20
+       3 |          30
+       4 |          40
+       5 |          50
+       6 |          60
+       7 |            
+       8 |          80
+       9 |          90
+(9 rows)
+
+-- We support CTEs
+BEGIN;
 WITH fist_table_agg AS
-  (SELECT sum(value_1) as v1_agg, user_id FROM raw_events_first GROUP BY user_id)
+  (SELECT max(value_1)+1 as v1_agg, user_id FROM raw_events_first GROUP BY user_id)
 INSERT INTO agg_events
             (value_1_agg, user_id)
             SELECT
@@ -647,9 +691,12 @@ INSERT INTO agg_events
               fist_table_agg;
 DEBUG:  distributed INSERT ... SELECT can only select from distributed tables
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
-ERROR:  could not run distributed query with complex table expressions
-HINT:  Consider using an equality filter on the distributed table's partition column.
--- We don't support CTEs that consist of const values as well
+DEBUG:  generating subplan 51_1 for CTE fist_table_agg: SELECT (max(value_1) + 1) AS v1_agg, user_id FROM public.raw_events_first GROUP BY user_id
+DEBUG:  Plan 51 query after replacing subqueries and CTEs: SELECT user_id, v1_agg FROM (SELECT fist_table_agg.v1_agg, fist_table_agg.user_id FROM (SELECT intermediate_result.v1_agg, intermediate_result.user_id FROM read_intermediate_result('51_1'::text, 'binary'::citus_copy_format) intermediate_result(v1_agg integer, user_id integer)) fist_table_agg) citus_insert_select_subquery
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ROLLBACK;
+-- We don't support CTEs that are referenced in the target list
 INSERT INTO agg_events
   WITH sub_cte AS (SELECT 1)
   SELECT
@@ -658,7 +705,9 @@ INSERT INTO agg_events
     raw_events_first;
 DEBUG:  Subqueries without relations are not allowed in distributed INSERT ... SELECT queries
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
-ERROR:  could not run distributed query with common table expressions
+DEBUG:  generating subplan 54_1 for CTE sub_cte: SELECT 1
+DEBUG:  Plan 54 query after replacing subqueries and CTEs: SELECT user_id, (SELECT sub_cte."?column?" FROM (SELECT intermediate_result."?column?" FROM read_intermediate_result('54_1'::text, 'binary'::citus_copy_format) intermediate_result("?column?" integer)) sub_cte) FROM public.raw_events_first
+ERROR:  could not run distributed query with subquery outside the FROM and WHERE clauses
 HINT:  Consider using an equality filter on the distributed table's partition column.
 -- We support set operations via the coordinator
 BEGIN;
@@ -672,15 +721,24 @@ FROM
 DEBUG:  Set operations are not allowed in distributed INSERT ... SELECT queries
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
 ROLLBACK;
--- We do not support any set operations
+-- We do support set operations through recursive planning
+BEGIN;
+SET LOCAL client_min_messages TO DEBUG;
 INSERT INTO
   raw_events_first(user_id)
   (SELECT user_id FROM raw_events_first) INTERSECT
   (SELECT user_id FROM raw_events_first);
 DEBUG:  Set operations are not allowed in distributed INSERT ... SELECT queries
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
-ERROR:  cannot pushdown the subquery since all relations are not joined using distribution keys
-DETAIL:  Each relation should be joined with at least one another relation using distribution keys and equality operator.
+DEBUG:  generating subplan 58_1 for subquery SELECT user_id FROM public.raw_events_first
+DEBUG:  generating subplan 58_2 for subquery SELECT user_id FROM public.raw_events_first
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  generating subplan 58_3 for subquery SELECT intermediate_result.user_id FROM read_intermediate_result('58_1'::text, 'binary'::citus_copy_format) intermediate_result(user_id integer) INTERSECT SELECT intermediate_result.user_id FROM read_intermediate_result('58_2'::text, 'binary'::citus_copy_format) intermediate_result(user_id integer)
+DEBUG:  Plan 58 query after replacing subqueries and CTEs: SELECT user_id FROM (SELECT intermediate_result.user_id FROM read_intermediate_result('58_3'::text, 'binary'::citus_copy_format) intermediate_result(user_id integer)) citus_insert_select_subquery
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ROLLBACK;
 -- If the query is router plannable then it is executed via the coordinator
 INSERT INTO
   raw_events_first(user_id)
@@ -1000,7 +1058,7 @@ FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
         GROUP  BY raw_events_second.user_id) AS foo;
 ERROR:  cannot perform distributed planning for the given modification
 DETAIL:  Select query cannot be pushed down to the worker.
--- INSERT partition column does not match with SELECT partition column
+-- INSERT returns NULL partition key value via coordinator
 INSERT INTO agg_events
             (value_4_agg,
              value_1_agg,
@@ -1015,11 +1073,25 @@ FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
                raw_events_second
         WHERE  raw_events_first.user_id = raw_events_second.user_id
         GROUP  BY raw_events_second.value_3) AS foo;
-DEBUG:  cannot perform distributed INSERT INTO ... SELECT because the partition columns in the source table and subquery do not match
-DETAIL:  The data type of the target table's partition column should exactly match the data type of the corresponding simple column reference in the subquery.
+DEBUG:  Group by list without distribution column is not allowed  in distributed INSERT ... SELECT queries
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
-ERROR:  cannot push down this subquery
-DETAIL:  Group by list without partition column is currently unsupported
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [0,1073741823]
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [0,1073741823]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [0,1073741823] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [0,1073741823] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [0,1073741823] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [0,1073741823]
+DEBUG:  generating subplan 88_1 for subquery SELECT sum(raw_events_second.value_4) AS v4, sum(raw_events_first.value_1) AS v1, raw_events_second.value_3 AS id FROM public.raw_events_first, public.raw_events_second WHERE (raw_events_first.user_id = raw_events_second.user_id) GROUP BY raw_events_second.value_3
+DEBUG:  Plan 88 query after replacing subqueries and CTEs: SELECT id, v1, v4 FROM (SELECT intermediate_result.v4, intermediate_result.v1, intermediate_result.id FROM read_intermediate_result('88_1'::text, 'binary'::citus_copy_format) intermediate_result(v4 numeric, v1 bigint, id double precision)) foo
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ERROR:  the partition column of table public.agg_events cannot be NULL
 -- error cases
 -- no part column at all
 INSERT INTO raw_events_second
@@ -1109,8 +1181,7 @@ DETAIL:  The target table's partition column should correspond to a partition co
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
 DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
--- unsupported joins between subqueries
--- we do not return bare partition column on the inner query
+-- foo2 is recursively planned and INSERT...SELECT is done via coordinator
 INSERT INTO agg_events
             (user_id)
 SELECT f2.id FROM
@@ -1133,15 +1204,26 @@ FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
         GROUP  BY raw_events_second.value_1
         HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
 ON (f.id = f2.id);
-DEBUG:  cannot perform distributed INSERT INTO ... SELECT because the partition columns in the source table and subquery do not match
-DETAIL:  Subquery contains an expression that is not a simple column reference in the same position as the target table's partition column.
-HINT:  Ensure the target table's partition column has a corresponding simple column reference to a distributed table's partition column in the subquery.
+DEBUG:  Group by list without distribution column is not allowed  in distributed INSERT ... SELECT queries
 DEBUG:  Collecting INSERT ... SELECT results on coordinator
-ERROR:  cannot pushdown the subquery since all relations are not joined using distribution keys
-DETAIL:  Each relation should be joined with at least one another relation using distribution keys and equality operator.
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [0,1073741823]
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [0,1073741823]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [0,1073741823] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [0,1073741823] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [0,1073741823] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [0,1073741823]
+DEBUG:  generating subplan 107_1 for subquery SELECT sum(raw_events_second.value_4) AS v4, raw_events_second.value_1 AS v1, sum(raw_events_second.user_id) AS id FROM public.raw_events_first, public.raw_events_second WHERE (raw_events_first.user_id = raw_events_second.user_id) GROUP BY raw_events_second.value_1 HAVING (sum(raw_events_second.value_4) > (10)::numeric)
+DEBUG:  Plan 107 query after replacing subqueries and CTEs: SELECT f2.id FROM ((SELECT foo.id FROM (SELECT reference_table.user_id AS id FROM public.raw_events_first, public.reference_table WHERE (raw_events_first.user_id = reference_table.user_id)) foo) f JOIN (SELECT foo2.v4, foo2.v1, foo2.id FROM (SELECT intermediate_result.v4, intermediate_result.v1, intermediate_result.id FROM read_intermediate_result('107_1'::text, 'binary'::citus_copy_format) intermediate_result(v4 numeric, v1 integer, id bigint)) foo2) f2 ON ((f.id = f2.id)))
 -- the second part of the query is not routable since
 -- GROUP BY not on the partition column (i.e., value_1) and thus join
 -- on f.id = f2.id is not on the partition key (instead on the sum of partition key)
+-- but we still recursively plan foo2 and run the query
 INSERT INTO agg_events
             (user_id)
 SELECT f.id FROM
@@ -1164,8 +1246,22 @@ FROM   (SELECT SUM(raw_events_second.value_4) AS v4,
         GROUP  BY raw_events_second.value_1
         HAVING SUM(raw_events_second.value_4) > 10) AS foo2 ) as f2
 ON (f.id = f2.id);
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  Select query cannot be pushed down to the worker.
+DEBUG:  Group by list without distribution column is not allowed  in distributed INSERT ... SELECT queries
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [0,1073741823]
+DEBUG:  join prunable for intervals [-2147483648,-1073741825] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [0,1073741823]
+DEBUG:  join prunable for intervals [-1073741824,-1] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [0,1073741823] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [0,1073741823] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [0,1073741823] and [1073741824,2147483647]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [-2147483648,-1073741825]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [-1073741824,-1]
+DEBUG:  join prunable for intervals [1073741824,2147483647] and [0,1073741823]
+DEBUG:  generating subplan 110_1 for subquery SELECT sum(raw_events_second.value_4) AS v4, raw_events_second.value_1 AS v1, sum(raw_events_second.user_id) AS id FROM public.raw_events_first, public.raw_events_second WHERE (raw_events_first.user_id = raw_events_second.user_id) GROUP BY raw_events_second.value_1 HAVING (sum(raw_events_second.value_4) > (10)::numeric)
+DEBUG:  Plan 110 query after replacing subqueries and CTEs: SELECT f.id FROM ((SELECT foo.id FROM (SELECT raw_events_first.user_id AS id FROM public.raw_events_first, public.reference_table WHERE (raw_events_first.user_id = reference_table.user_id)) foo) f JOIN (SELECT foo2.v4, foo2.v1, foo2.id FROM (SELECT intermediate_result.v4, intermediate_result.v1, intermediate_result.id FROM read_intermediate_result('110_1'::text, 'binary'::citus_copy_format) intermediate_result(v4 numeric, v1 integer, id bigint)) foo2) f2 ON ((f.id = f2.id)))
 -- cannot pushdown the query since the JOIN is not equi JOIN
 INSERT INTO agg_events
             (user_id, value_4_agg)
@@ -1581,8 +1677,8 @@ HINT:  Consider using an equality filter on the distributed table's partition co
 SET client_min_messages TO INFO;
 -- avoid constraint violations
 TRUNCATE raw_events_first;
--- we don't support LIMIT even if it exists in the subqueries 
--- in where clause
+-- we don't support LIMIT for subquery pushdown, but
+-- we recursively plan the query and run it via coordinator
 INSERT INTO agg_events(user_id)
 SELECT user_id 
 FROM   users_table 
@@ -1604,15 +1700,11 @@ WHERE  user_id
                      ) as f_inner
                   )
           ) AS f2); 
-ERROR:  cannot push down this subquery
-DETAIL:  Limit in subquery is currently unsupported
 -- Altering a table and selecting from it using a multi-shard statement
 -- in the same transaction is allowed because we will use the same
 -- connections for all co-located placements.
 BEGIN;
 ALTER TABLE raw_events_second DROP COLUMN value_4;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 INSERT INTO raw_events_first SELECT * FROM raw_events_second; 
 ROLLBACK;
 -- Alterating a table and selecting from it using a single-shard statement
@@ -2092,13 +2184,21 @@ RETURNING *;
 DEBUG:  distributed INSERT ... SELECT can only select from distributed tables
 ERROR:  RETURNING is not supported in INSERT ... SELECT via coordinator
 RESET client_min_messages;
--- INSERT ... SELECT and multi-shard SELECT in the same transaction is unsupported
+-- INSERT ... SELECT and multi-shard SELECT in the same transaction is supported
 TRUNCATE raw_events_first;
 BEGIN;
 INSERT INTO raw_events_first (user_id, value_1)
 SELECT s, s FROM generate_series(1, 5) s;
 SELECT user_id, value_1 FROM raw_events_first;
-ERROR:  cannot open new connections after the first modification command within a transaction
+ user_id | value_1 
+---------+---------
+       1 |       1
+       5 |       5
+       3 |       3
+       4 |       4
+       2 |       2
+(5 rows)
+
 ROLLBACK;
 -- INSERT ... SELECT and single-shard SELECT in the same transaction is supported
 TRUNCATE raw_events_first;
@@ -2350,6 +2450,39 @@ SELECT * FROM ref_table ORDER BY user_id, value_1;
 (5 rows)
 
 DROP TABLE ref_table;
+-- Select from reference table into reference table
+CREATE TABLE ref1 (d timestamptz);
+SELECT create_reference_table('ref1');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+CREATE TABLE ref2 (d date);
+SELECT create_reference_table('ref2');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+INSERT INTO ref2 VALUES ('2017-10-31');
+INSERT INTO ref1 SELECT * FROM ref2;
+SELECT count(*) from ref1;
+ count 
+-------
+     1
+(1 row)
+
+-- also test with now()
+INSERT INTO ref1 SELECT now() FROM ref2;
+SELECT count(*) from ref1;
+ count 
+-------
+     2
+(1 row)
+
+DROP TABLE ref1;
+DROP TABLE ref2;
 -- Select into an append-partitioned table is not supported
 CREATE TABLE insert_append_table (user_id int, value_4 bigint);
 SELECT create_distributed_table('insert_append_table', 'user_id', 'append');
@@ -2429,6 +2562,144 @@ SELECT * FROM drop_col_table WHERE col2 = '1';
 (1 row)
 
 RESET client_min_messages;
+-- make sure casts are handled correctly
+CREATE TABLE coerce_events(user_id int, time timestamp, value_1 numeric);
+SELECT create_distributed_table('coerce_events', 'user_id');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+CREATE TABLE coerce_agg (user_id int, value_1_agg int);
+SELECT create_distributed_table('coerce_agg', 'user_id');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+INSERT INTO coerce_events(user_id, value_1) VALUES (1, 1), (2, 2), (10, 10);
+-- numeric -> int (straight function)
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+ORDER BY 2 DESC, 1 DESC
+LIMIT 5;
+-- int -> text
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE text;
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+SELECT * FROM coerce_agg;
+ user_id | value_1_agg 
+---------+-------------
+      10 | 10
+       1 | 1
+       1 | 1
+      10 | 10
+       2 | 2
+       2 | 2
+(6 rows)
+
+TRUNCATE coerce_agg;
+-- int -> char(1)
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE char(1);
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+ERROR:  value too long for type character(1)
+DETAIL:  (null)
+SELECT * FROM coerce_agg;
+ user_id | value_1_agg 
+---------+-------------
+(0 rows)
+
+TRUNCATE coerce_agg;
+TRUNCATE coerce_events;
+-- char(5) -> char(1)
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE char(5);
+INSERT INTO coerce_events(user_id, value_1) VALUES (1, 'aaaaa'), (2, 'bbbbb');
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+ERROR:  value too long for type character(1)
+DETAIL:  (null)
+-- char(1) -> char(5)
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE char(1) USING value_1::char(1);
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE char(5);
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+SELECT * FROM coerce_agg;
+ user_id | value_1_agg 
+---------+-------------
+       1 | a    
+       2 | b    
+(2 rows)
+
+TRUNCATE coerce_agg;
+TRUNCATE coerce_events;
+-- integer -> integer (check VALUE < 5)
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE integer USING NULL;
+ALTER TABLE coerce_agg ALTER COLUMN value_1_agg TYPE integer USING NULL;
+ALTER TABLE coerce_agg ADD CONSTRAINT small_number CHECK (value_1_agg < 5);
+INSERT INTO coerce_events (user_id, value_1) VALUES (1, 1), (10, 10);
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop;
+ERROR:  new row for relation "coerce_agg_13300060" violates check constraint "small_number_13300060"
+DETAIL:  Failing row contains (10, 10).
+CONTEXT:  while executing command on localhost:57637
+SELECT * FROM coerce_agg;
+ user_id | value_1_agg 
+---------+-------------
+(0 rows)
+
+-- integer[3] -> text[3]
+TRUNCATE coerce_events;
+ALTER TABLE coerce_events ALTER COLUMN value_1 TYPE integer[3] USING NULL;
+INSERT INTO coerce_events(user_id, value_1) VALUES (1, '{1,1,1}'), (2, '{2,2,2}');
+ALTER TABLE coerce_agg DROP COLUMN value_1_agg;
+ALTER TABLE coerce_agg ADD COLUMN value_1_agg text[3];
+INSERT INTO coerce_agg(user_id, value_1_agg)
+SELECT *
+FROM (
+  SELECT user_id, value_1
+  FROM coerce_events
+) AS ftop
+LIMIT 5;
+SELECT * FROM coerce_agg;
+ user_id | value_1_agg 
+---------+-------------
+       1 | {1,1,1}
+       2 | {2,2,2}
+(2 rows)
+
+-- wrap in a transaction to improve performance
+BEGIN;
+DROP TABLE coerce_events;
+DROP TABLE coerce_agg;
 DROP TABLE drop_col_table;
 DROP TABLE raw_table;
 DROP TABLE summary_table;
@@ -2441,3 +2712,4 @@ DROP TABLE table_with_serial;
 DROP TABLE text_table;
 DROP TABLE char_table;
 DROP TABLE table_with_starts_with_defaults;
+COMMIT;

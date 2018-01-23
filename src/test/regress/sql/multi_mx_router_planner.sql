@@ -137,7 +137,7 @@ WITH id_author AS ( SELECT id, author_id FROM articles_hash_mx WHERE author_id =
 id_title AS (SELECT id, title from articles_hash_mx WHERE author_id = 3)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
 
--- CTE joins are not supported if table shards are at different workers
+-- CTE joins on different workers are supported because they are both planned recursively
 WITH id_author AS ( SELECT id, author_id FROM articles_hash_mx WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash_mx WHERE author_id = 2)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
@@ -216,8 +216,8 @@ SELECT * FROM articles_hash_mx, position('om' in 'Thomas') WHERE author_id = 1;
 
 SELECT * FROM articles_hash_mx, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 3;
 
--- they are not supported if multiple workers are involved
-SELECT * FROM articles_hash_mx, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 2;
+-- they are supported via (sub)query pushdown if multiple workers are involved
+SELECT * FROM articles_hash_mx, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 2 ORDER BY 4 DESC, 1 DESC, 2 DESC LIMIT 5;
 
 -- subqueries are supported in FROM clause but they are not router plannable
 SELECT articles_hash_mx.id,test.word_count
@@ -269,8 +269,8 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	LIMIT 3;
 	
 -- following join is not router plannable since there are no
--- workers containing both shards, added a CTE to make this fail
--- at logical planner
+-- workers containing both shards, but will work through recursive
+-- planning
 WITH single_shard as (SELECT * FROM articles_single_shard_hash_mx)
 SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash_mx a, single_shard b
@@ -353,21 +353,20 @@ SELECT * FROM (
 ) AS combination
 ORDER BY 1;
 
--- union queries are not supported if not router plannable
--- there is an inconsistency on shard pruning between
--- ubuntu/mac disabling log messages for this queries only
-
-SET client_min_messages to 'NOTICE';
-
+-- union queries are supported through recursive planning
+SET client_min_messages TO DEBUG1;
 (SELECT * FROM articles_hash_mx WHERE author_id = 1)
 UNION
-(SELECT * FROM articles_hash_mx WHERE author_id = 2);
+(SELECT * FROM articles_hash_mx WHERE author_id = 2)
+ORDER BY 1,2;
 
 
 SELECT * FROM (
 	(SELECT * FROM articles_hash_mx WHERE author_id = 1)
 	UNION
-	(SELECT * FROM articles_hash_mx WHERE author_id = 2)) uu;
+	(SELECT * FROM articles_hash_mx WHERE author_id = 2)) uu
+ORDER BY 1, 2
+LIMIT 5;
 
 -- error out for queries with repartition jobs
 SELECT *

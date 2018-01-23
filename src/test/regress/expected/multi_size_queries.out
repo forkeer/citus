@@ -4,15 +4,15 @@
 -- Test checks whether size of distributed tables can be obtained with citus_table_size.
 -- To find the relation size and total relation size citus_relation_size and 
 -- citus_total_relation_size are also tested.
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1390000;
+SET citus.next_shard_id TO 1390000;
 ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1390000;
 -- Tests with invalid relation IDs
 SELECT citus_table_size(1);
-ERROR:  could not open relation with OID 1
+ERROR:  could not compute table size: relation does not exist
 SELECT citus_relation_size(1);
-ERROR:  could not open relation with OID 1
+ERROR:  could not compute table size: relation does not exist
 SELECT citus_total_relation_size(1);
-ERROR:  could not open relation with OID 1
+ERROR:  could not compute table size: relation does not exist
 -- Tests with non-distributed table
 CREATE TABLE non_distributed_table (x int);
 SELECT citus_table_size('non_distributed_table');
@@ -50,8 +50,6 @@ SELECT citus_total_relation_size('customer_copy_hash');
 (1 row)
 
 CREATE INDEX index_1 on customer_copy_hash(c_custkey);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 VACUUM (FULL) customer_copy_hash;
 -- Tests on distributed table with index.
 SELECT citus_table_size('customer_copy_hash');

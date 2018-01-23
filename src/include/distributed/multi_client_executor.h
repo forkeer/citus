@@ -14,6 +14,11 @@
 #ifndef MULTI_CLIENT_EXECUTOR_H
 #define MULTI_CLIENT_EXECUTOR_H
 
+
+#include "distributed/connection_management.h"
+#include "nodes/pg_list.h"
+
+
 #define INVALID_CONNECTION_ID -1  /* identifies an invalid connection */
 #define MAX_CONNECTION_COUNT 2048 /* simultaneous client connection count */
 #define STRING_BUFFER_SIZE 1024   /* buffer size for character arrays */
@@ -98,9 +103,13 @@ typedef struct WaitInfo
 extern int32 MultiClientConnect(const char *nodeName, uint32 nodePort,
 								const char *nodeDatabase, const char *nodeUser);
 extern int32 MultiClientConnectStart(const char *nodeName, uint32 nodePort,
-									 const char *nodeDatabase);
+									 const char *nodeDatabase, const char *nodeUser);
+extern int32 MultiClientPlacementConnectStart(List *placementAccessList,
+											  const char *userName);
 extern ConnectStatus MultiClientConnectPoll(int32 connectionId);
+extern MultiConnection * MultiClientGetConnection(int32 connectionId);
 extern void MultiClientDisconnect(int32 connectionId);
+extern void MultiClientReleaseConnection(int32 connectionId);
 extern bool MultiClientConnectionUp(int32 connectionId);
 extern bool MultiClientExecute(int32 connectionId, const char *query, void **queryResult,
 							   int *rowCount, int *columnCount);
@@ -108,7 +117,8 @@ extern bool MultiClientSendQuery(int32 connectionId, const char *query);
 extern bool MultiClientCancel(int32 connectionId);
 extern ResultStatus MultiClientResultStatus(int32 connectionId);
 extern QueryStatus MultiClientQueryStatus(int32 connectionId);
-extern CopyStatus MultiClientCopyData(int32 connectionId, int32 fileDescriptor);
+extern CopyStatus MultiClientCopyData(int32 connectionId, int32 fileDescriptor,
+									  uint64 *returnBytesReceived);
 extern bool MultiClientQueryResult(int32 connectionId, void **queryResult,
 								   int *rowCount, int *columnCount);
 extern BatchQueryStatus MultiClientBatchResult(int32 connectionId, void **queryResult,

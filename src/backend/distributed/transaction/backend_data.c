@@ -297,7 +297,10 @@ void
 InitializeBackendManagement(void)
 {
 	/* allocate shared memory */
-	RequestAddinShmemSpace(BackendManagementShmemSize());
+	if (!IsUnderPostmaster)
+	{
+		RequestAddinShmemSpace(BackendManagementShmemSize());
+	}
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = BackendManagementShmemInit;
@@ -398,27 +401,39 @@ BackendManagementShmemSize(void)
 
 
 /*
- *  InitializeBackendData is called per backend and does the
- *  required initialization.
+ * InitializeBackendData initialises MyBackendData to the shared memory segment
+ * belonging to the current backend.
+ *
+ * The function is called through CitusHasBeenLoaded when we first detect that
+ * the Citus extension is present, and after any subsequent invalidation of
+ * pg_dist_partition (see InvalidateMetadataSystemCache()).
+ *
+ * We only need to initialise MyBackendData once. The only goal here is to make
+ * sure that we don't use the backend data from a previous backend with the same
+ * pgprocno. Resetting the backend data after a distributed transaction happens
+ * on COMMIT/ABORT through transaction callbacks.
  */
 void
 InitializeBackendData(void)
 {
+	if (MyBackendData != NULL)
+	{
+		/*
+		 * We already initialized MyBackendData before. We definitely should
+		 * not initialise it again, because we might be in the middle of a
+		 * distributed transaction.
+		 */
+		return;
+	}
+
 	MyBackendData = &backendManagementShmemData->backends[MyProc->pgprocno];
 
 	Assert(MyBackendData);
 
 	LockBackendSharedMemory(LW_EXCLUSIVE);
 
-	SpinLockAcquire(&MyBackendData->mutex);
-
-	MyBackendData->databaseId = MyDatabaseId;
-	MyBackendData->transactionId.initiatorNodeIdentifier = 0;
-	MyBackendData->transactionId.transactionOriginator = false;
-	MyBackendData->transactionId.transactionNumber = 0;
-	MyBackendData->transactionId.timestamp = 0;
-
-	SpinLockRelease(&MyBackendData->mutex);
+	/* zero out the backend data */
+	UnSetDistributedTransactionId();
 
 	UnlockBackendSharedMemory();
 }
@@ -479,25 +494,27 @@ UnlockBackendSharedMemory(void)
 /*
  * GetCurrentDistributedTransactionId reads the backend's distributed transaction id and
  * returns a copy of it.
+ *
+ * When called from a parallel worker, it uses the parent's transaction ID per the logic
+ * in GetBackendDataForProc.
  */
 DistributedTransactionId *
 GetCurrentDistributedTransactionId(void)
 {
 	DistributedTransactionId *currentDistributedTransactionId =
 		(DistributedTransactionId *) palloc(sizeof(DistributedTransactionId));
+	BackendData backendData;
 
-	SpinLockAcquire(&MyBackendData->mutex);
+	GetBackendDataForProc(MyProc, &backendData);
 
 	currentDistributedTransactionId->initiatorNodeIdentifier =
-		MyBackendData->transactionId.initiatorNodeIdentifier;
+		backendData.transactionId.initiatorNodeIdentifier;
 	currentDistributedTransactionId->transactionOriginator =
-		MyBackendData->transactionId.transactionOriginator;
+		backendData.transactionId.transactionOriginator;
 	currentDistributedTransactionId->transactionNumber =
-		MyBackendData->transactionId.transactionNumber;
+		backendData.transactionId.transactionNumber;
 	currentDistributedTransactionId->timestamp =
-		MyBackendData->transactionId.timestamp;
-
-	SpinLockRelease(&MyBackendData->mutex);
+		backendData.transactionId.timestamp;
 
 	return currentDistributedTransactionId;
 }
@@ -639,4 +656,53 @@ MyBackendGotCancelledDueToDeadlock(void)
 	SpinLockRelease(&MyBackendData->mutex);
 
 	return cancelledDueToDeadlock;
+}
+
+
+/*
+ * ActiveDistributedTransactionNumbers returns a list of pointers to
+ * transaction numbers of distributed transactions that are in progress
+ * and were started by the node on which it is called.
+ */
+List *
+ActiveDistributedTransactionNumbers(void)
+{
+	List *activeTransactionNumberList = NIL;
+	int curBackend = 0;
+
+	/* build list of starting procs */
+	for (curBackend = 0; curBackend < MaxBackends; curBackend++)
+	{
+		PGPROC *currentProc = &ProcGlobal->allProcs[curBackend];
+		BackendData currentBackendData;
+		uint64 *transactionNumber = NULL;
+
+		if (currentProc->pid == 0)
+		{
+			/* unused PGPROC slot */
+			continue;
+		}
+
+		GetBackendDataForProc(currentProc, &currentBackendData);
+
+		if (!IsInDistributedTransaction(&currentBackendData))
+		{
+			/* not a distributed transaction */
+			continue;
+		}
+
+		if (!currentBackendData.transactionId.transactionOriginator)
+		{
+			/* not a coordinator process */
+			continue;
+		}
+
+		transactionNumber = (uint64 *) palloc0(sizeof(uint64));
+		*transactionNumber = currentBackendData.transactionId.transactionNumber;
+
+		activeTransactionNumberList = lappend(activeTransactionNumberList,
+											  transactionNumber);
+	}
+
+	return activeTransactionNumberList;
 }

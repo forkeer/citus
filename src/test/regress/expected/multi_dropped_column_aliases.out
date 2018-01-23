@@ -1,6 +1,6 @@
 -- Tests that check that our query functionality behaves as expected when the
 -- table schema is modified via ALTER statements.
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 620000;
+SET citus.next_shard_id TO 620000;
 SELECT count(*) FROM customer;
  count 
 -------
@@ -15,8 +15,6 @@ SELECT * FROM customer LIMIT 2;
 (2 rows)
 
 ALTER TABLE customer ADD COLUMN new_column1 INTEGER;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 ALTER TABLE customer ADD COLUMN new_column2 INTEGER;
 SELECT count(*) FROM customer;
  count 

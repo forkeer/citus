@@ -2,7 +2,7 @@
 -- MULTI_UNSUPPORTED_WORKER_OPERATIONS
 --
 -- Tests for ensuring unsupported functions on workers error out.
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1270000;
+SET citus.next_shard_id TO 1270000;
 ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART 1370000;
 ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART 1370000;
 -- Set the colocation id to a safe value so that 
@@ -140,8 +140,6 @@ SELECT * FROM mx_ref_table ORDER BY col_1;
 \c - - - :master_port
 DROP TABLE mx_ref_table;
 CREATE UNIQUE INDEX mx_test_uniq_index ON mx_table(col_1);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 \c - - - :worker_1_port
 -- DDL commands
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
@@ -228,8 +226,6 @@ SELECT count(1) FROM pg_dist_node WHERE nodename='localhost' AND nodeport=5432;
 -- master_remove_node
 \c - - - :master_port
 DROP INDEX mx_test_uniq_index;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 SELECT 1 FROM master_add_node('localhost', 5432);
  ?column? 
 ----------
@@ -259,19 +255,6 @@ TRUNCATE mx_table;
 ERROR:  operation is not allowed on this node
 HINT:  Connect to the coordinator and run it again.
 SELECT count(*) FROM mx_table;
- count 
--------
-     5
-(1 row)
-
--- INSERT / SELECT pulls results to worker
-BEGIN;
-SET LOCAL client_min_messages TO DEBUG;
-INSERT INTO mx_table_2 SELECT * FROM mx_table;
-DEBUG:  distributed INSERT ... SELECT can only be performed from the coordinator
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-END;
-SELECT count(*) FROM mx_table_2;
  count 
 -------
      5

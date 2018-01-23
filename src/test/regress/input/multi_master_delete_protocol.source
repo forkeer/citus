@@ -3,7 +3,7 @@
 --
 
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 320000;
+SET citus.next_shard_id TO 320000;
 
 
 -- Create a new range partitioned customer_delete_protocol table and load data into it.
@@ -27,8 +27,6 @@ SELECT master_create_distributed_table('customer_delete_protocol', 'c_custkey', 
 
 SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol
                                            WHERE c_acctbal > 0.0');
--- Check that free-form deletes are not supported.
-DELETE FROM customer_delete_protocol WHERE c_custkey > 100;
 -- Check that we delete a shard if and only if all rows in the shard satisfy the condition.
 SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol 
                                            WHERE c_custkey > 6500');

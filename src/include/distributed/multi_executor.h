@@ -14,33 +14,31 @@
 #include "nodes/parsenodes.h"
 #include "nodes/execnodes.h"
 
+#include "distributed/citus_custom_scan.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
 
 
-typedef struct CitusScanState
+/* managed via guc.c */
+typedef enum
 {
-	CustomScanState customScanState;  /* underlying custom scan node */
-	MultiPlan *multiPlan;             /* distributed execution plan */
-	MultiExecutorType executorType;   /* distributed executor type */
-	bool finishedRemoteScan;          /* flag to check if remote scan is finished */
-	Tuplestorestate *tuplestorestate; /* tuple store to store distributed results */
-} CitusScanState;
+	PARALLEL_CONNECTION = 0,
+	SEQUENTIAL_CONNECTION = 1
+} MultiShardConnectionTypes;
+extern int MultiShardConnectionType;
 
 
-extern Node * RealTimeCreateScan(CustomScan *scan);
-extern Node * TaskTrackerCreateScan(CustomScan *scan);
-extern Node * RouterCreateScan(CustomScan *scan);
-extern Node * CoordinatorInsertSelectCreateScan(CustomScan *scan);
-extern Node * DelayedErrorCreateScan(CustomScan *scan);
-extern void CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags);
-extern TupleTableSlot * RealTimeExecScan(CustomScanState *node);
-extern TupleTableSlot * TaskTrackerExecScan(CustomScanState *node);
-extern void CitusEndScan(CustomScanState *node);
-extern void CitusReScan(CustomScanState *node);
-extern void CitusExplainScan(CustomScanState *node, List *ancestors, struct
-							 ExplainState *es);
 extern TupleTableSlot * ReturnTupleFromTuplestore(CitusScanState *scanState);
+extern void LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob);
+extern void ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc
+								   tupleDescriptor, Tuplestorestate *tupstore);
+extern void ExecuteQueryStringIntoDestReceiver(const char *queryString, ParamListInfo
+											   params,
+											   DestReceiver *dest);
+extern void ExecuteQueryIntoDestReceiver(Query *query, ParamListInfo params,
+										 DestReceiver *dest);
+extern void ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
+										DestReceiver *dest);
 
 
 #endif /* MULTI_EXECUTOR_H */

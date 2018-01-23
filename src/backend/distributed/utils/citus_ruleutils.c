@@ -31,12 +31,14 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/relay_utility.h"
 #include "distributed/master_metadata_utility.h"
+#include "distributed/version_compat.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodes.h"
@@ -44,6 +46,7 @@
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "parser/parse_utilcmd.h"
+#include "parser/parser.h"
 #include "storage/lock.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -60,8 +63,11 @@
 
 
 static void AppendOptionListToString(StringInfo stringData, List *options);
+static void AppendStorageParametersToString(StringInfo stringBuffer,
+											List *optionList);
 static const char * convert_aclright_to_string(int aclright);
-
+static void simple_quote_literal(StringInfo buf, const char *val);
+static char * flatten_reloptions(Oid relid);
 
 /*
  * pg_get_extensiondef_string finds the foreign data wrapper that corresponds to
@@ -333,7 +339,7 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 
 	for (attributeIndex = 0; attributeIndex < tupleDescriptor->natts; attributeIndex++)
 	{
-		Form_pg_attribute attributeForm = tupleDescriptor->attrs[attributeIndex];
+		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
 
 		/*
 		 * We disregard the inherited attributes (i.e., attinhcount > 0) here. The
@@ -473,6 +479,20 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 		appendStringInfo(&buffer, " PARTITION BY %s ", partitioningInformation);
 	}
 #endif
+
+	/*
+	 * Add any reloptions (storage parameters) defined on the table in a WITH
+	 * clause.
+	 */
+	{
+		char *reloptions = flatten_reloptions(tableRelationId);
+		if (reloptions)
+		{
+			appendStringInfo(&buffer, " WITH (%s)", reloptions);
+			pfree(reloptions);
+		}
+	}
+
 	relation_close(relation, AccessShareLock);
 
 	return (buffer.data);
@@ -545,7 +565,7 @@ pg_get_tablecolumnoptionsdef_string(Oid tableRelationId)
 
 	for (attributeIndex = 0; attributeIndex < tupleDescriptor->natts; attributeIndex++)
 	{
-		Form_pg_attribute attributeForm = tupleDescriptor->attrs[attributeIndex];
+		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
 		char *attributeName = NameStr(attributeForm->attname);
 		char defaultStorageType = get_typstorage(attributeForm->atttypid);
 
@@ -737,11 +757,7 @@ deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
 
 	appendStringInfoString(buffer, ") ");
 
-	if (indexStmt->options != NIL)
-	{
-		appendStringInfoString(buffer, "WITH ");
-		AppendOptionListToString(buffer, indexStmt->options);
-	}
+	AppendStorageParametersToString(buffer, indexStmt->options);
 
 	if (indexStmt->whereClause != NULL)
 	{
@@ -1003,6 +1019,44 @@ AppendOptionListToString(StringInfo stringBuffer, List *optionList)
 }
 
 
+/*
+ * AppendStorageParametersToString converts the storage parameter list to its
+ * textual format, and appends this text to the given string buffer.
+ */
+static void
+AppendStorageParametersToString(StringInfo stringBuffer, List *optionList)
+{
+	ListCell *optionCell = NULL;
+	bool firstOptionPrinted = false;
+
+	if (optionList == NIL)
+	{
+		return;
+	}
+
+	appendStringInfo(stringBuffer, " WITH (");
+
+	foreach(optionCell, optionList)
+	{
+		DefElem *option = (DefElem *) lfirst(optionCell);
+		char *optionName = option->defname;
+		char *optionValue = defGetString(option);
+
+		if (firstOptionPrinted)
+		{
+			appendStringInfo(stringBuffer, ", ");
+		}
+		firstOptionPrinted = true;
+
+		appendStringInfo(stringBuffer, "%s = %s ",
+						 quote_identifier(optionName),
+						 quote_literal_cstr(optionValue));
+	}
+
+	appendStringInfo(stringBuffer, ")");
+}
+
+
 /* copy of postgresql's function, which is static as well */
 static const char *
 convert_aclright_to_string(int aclright)
@@ -1064,4 +1118,174 @@ contain_nextval_expression_walker(Node *node, void *context)
 		}
 	}
 	return expression_tree_walker(node, contain_nextval_expression_walker, context);
+}
+
+
+/*
+ * pg_get_replica_identity_command function returns the required ALTER .. TABLE
+ * command to define the replica identity.
+ */
+char *
+pg_get_replica_identity_command(Oid tableRelationId)
+{
+	Relation relation = NULL;
+	StringInfo buf = makeStringInfo();
+	char *relationName = NULL;
+	char replicaIdentity = 0;
+
+	relation = heap_open(tableRelationId, AccessShareLock);
+
+	replicaIdentity = relation->rd_rel->relreplident;
+
+	relationName = generate_qualified_relation_name(tableRelationId);
+
+	if (replicaIdentity == REPLICA_IDENTITY_INDEX)
+	{
+		Oid indexId = RelationGetReplicaIndex(relation);
+
+		if (OidIsValid(indexId))
+		{
+			appendStringInfo(buf, "ALTER TABLE %s REPLICA IDENTITY USING INDEX %s ",
+							 relationName,
+							 quote_identifier(get_rel_name(indexId)));
+		}
+	}
+	else if (replicaIdentity == REPLICA_IDENTITY_NOTHING)
+	{
+		appendStringInfo(buf, "ALTER TABLE %s REPLICA IDENTITY NOTHING",
+						 relationName);
+	}
+	else if (replicaIdentity == REPLICA_IDENTITY_FULL)
+	{
+		appendStringInfo(buf, "ALTER TABLE %s REPLICA IDENTITY FULL",
+						 relationName);
+	}
+
+	heap_close(relation, AccessShareLock);
+
+	return (buf->len > 0) ? buf->data : NULL;
+}
+
+
+/*
+ * Generate a C string representing a relation's reloptions, or NULL if none.
+ *
+ * This function comes from PostgreSQL source code in
+ * src/backend/utils/adt/ruleutils.c
+ */
+static char *
+flatten_reloptions(Oid relid)
+{
+	char *result = NULL;
+	HeapTuple tuple;
+	Datum reloptions;
+	bool isnull;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+	{
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	}
+
+	reloptions = SysCacheGetAttr(RELOID, tuple,
+								 Anum_pg_class_reloptions, &isnull);
+	if (!isnull)
+	{
+		StringInfoData buf;
+		Datum *options;
+		int noptions;
+		int i;
+
+		initStringInfo(&buf);
+
+		deconstruct_array(DatumGetArrayTypeP(reloptions),
+						  TEXTOID, -1, false, 'i',
+						  &options, NULL, &noptions);
+
+		for (i = 0; i < noptions; i++)
+		{
+			char *option = TextDatumGetCString(options[i]);
+			char *name;
+			char *separator;
+			char *value;
+
+			/*
+			 * Each array element should have the form name=value.  If the "="
+			 * is missing for some reason, treat it like an empty value.
+			 */
+			name = option;
+			separator = strchr(option, '=');
+			if (separator)
+			{
+				*separator = '\0';
+				value = separator + 1;
+			}
+			else
+			{
+				value = "";
+			}
+
+			if (i > 0)
+			{
+				appendStringInfoString(&buf, ", ");
+			}
+			appendStringInfo(&buf, "%s=", quote_identifier(name));
+
+			/*
+			 * In general we need to quote the value; but to avoid unnecessary
+			 * clutter, do not quote if it is an identifier that would not
+			 * need quoting.  (We could also allow numbers, but that is a bit
+			 * trickier than it looks --- for example, are leading zeroes
+			 * significant?  We don't want to assume very much here about what
+			 * custom reloptions might mean.)
+			 */
+			if (quote_identifier(value) == value)
+			{
+				appendStringInfoString(&buf, value);
+			}
+			else
+			{
+				simple_quote_literal(&buf, value);
+			}
+
+			pfree(option);
+		}
+
+		result = buf.data;
+	}
+
+	ReleaseSysCache(tuple);
+
+	return result;
+}
+
+
+/*
+ * simple_quote_literal - Format a string as a SQL literal, append to buf
+ *
+ * This function comes from PostgreSQL source code in
+ * src/backend/utils/adt/ruleutils.c
+ */
+static void
+simple_quote_literal(StringInfo buf, const char *val)
+{
+	const char *valptr;
+
+	/*
+	 * We form the string literal according to the prevailing setting of
+	 * standard_conforming_strings; we never use E''. User is responsible for
+	 * making sure result is used correctly.
+	 */
+	appendStringInfoChar(buf, '\'');
+	for (valptr = val; *valptr; valptr++)
+	{
+		char ch = *valptr;
+
+		if (SQL_STR_DOUBLE(ch, !standard_conforming_strings))
+		{
+			appendStringInfoChar(buf, ch);
+		}
+		appendStringInfoChar(buf, ch);
+	}
+	appendStringInfoChar(buf, '\'');
 }

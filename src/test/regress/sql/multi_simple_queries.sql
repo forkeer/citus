@@ -1,5 +1,5 @@
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 850000;
+SET citus.next_shard_id TO 850000;
 
 
 -- ===================================================================
@@ -116,18 +116,19 @@ SELECT author_id, sum(word_count) AS corpus_size FROM articles
 	HAVING sum(word_count) > 40000
 	ORDER BY sum(word_count) DESC;
 
--- UNION/INTERSECT queries are unsupported if on multiple shards
+-- UNION/INTERSECT queries are supported if on multiple shards
 SELECT * FROM articles WHERE author_id = 10 UNION
-SELECT * FROM articles WHERE author_id = 2; 
+SELECT * FROM articles WHERE author_id = 2
+ORDER BY 1,2,3;
 
--- queries using CTEs are unsupported
+-- queries using CTEs are supported
 WITH long_names AS ( SELECT id FROM authors WHERE char_length(name) > 15 )
-SELECT title FROM articles;
+SELECT title FROM articles ORDER BY 1 LIMIT 5;
 
--- queries which involve functions in FROM clause are unsupported.
-SELECT * FROM articles, position('om' in 'Thomas');
+-- queries which involve functions in FROM clause are recursively planned
+SELECT * FROM articles, position('om' in 'Thomas') ORDER BY 2 DESC, 1 DESC, 3 DESC LIMIT 5;
 
--- subqueries are not supported in WHERE clause in Citus
+-- subqueries are supported in WHERE clause in Citus even if the relations are not distributed
 SELECT * FROM articles WHERE author_id IN (SELECT id FROM authors WHERE name LIKE '%a');
 
 -- subqueries are supported in FROM clause

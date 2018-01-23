@@ -56,6 +56,22 @@ typedef struct QualifierWalkerContext
 } QualifierWalkerContext;
 
 
+/*
+ * RecurringTuplesType is used to distinguish different types of expressions
+ * that always produce the same set of tuples when a shard is queried. We make
+ * this distinction to produce relevant error messages when recurring tuples
+ * are used in a way that would give incorrect results.
+ */
+typedef enum RecurringTuplesType
+{
+	RECURRING_TUPLES_INVALID = 0,
+	RECURRING_TUPLES_REFERENCE_TABLE,
+	RECURRING_TUPLES_FUNCTION,
+	RECURRING_TUPLES_EMPTY_JOIN_TREE,
+	RECURRING_TUPLES_RESULT_FUNCTION
+} RecurringTuplesType;
+
+
 /* Function pointer type definition for apply join rule functions */
 typedef MultiNode *(*RuleApplyFunction) (MultiNode *leftNode, MultiNode *rightNode,
 										 Var *partitionColumn, JoinType joinType,
@@ -64,33 +80,34 @@ typedef MultiNode *(*RuleApplyFunction) (MultiNode *leftNode, MultiNode *rightNo
 static RuleApplyFunction RuleApplyFunctionArray[JOIN_RULE_LAST] = { 0 }; /* join rules */
 
 /* Local functions forward declarations */
-static bool SingleRelationRepartitionSubquery(Query *queryTree);
 static DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryPushdown(Query *
 																	  originalQuery,
 																	  PlannerRestrictionContext
 																	  *
 																	  plannerRestrictionContext);
-static DeferredErrorMessage * DeferErrorIfUnsupportedSublinkAndReferenceTable(
-	Query *queryTree);
-static DeferredErrorMessage * DeferErrorIfUnsupportedFilters(Query *subquery);
-static bool EqualOpExpressionLists(List *firstOpExpressionList,
-								   List *secondOpExpressionList);
-static DeferredErrorMessage * DeferErrorIfCannotPushdownSubquery(Query *subqueryTree,
-																 bool
-																 outerMostQueryHasLimit);
-static DeferredErrorMessage * DeferErrorIfUnsupportedUnionQuery(Query *queryTree,
-																bool
-																outerMostQueryHasLimit);
+static RelationRestrictionContext * FilterRelationRestrictionContext(
+	RelationRestrictionContext *relationRestrictionContext,
+	Relids
+	queryRteIdentities);
+static JoinRestrictionContext * FilterJoinRestrictionContext(
+	JoinRestrictionContext *joinRestrictionContext, Relids
+	queryRteIdentities);
+static bool RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
+													rangeTableArrayLength, Relids
+													queryRteIdentities);
+static Relids QueryRteIdentities(Query *queryTree);
+static DeferredErrorMessage * DeferErrorIfFromClauseRecurs(Query *queryTree);
 static bool ExtractSetOperationStatmentWalker(Node *node, List **setOperationList);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
-static bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
+static bool WindowPartitionOnDistributionColumn(Query *query);
+static bool AllTargetExpressionsAreColumnReferences(List *targetEntryList);
+static bool IsDistributedTableRTE(Node *node);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
-static MultiNode * MultiPlanTree(Query *queryTree);
-static void ErrorIfQueryNotSupported(Query *queryTree);
-static bool HasUnsupportedReferenceTableJoin(
+static MultiNode * MultiNodeTree(Query *queryTree);
+static DeferredErrorMessage * DeferredErrorIfUnsupportedRecurringTuplesJoin(
 	PlannerRestrictionContext *plannerRestrictionContext);
-static bool ShouldRecurseForReferenceTableJoinChecks(RelOptInfo *relOptInfo);
+static bool ShouldRecurseForRecurringTuplesJoinChecks(RelOptInfo *relOptInfo);
 static bool HasUnsupportedJoinWalker(Node *node, void *context);
 static bool ErrorHintRequired(const char *errorHint, Query *queryTree);
 static DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryRepartition(Query *
@@ -100,10 +117,15 @@ static bool HasOuterJoin(Query *queryTree);
 static bool HasOuterJoinWalker(Node *node, void *maxJoinLevel);
 static bool HasComplexJoinOrder(Query *queryTree);
 static bool HasComplexRangeTableType(Query *queryTree);
-static bool RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo,
-											   RelOptInfo *relationInfo);
-static void ValidateClauseList(List *clauseList);
-static void ValidateSubqueryPushdownClauseList(List *clauseList);
+static bool RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo,
+												RelOptInfo *relationInfo,
+												RecurringTuplesType *recurType);
+static bool IsRecurringRTE(RangeTblEntry *rangeTableEntry,
+						   RecurringTuplesType *recurType);
+static bool IsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurType);
+static bool HasRecurringTuples(Node *node, RecurringTuplesType *recurType);
+static bool IsReadIntermediateResultFunction(Node *node);
+static DeferredErrorMessage * DeferErrorIfUnsupportedClause(List *clauseList);
 static bool ExtractFromExpressionWalker(Node *node,
 										QualifierWalkerContext *walkerContext);
 static List * MultiTableNodeList(List *tableEntryList, List *rangeTableList);
@@ -113,7 +135,6 @@ static MultiNode * MultiJoinTree(List *joinOrderList, List *collectTableList,
 static MultiCollect * CollectNodeForTable(List *collectTableList, uint32 rangeTableId);
 static MultiSelect * MultiSelectNode(List *whereClauseList);
 static bool IsSelectClause(Node *clause);
-static bool IsSublinkClause(Node *clause);
 static MultiProject * MultiProjectNode(List *targetEntryList);
 static MultiExtendedOp * MultiExtendedOpNode(Query *queryTree);
 
@@ -142,14 +163,16 @@ static MultiNode * ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNo
  * Local functions forward declarations for subquery pushdown. Note that these
  * functions will be removed with upcoming subqery changes.
  */
-static Node * ResolveExternalParams(Node *inputNode, ParamListInfo boundParams);
-static MultiNode * MultiSubqueryPlanTree(Query *originalQuery,
+static bool ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery);
+static bool IsFunctionRTE(Node *node);
+static bool FindNodeCheck(Node *node, bool (*check)(Node *));
+static MultiNode * SubqueryMultiNodeTree(Query *originalQuery,
 										 Query *queryTree,
 										 PlannerRestrictionContext *
 										 plannerRestrictionContext);
 static List * SublinkList(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
-static MultiNode * SubqueryPushdownMultiPlanTree(Query *queryTree);
+static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 
 static List * CreateSubqueryTargetEntryList(List *columnList);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
@@ -163,12 +186,6 @@ static MultiTable * MultiSubqueryPushdownTable(Query *subquery);
  * plan and adds a root node to top of it. The  original query is only used for subquery
  * pushdown planning.
  *
- * In order to support external parameters for the queries where planning
- * is done on the original query, we need to replace the external parameters
- * manually. To achive that for subquery pushdown planning, we pass boundParams
- * to this function. We need to do that since Citus currently unable to send
- * parameters to the workers on the execution.
- *
  * We also pass queryTree and plannerRestrictionContext to the planner. They
  * are primarily used to decide whether the subquery is safe to pushdown.
  * If not, it helps to produce meaningful error messages for subquery
@@ -176,32 +193,19 @@ static MultiTable * MultiSubqueryPushdownTable(Query *subquery);
  */
 MultiTreeRoot *
 MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
-					   PlannerRestrictionContext *plannerRestrictionContext,
-					   ParamListInfo boundParams)
+					   PlannerRestrictionContext *plannerRestrictionContext)
 {
 	MultiNode *multiQueryNode = NULL;
 	MultiTreeRoot *rootNode = NULL;
 
-	/*
-	 * We check the existence of subqueries in FROM clause on the modified query
-	 * given that if postgres already flattened the subqueries, MultiPlanTree()
-	 * can plan corresponding distributed plan.
-	 *
-	 * We also check the existence of subqueries in WHERE clause. Note that
-	 * this check needs to be done on the original query given that
-	 * standard_planner() may replace the sublinks with anti/semi joins and
-	 * MultiPlanTree() cannot plan such queries.
-	 */
-	if (SubqueryEntryList(queryTree) != NIL || SublinkList(originalQuery) != NIL)
+	if (ShouldUseSubqueryPushDown(originalQuery, queryTree))
 	{
-		originalQuery = (Query *) ResolveExternalParams((Node *) originalQuery,
-														boundParams);
-		multiQueryNode = MultiSubqueryPlanTree(originalQuery, queryTree,
+		multiQueryNode = SubqueryMultiNodeTree(originalQuery, queryTree,
 											   plannerRestrictionContext);
 	}
 	else
 	{
-		multiQueryNode = MultiPlanTree(queryTree);
+		multiQueryNode = MultiNodeTree(queryTree);
 	}
 
 	/* add a root node to serve as the permanent handle to the tree */
@@ -213,95 +217,109 @@ MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 
 
 /*
- * ResolveExternalParams replaces the external parameters that appears
- * in the query with the corresponding entries in the boundParams.
- *
- * Note that this function is inspired by eval_const_expr() on Postgres.
- * We cannot use that function because it requires access to PlannerInfo.
+ * ShouldUseSubqueryPushDown determines whether it's desirable to use
+ * subquery pushdown to plan the query based on the original and
+ * rewritten query.
  */
-static Node *
-ResolveExternalParams(Node *inputNode, ParamListInfo boundParams)
+static bool
+ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 {
-	/* consider resolving external parameters only when boundParams exists */
-	if (!boundParams)
+	List *qualifierList = NIL;
+
+	/*
+	 * We check the existence of subqueries in FROM clause on the modified query
+	 * given that if postgres already flattened the subqueries, MultiPlanTree()
+	 * can plan corresponding distributed plan.
+	 */
+	if (SubqueryEntryList(rewrittenQuery) != NIL)
 	{
-		return inputNode;
+		return true;
 	}
 
-	if (inputNode == NULL)
+	/*
+	 * We also check the existence of subqueries in WHERE clause. Note that
+	 * this check needs to be done on the original query given that
+	 * standard_planner() may replace the sublinks with anti/semi joins and
+	 * MultiPlanTree() cannot plan such queries.
+	 */
+	if (SublinkList(originalQuery) != NIL)
 	{
-		return NULL;
+		return true;
 	}
 
-	if (IsA(inputNode, Param))
+	/*
+	 * We process function RTEs as subqueries, since the join order planner
+	 * does not know how to handle them.
+	 */
+	if (FindNodeCheck((Node *) originalQuery, IsFunctionRTE))
 	{
-		Param *paramToProcess = (Param *) inputNode;
-		ParamExternData *correspondingParameterData = NULL;
-		int numberOfParameters = boundParams->numParams;
-		int parameterId = paramToProcess->paramid;
-		int16 typeLength = 0;
-		bool typeByValue = false;
-		Datum constValue = 0;
-		bool paramIsNull = false;
-		int parameterIndex = 0;
-
-		if (paramToProcess->paramkind != PARAM_EXTERN)
-		{
-			return inputNode;
-		}
-
-		if (parameterId < 0)
-		{
-			return inputNode;
-		}
-
-		/* parameterId starts from 1 */
-		parameterIndex = parameterId - 1;
-		if (parameterIndex >= numberOfParameters)
-		{
-			return inputNode;
-		}
-
-		correspondingParameterData = &boundParams->params[parameterIndex];
-
-		if (!(correspondingParameterData->pflags & PARAM_FLAG_CONST))
-		{
-			return inputNode;
-		}
-
-		get_typlenbyval(paramToProcess->paramtype, &typeLength, &typeByValue);
-
-		paramIsNull = correspondingParameterData->isnull;
-		if (paramIsNull)
-		{
-			constValue = 0;
-		}
-		else if (typeByValue)
-		{
-			constValue = correspondingParameterData->value;
-		}
-		else
-		{
-			/*
-			 * Out of paranoia ensure that datum lives long enough,
-			 * although bind params currently should always live
-			 * long enough.
-			 */
-			constValue = datumCopy(correspondingParameterData->value, typeByValue,
-								   typeLength);
-		}
-
-		return (Node *) makeConst(paramToProcess->paramtype, paramToProcess->paramtypmod,
-								  paramToProcess->paramcollid, typeLength, constValue,
-								  paramIsNull, typeByValue);
-	}
-	else if (IsA(inputNode, Query))
-	{
-		return (Node *) query_tree_mutator((Query *) inputNode, ResolveExternalParams,
-										   boundParams, 0);
+		return true;
 	}
 
-	return expression_tree_mutator(inputNode, ResolveExternalParams, boundParams);
+	/*
+	 * Some unsupported join clauses in logical planner
+	 * may be supported by subquery pushdown planner.
+	 */
+	qualifierList = QualifierList(rewrittenQuery->jointree);
+	if (DeferErrorIfUnsupportedClause(qualifierList) != NULL)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * IsFunctionRTE determines whether the given node is a function RTE.
+ */
+static bool
+IsFunctionRTE(Node *node)
+{
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rangeTblEntry = (RangeTblEntry *) node;
+
+		if (rangeTblEntry->rtekind == RTE_FUNCTION)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * FindNodeCheck finds a node for which the check function returns true.
+ *
+ * To call this function directly with an RTE, use:
+ * range_table_walker(rte, FindNodeCheck, check, QTW_EXAMINE_RTES)
+ */
+static bool
+FindNodeCheck(Node *node, bool (*check)(Node *))
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (check(node))
+	{
+		return true;
+	}
+
+	if (IsA(node, RangeTblEntry))
+	{
+		/* query_tree_walker descends into RTEs */
+		return false;
+	}
+	else if (IsA(node, Query))
+	{
+		return query_tree_walker((Query *) node, FindNodeCheck, check, QTW_EXAMINE_RTES);
+	}
+
+	return expression_tree_walker(node, FindNodeCheck, check);
 }
 
 
@@ -357,7 +375,7 @@ ExtractSublinkWalker(Node *node, List **sublinkList)
 
 
 /*
- * MultiSubqueryPlanTree gets the query objects and returns logical plan
+ * SubqueryMultiNodeTree gets the query objects and returns logical plan
  * for subqueries.
  *
  * We currently have two different code paths for creating logic plan for subqueries:
@@ -376,17 +394,22 @@ ExtractSublinkWalker(Node *node, List **sublinkList)
  *                - If found errors, throw it
  */
 static MultiNode *
-MultiSubqueryPlanTree(Query *originalQuery, Query *queryTree,
+SubqueryMultiNodeTree(Query *originalQuery, Query *queryTree,
 					  PlannerRestrictionContext *plannerRestrictionContext)
 {
 	MultiNode *multiQueryNode = NULL;
 	DeferredErrorMessage *subqueryPushdownError = NULL;
+	DeferredErrorMessage *unsupportedQueryError = NULL;
 
 	/*
 	 * This is a generic error check that applies to both subquery pushdown
 	 * and single table repartition subquery.
 	 */
-	ErrorIfQueryNotSupported(originalQuery);
+	unsupportedQueryError = DeferErrorIfQueryNotSupported(originalQuery);
+	if (unsupportedQueryError != NULL)
+	{
+		RaiseDeferredError(unsupportedQueryError, ERROR);
+	}
 
 	/*
 	 * In principle, we're first trying subquery pushdown planner. If it fails
@@ -397,7 +420,7 @@ MultiSubqueryPlanTree(Query *originalQuery, Query *queryTree,
 																	plannerRestrictionContext);
 	if (!subqueryPushdownError)
 	{
-		multiQueryNode = SubqueryPushdownMultiPlanTree(originalQuery);
+		multiQueryNode = SubqueryPushdownMultiNodeTree(originalQuery);
 	}
 	else if (subqueryPushdownError)
 	{
@@ -431,7 +454,7 @@ MultiSubqueryPlanTree(Query *originalQuery, Query *queryTree,
 		}
 
 		/* all checks has passed, safe to create the multi plan */
-		multiQueryNode = MultiPlanTree(queryTree);
+		multiQueryNode = MultiNodeTree(queryTree);
 	}
 
 	Assert(multiQueryNode != NULL);
@@ -447,12 +470,13 @@ MultiSubqueryPlanTree(Query *originalQuery, Query *queryTree,
  *   - Only a single RTE_RELATION exists, which means only a single table
  *     name is specified on the whole query
  *   - No sublinks exists in the subquery
+ *   - No window functions in the subquery
  *
  * Note that the caller should still call DeferErrorIfUnsupportedSubqueryRepartition()
  * to ensure that Citus supports the subquery. Also, this function is designed to run
  * on the original query.
  */
-static bool
+bool
 SingleRelationRepartitionSubquery(Query *queryTree)
 {
 	List *rangeTableIndexList = NULL;
@@ -462,6 +486,12 @@ SingleRelationRepartitionSubquery(Query *queryTree)
 
 	/* we don't support subqueries in WHERE */
 	if (queryTree->hasSubLinks)
+	{
+		return false;
+	}
+
+	/* we don't support window functions */
+	if (queryTree->hasWindowFuncs)
 	{
 		return false;
 	}
@@ -510,8 +540,6 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 	ListCell *subqueryCell = NULL;
 	List *subqueryList = NIL;
 	DeferredErrorMessage *error = NULL;
-	RelationRestrictionContext *relationRestrictionContext =
-		plannerRestrictionContext->relationRestrictionContext;
 
 	if (originalQuery->limitCount != NULL)
 	{
@@ -526,42 +554,38 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 	 */
 	if (ContainsUnionSubquery(originalQuery))
 	{
-		if (!SafeToPushdownUnionSubquery(relationRestrictionContext))
+		if (!SafeToPushdownUnionSubquery(plannerRestrictionContext))
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "cannot pushdown the subquery since all leaves of "
-								 "the UNION does not include partition key at the "
-								 "same position",
-								 "Each leaf query of the UNION should return "
-								 "partition key at the same position on its "
-								 "target list.", NULL);
+								 "cannot pushdown the subquery since not all subqueries "
+								 "in the UNION have the partition column in the same "
+								 "position",
+								 "Each leaf query of the UNION should return the "
+								 "partition column in the same position and all joins "
+								 "must be on the partition column",
+								 NULL);
 		}
 	}
 	else if (!RestrictionEquivalenceForPartitionKeys(plannerRestrictionContext))
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "cannot pushdown the subquery since all relations are not "
-							 "joined using distribution keys",
-							 "Each relation should be joined with at least "
-							 "one another relation using distribution keys and "
-							 "equality operator.", NULL);
+							 "complex joins are only supported when all distributed tables are "
+							 "joined on their distribution columns with equal operator",
+							 NULL, NULL);
 	}
 
 	/* we shouldn't allow reference tables in the FROM clause when the query has sublinks */
-	error = DeferErrorIfUnsupportedSublinkAndReferenceTable(originalQuery);
+	error = DeferErrorIfFromClauseRecurs(originalQuery);
 	if (error)
 	{
 		return error;
 	}
 
 	/* we shouldn't allow reference tables in the outer part of outer joins */
-	if (HasUnsupportedReferenceTableJoin(plannerRestrictionContext))
+	error = DeferredErrorIfUnsupportedRecurringTuplesJoin(plannerRestrictionContext);
+	if (error)
 	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "cannot pushdown the subquery",
-							 "There exist a reference table in the outer part of the "
-							 "outer join",
-							 NULL);
+		return error;
 	}
 
 	/*
@@ -583,12 +607,6 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 		{
 			return error;
 		}
-
-		error = DeferErrorIfUnsupportedFilters(subquery);
-		if (error)
-		{
-			return error;
-		}
 	}
 
 	return NULL;
@@ -596,162 +614,299 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 
 
 /*
- * DeferErrorIfUnsupportedSublinkAndReferenceTable returns a deferred error if the
+ * FilterPlannerRestrictionForQuery gets a planner restriction context and
+ * set of rte identities. It returns the restrictions that that appear
+ * in the queryRteIdentities and returns a newly allocated
+ * PlannerRestrictionContext. The function also sets all the other fields of
+ * the PlannerRestrictionContext with respect to the filtered restrictions.
+ */
+PlannerRestrictionContext *
+FilterPlannerRestrictionForQuery(PlannerRestrictionContext *plannerRestrictionContext,
+								 Query *query)
+{
+	PlannerRestrictionContext *filteredPlannerRestrictionContext = NULL;
+	int referenceRelationCount = 0;
+	int totalRelationCount = 0;
+
+	Relids queryRteIdentities = QueryRteIdentities(query);
+
+	RelationRestrictionContext *relationRestrictionContext =
+		plannerRestrictionContext->relationRestrictionContext;
+	JoinRestrictionContext *joinRestrictionContext =
+		plannerRestrictionContext->joinRestrictionContext;
+
+	RelationRestrictionContext *filteredRelationRestrictionContext =
+		FilterRelationRestrictionContext(relationRestrictionContext, queryRteIdentities);
+
+	JoinRestrictionContext *filtererdJoinRestrictionContext =
+		FilterJoinRestrictionContext(joinRestrictionContext, queryRteIdentities);
+
+	/* allocate the filtered planner restriction context and set all the fields */
+	filteredPlannerRestrictionContext = palloc0(sizeof(PlannerRestrictionContext));
+
+	filteredPlannerRestrictionContext->memoryContext =
+		plannerRestrictionContext->memoryContext;
+
+	totalRelationCount = list_length(
+		filteredRelationRestrictionContext->relationRestrictionList);
+	referenceRelationCount = ReferenceRelationCount(filteredRelationRestrictionContext);
+
+	filteredRelationRestrictionContext->allReferenceTables =
+		(totalRelationCount == referenceRelationCount);
+
+	/* we currently don't support local relations and we cannot come up to this point */
+	filteredRelationRestrictionContext->hasLocalRelation = false;
+	filteredRelationRestrictionContext->hasDistributedRelation = true;
+
+	/* finally set the relation and join restriction contexts */
+	filteredPlannerRestrictionContext->relationRestrictionContext =
+		filteredRelationRestrictionContext;
+	filteredPlannerRestrictionContext->joinRestrictionContext =
+		filtererdJoinRestrictionContext;
+
+	return filteredPlannerRestrictionContext;
+}
+
+
+/*
+ * FilterRelationRestrictionContext gets a relation restriction context and
+ * set of rte identities. It returns the relation restrictions that that appear
+ * in the queryRteIdentities and returns a newly allocated
+ * RelationRestrictionContext.
+ */
+static RelationRestrictionContext *
+FilterRelationRestrictionContext(RelationRestrictionContext *relationRestrictionContext,
+								 Relids queryRteIdentities)
+{
+	RelationRestrictionContext *filteredRestrictionContext =
+		palloc0(sizeof(RelationRestrictionContext));
+
+	ListCell *relationRestrictionCell = NULL;
+
+	foreach(relationRestrictionCell, relationRestrictionContext->relationRestrictionList)
+	{
+		RelationRestriction *relationRestriction =
+			(RelationRestriction *) lfirst(relationRestrictionCell);
+
+		int rteIdentity = GetRTEIdentity(relationRestriction->rte);
+
+		if (bms_is_member(rteIdentity, queryRteIdentities))
+		{
+			filteredRestrictionContext->relationRestrictionList =
+				lappend(filteredRestrictionContext->relationRestrictionList,
+						relationRestriction);
+		}
+	}
+
+	return filteredRestrictionContext;
+}
+
+
+/*
+ * FilterJoinRestrictionContext gets a join restriction context and
+ * set of rte identities. It returns the join restrictions that that appear
+ * in the queryRteIdentities and returns a newly allocated
+ * JoinRestrictionContext.
+ *
+ * Note that the join restriction is added to the return context as soon as
+ * any range table entry that appear in the join belongs to queryRteIdentities.
+ */
+static JoinRestrictionContext *
+FilterJoinRestrictionContext(JoinRestrictionContext *joinRestrictionContext, Relids
+							 queryRteIdentities)
+{
+	JoinRestrictionContext *filtererdJoinRestrictionContext =
+		palloc0(sizeof(JoinRestrictionContext));
+
+	ListCell *joinRestrictionCell = NULL;
+
+	foreach(joinRestrictionCell, joinRestrictionContext->joinRestrictionList)
+	{
+		JoinRestriction *joinRestriction =
+			(JoinRestriction *) lfirst(joinRestrictionCell);
+		RangeTblEntry **rangeTableEntries =
+			joinRestriction->plannerInfo->simple_rte_array;
+		int rangeTableArrayLength = joinRestriction->plannerInfo->simple_rel_array_size;
+
+		if (RangeTableArrayContainsAnyRTEIdentities(rangeTableEntries,
+													rangeTableArrayLength,
+													queryRteIdentities))
+		{
+			filtererdJoinRestrictionContext->joinRestrictionList = lappend(
+				filtererdJoinRestrictionContext->joinRestrictionList,
+				joinRestriction);
+		}
+	}
+
+	return filtererdJoinRestrictionContext;
+}
+
+
+/*
+ * RangeTableArrayContainsAnyRTEIdentities returns true if any of the range table entries
+ * int rangeTableEntries array is an range table relation specified in queryRteIdentities.
+ */
+static bool
+RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
+										rangeTableArrayLength, Relids queryRteIdentities)
+{
+	int rteIndex = 0;
+
+	/* simple_rte_array starts from 1, see plannerInfo struct */
+	for (rteIndex = 1; rteIndex < rangeTableArrayLength; ++rteIndex)
+	{
+		RangeTblEntry *rangeTableEntry = rangeTableEntries[rteIndex];
+		List *rangeTableRelationList = NULL;
+		ListCell *rteRelationCell = NULL;
+
+		/*
+		 * Get list of all RTE_RELATIONs in the given range table entry
+		 * (i.e.,rangeTableEntry could be a subquery where we're interested
+		 * in relations).
+		 */
+		ExtractRangeTableRelationWalker((Node *) rangeTableEntry,
+										&rangeTableRelationList);
+
+		foreach(rteRelationCell, rangeTableRelationList)
+		{
+			RangeTblEntry *rteRelation = (RangeTblEntry *) lfirst(rteRelationCell);
+			int rteIdentity = 0;
+
+			Assert(rteRelation->rtekind == RTE_RELATION);
+
+			rteIdentity = GetRTEIdentity(rteRelation);
+			if (bms_is_member(rteIdentity, queryRteIdentities))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * QueryRteIdentities gets a queryTree, find get all the rte identities assigned by
+ * us.
+ */
+static Relids
+QueryRteIdentities(Query *queryTree)
+{
+	List *rangeTableList = NULL;
+	ListCell *rangeTableCell = NULL;
+	Relids queryRteIdentities = NULL;
+
+	/* extract range table entries for simple relations only */
+	ExtractRangeTableRelationWalker((Node *) queryTree, &rangeTableList);
+
+	foreach(rangeTableCell, rangeTableList)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+		int rteIdentity = 0;
+
+		/* we're only interested in relations */
+		Assert(rangeTableEntry->rtekind == RTE_RELATION);
+
+		rteIdentity = GetRTEIdentity(rangeTableEntry);
+
+		queryRteIdentities = bms_add_member(queryRteIdentities, rteIdentity);
+	}
+
+	return queryRteIdentities;
+}
+
+
+/*
+ * DeferErrorIfFromClauseRecurs returns a deferred error if the
  * given query is not suitable for subquery pushdown.
  *
  * While planning sublinks, we rely on Postgres in the sense that it converts some of
  * sublinks into joins.
  *
  * In some cases, sublinks are pulled up and converted into outer joins. Those cases
- * are already handled with HasUnsupportedReferenceTableJoin().
+ * are already handled with DeferredErrorIfUnsupportedRecurringTuplesJoin().
  *
- * If the sublinks are not pulled up, we should still error out in if any reference table
- * appears in the FROM clause of a subquery.
+ * If the sublinks are not pulled up, we should still error out in if the expression
+ * in the FROM clause would recur for every shard in a subquery on the WHERE clause.
  *
  * Otherwise, the result would include duplicate rows.
  */
 static DeferredErrorMessage *
-DeferErrorIfUnsupportedSublinkAndReferenceTable(Query *queryTree)
+DeferErrorIfFromClauseRecurs(Query *queryTree)
 {
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
+
 	if (!queryTree->hasSubLinks)
 	{
 		return NULL;
 	}
 
-	if (HasReferenceTable((Node *) queryTree->rtable))
+	if (FindNodeCheckInRangeTableList(queryTree->rtable, IsDistributedTableRTE))
+	{
+		/*
+		 * There is a distributed table somewhere in the FROM clause.
+		 *
+		 * In the typical case this means that the query does not recur,
+		 * but there are two exceptions:
+		 *
+		 * - outer joins such as reference_table LEFT JOIN distributed_table
+		 * - FROM reference_table WHERE .. (SELECT .. FROM distributed_table) ..
+		 *
+		 * However, we check all subqueries and joins separately, so we would
+		 * find such conditions in other calls.
+		 */
+		return NULL;
+	}
+
+
+	/*
+	 * Try to figure out which type of recurring tuples we have to produce a
+	 * relevant error message. If there are several we'll pick the first one.
+	 */
+	IsRecurringRangeTable(queryTree->rtable, &recurType);
+
+	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "cannot pushdown the subquery",
 							 "Reference tables are not allowed in FROM "
 							 "clause when the query has subqueries in "
-							 "WHERE clause",
-							 NULL);
+							 "WHERE clause", NULL);
 	}
-
-	return NULL;
-}
-
-
-/*
- * DeferErrorIfUnsupportedFilters checks if all leaf queries in the given query have
- * same filter on the partition column. Note that if there are queries without
- * any filter on the partition column, they don't break this prerequisite.
- */
-static DeferredErrorMessage *
-DeferErrorIfUnsupportedFilters(Query *subquery)
-{
-	List *queryList = NIL;
-	ListCell *queryCell = NULL;
-	List *subqueryOpExpressionList = NIL;
-	List *relationIdList = RelationIdList(subquery);
-	Var *partitionColumn = NULL;
-	Oid relationId = InvalidOid;
-
-	/*
-	 * If there are no appropriate relations, we're going to error out on
-	 * DeferErrorIfCannotPushdownSubquery(). It may happen once the subquery
-	 * does not include a relation.
-	 */
-	if (relationIdList == NIL)
+	else if (recurType == RECURRING_TUPLES_FUNCTION)
 	{
-		return NULL;
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "Functions are not allowed in FROM "
+							 "clause when the query has subqueries in "
+							 "WHERE clause", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_RESULT_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "Complex subqueries and CTEs are not allowed in "
+							 "the FROM clause when the query has subqueries in the "
+							 "WHERE clause", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_EMPTY_JOIN_TREE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "Subqueries without FROM are not allowed in FROM "
+							 "clause when the outer query has subqueries in "
+							 "WHERE clause", NULL);
 	}
 
 	/*
-	 * Get relation id of any relation in the subquery and create partiton column
-	 * for this relation. We will use this column to replace columns on operator
-	 * expressions on different tables. Then we compare these operator expressions
-	 * to see if they consist of same operator and constant value.
+	 * We get here when there is neither a distributed table, nor recurring tuples.
+	 * That usually means that there isn't a FROM at all (only sublinks), this
+	 * implies that queryTree is recurring, but whether this is a problem depends
+	 * on outer queries, not on queryTree itself.
 	 */
-	relationId = linitial_oid(relationIdList);
-	partitionColumn = PartitionColumn(relationId, 0);
-
-	ExtractQueryWalker((Node *) subquery, &queryList);
-	foreach(queryCell, queryList)
-	{
-		Query *query = (Query *) lfirst(queryCell);
-		List *opExpressionList = NIL;
-		List *newOpExpressionList = NIL;
-
-		bool leafQuery = LeafQuery(query);
-		if (!leafQuery)
-		{
-			continue;
-		}
-
-		opExpressionList = PartitionColumnOpExpressionList(query);
-		if (opExpressionList == NIL)
-		{
-			continue;
-		}
-
-		newOpExpressionList = ReplaceColumnsInOpExpressionList(opExpressionList,
-															   partitionColumn);
-
-		if (subqueryOpExpressionList == NIL)
-		{
-			subqueryOpExpressionList = newOpExpressionList;
-		}
-		else
-		{
-			bool equalOpExpressionLists = EqualOpExpressionLists(subqueryOpExpressionList,
-																 newOpExpressionList);
-			if (!equalOpExpressionLists)
-			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "cannot push down this subquery",
-									 "Currently all leaf queries need to "
-									 "have same filters on partition column", NULL);
-			}
-		}
-	}
 
 	return NULL;
-}
-
-
-/*
- * EqualOpExpressionLists checks if given two operator expression lists are
- * equal.
- */
-static bool
-EqualOpExpressionLists(List *firstOpExpressionList, List *secondOpExpressionList)
-{
-	bool equalOpExpressionLists = false;
-	ListCell *firstOpExpressionCell = NULL;
-	uint32 equalOpExpressionCount = 0;
-	uint32 firstOpExpressionCount = list_length(firstOpExpressionList);
-	uint32 secondOpExpressionCount = list_length(secondOpExpressionList);
-
-	if (firstOpExpressionCount != secondOpExpressionCount)
-	{
-		return false;
-	}
-
-	foreach(firstOpExpressionCell, firstOpExpressionList)
-	{
-		OpExpr *firstOpExpression = (OpExpr *) lfirst(firstOpExpressionCell);
-		ListCell *secondOpExpressionCell = NULL;
-
-		foreach(secondOpExpressionCell, secondOpExpressionList)
-		{
-			OpExpr *secondOpExpression = (OpExpr *) lfirst(secondOpExpressionCell);
-			bool equalExpressions = equal(firstOpExpression, secondOpExpression);
-
-			if (equalExpressions)
-			{
-				equalOpExpressionCount++;
-				continue;
-			}
-		}
-	}
-
-	if (equalOpExpressionCount == firstOpExpressionCount)
-	{
-		equalOpExpressionLists = true;
-	}
-
-	return equalOpExpressionLists;
 }
 
 
@@ -767,7 +922,7 @@ EqualOpExpressionLists(List *firstOpExpressionList, List *secondOpExpressionList
  * the join condition must be partition columns.
  * c. If there is a distinct clause, it must be on the partition column.
  *
- * This function is very similar to ErrorIfQueryNotSupported() in logical
+ * This function is very similar to DeferErrorIfQueryNotSupported() in logical
  * planner, but we don't reuse it, because differently for subqueries we support
  * a subset of distinct, union and left joins.
  *
@@ -777,11 +932,12 @@ EqualOpExpressionLists(List *firstOpExpressionList, List *secondOpExpressionList
  * limit, we let this query to run, but results could be wrong depending on the
  * features of underlying tables.
  */
-static DeferredErrorMessage *
+DeferredErrorMessage *
 DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLimit)
 {
 	bool preconditionsSatisfied = true;
 	char *errorDetail = NULL;
+	StringInfo errorInfo = NULL;
 	DeferredErrorMessage *deferredError = NULL;
 
 	deferredError = DeferErrorIfUnsupportedTableCombination(subqueryTree);
@@ -790,29 +946,27 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		return deferredError;
 	}
 
-	if (subqueryTree->rtable == NIL)
+	if (subqueryTree->rtable == NIL &&
+		contain_mutable_functions((Node *) subqueryTree->targetList))
 	{
 		preconditionsSatisfied = false;
-		errorDetail = "Subqueries without relations are unsupported";
-	}
-
-	if (subqueryTree->hasWindowFuncs)
-	{
-		preconditionsSatisfied = false;
-		errorDetail = "Window functions are currently unsupported";
+		errorDetail = "Subqueries without a FROM clause can only contain immutable "
+					  "functions";
 	}
 
 	if (subqueryTree->limitOffset)
 	{
 		preconditionsSatisfied = false;
-		errorDetail = "Offset clause is currently unsupported";
+		errorDetail = "Offset clause is currently unsupported when a subquery "
+					  "references a column from another query";
 	}
 
 	/* limit is not supported when SubqueryPushdown is not set */
 	if (subqueryTree->limitCount && !SubqueryPushdown)
 	{
 		preconditionsSatisfied = false;
-		errorDetail = "Limit in subquery is currently unsupported";
+		errorDetail = "Limit in subquery is currently unsupported when a "
+					  "subquery references a column from another query";
 	}
 
 	/*
@@ -828,8 +982,7 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 
 	if (subqueryTree->setOperations)
 	{
-		deferredError = DeferErrorIfUnsupportedUnionQuery(subqueryTree,
-														  outerMostQueryHasLimit);
+		deferredError = DeferErrorIfUnsupportedUnionQuery(subqueryTree);
 		if (deferredError)
 		{
 			return deferredError;
@@ -867,15 +1020,28 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		{
 			preconditionsSatisfied = false;
 			errorDetail = "Group by list without partition column is currently "
-						  "unsupported";
+						  "unsupported when a subquery references a column "
+						  "from another query";
 		}
+	}
+
+	/*
+	 * We support window functions when the window function
+	 * is partitioned on distribution column.
+	 */
+	if (subqueryTree->windowClause && !SafeToPushdownWindowFunction(subqueryTree,
+																	&errorInfo))
+	{
+		errorDetail = (char *) errorInfo->data;
+		preconditionsSatisfied = false;
 	}
 
 	/* we don't support aggregates without group by */
 	if (subqueryTree->hasAggs && (subqueryTree->groupClause == NULL))
 	{
 		preconditionsSatisfied = false;
-		errorDetail = "Aggregates without group by are currently unsupported";
+		errorDetail = "Aggregates without group by are currently unsupported "
+					  "when a subquery references a column from another query";
 	}
 
 	/* having clause without group by on partition column is not supported */
@@ -883,7 +1049,8 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 	{
 		preconditionsSatisfied = false;
 		errorDetail = "Having qual without group by on partition column is "
-					  "currently unsupported";
+					  "currently unsupported when a subquery references "
+					  "a column from another query";
 	}
 
 	/* distinct clause list must include partition column */
@@ -903,7 +1070,7 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		}
 	}
 
-	deferredError = DeferErrorIfUnsupportedSublinkAndReferenceTable(subqueryTree);
+	deferredError = DeferErrorIfFromClauseRecurs(subqueryTree);
 	if (deferredError)
 	{
 		preconditionsSatisfied = false;
@@ -927,12 +1094,12 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
  * DeferErrorIfUnsupportedUnionQuery is a helper function for ErrorIfCannotPushdownSubquery().
  * The function also errors out for set operations INTERSECT and EXCEPT.
  */
-static DeferredErrorMessage *
-DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree,
-								  bool outerMostQueryHasLimit)
+DeferredErrorMessage *
+DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree)
 {
 	List *setOperationStatementList = NIL;
 	ListCell *setOperationStatmentCell = NULL;
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
 
 	ExtractSetOperationStatmentWalker((Node *) subqueryTree->setOperations,
 									  &setOperationStatementList);
@@ -958,12 +1125,9 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree,
 			leftArgRTI = ((RangeTblRef *) leftArg)->rtindex;
 			leftArgSubquery = (Node *) rt_fetch(leftArgRTI,
 												subqueryTree->rtable)->subquery;
-			if (HasReferenceTable(leftArgSubquery))
+			if (HasRecurringTuples(leftArgSubquery, &recurType))
 			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "cannot push down this subquery ",
-									 "Reference tables are not supported with union"
-									 " operator", NULL);
+				break;
 			}
 		}
 
@@ -973,15 +1137,42 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree,
 			rightArgRTI = ((RangeTblRef *) rightArg)->rtindex;
 			rightArgSubquery = (Node *) rt_fetch(rightArgRTI,
 												 subqueryTree->rtable)->subquery;
-			if (HasReferenceTable(rightArgSubquery))
+			if (HasRecurringTuples(rightArgSubquery, &recurType))
 			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "cannot push down this subquery",
-									 "Reference tables are not supported with union"
-									 " operator", NULL);
+				break;
 			}
 		}
 	}
+
+	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot push down this subquery",
+							 "Reference tables are not supported with union operator",
+							 NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot push down this subquery",
+							 "Table functions are not supported with union operator",
+							 NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_EMPTY_JOIN_TREE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot push down this subquery",
+							 "Subqueries without a FROM clause are not supported with "
+							 "union operator", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_RESULT_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot push down this subquery",
+							 "Complex subqueries and CTEs are not supported within a "
+							 "UNION", NULL);
+	}
+
 
 	return NULL;
 }
@@ -1028,16 +1219,15 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 	List *rangeTableList = queryTree->rtable;
 	List *joinTreeTableIndexList = NIL;
 	ListCell *joinTreeTableIndexCell = NULL;
-	bool unsupporteTableCombination = false;
+	bool unsupportedTableCombination = false;
 	char *errorDetail = NULL;
-	uint32 relationRangeTableCount = 0;
-	uint32 subqueryRangeTableCount = 0;
 
 	/*
 	 * Extract all range table indexes from the join tree. Note that sub-queries
 	 * that get pulled up by PostgreSQL don't appear in this join tree.
 	 */
 	ExtractRangeTableIndexWalker((Node *) queryTree->jointree, &joinTreeTableIndexList);
+
 	foreach(joinTreeTableIndexCell, joinTreeTableIndexList)
 	{
 		/*
@@ -1051,28 +1241,61 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 			(RangeTblEntry *) list_nth(rangeTableList, rangeTableListIndex);
 
 		/*
-		 * Check if the range table in the join tree is a simple relation or a
-		 * subquery.
+		 * Check if the range table in the join tree is a simple relation, a
+		 * subquery, or immutable function.
 		 */
-		if (rangeTableEntry->rtekind == RTE_RELATION)
+		if (rangeTableEntry->rtekind == RTE_RELATION ||
+			rangeTableEntry->rtekind == RTE_SUBQUERY)
 		{
-			relationRangeTableCount++;
+			/* accepted */
 		}
-		else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
+		else if (rangeTableEntry->rtekind == RTE_FUNCTION)
 		{
-			subqueryRangeTableCount++;
+			List *functionList = rangeTableEntry->functions;
+
+			if (list_length(functionList) == 1 &&
+				ContainsReadIntermediateResultFunction(linitial(functionList)))
+			{
+				/*
+				 * The read_intermediate_result function is volatile, but we know
+				 * it has the same result across all nodes and can therefore treat
+				 * it as a reference table.
+				 */
+			}
+			else if (contain_mutable_functions((Node *) functionList))
+			{
+				unsupportedTableCombination = true;
+				errorDetail = "Only immutable functions can be used as a table "
+							  "expressions in a multi-shard query";
+			}
+			else
+			{
+				/* immutable function RTEs are treated as reference tables */
+			}
+		}
+		else if (rangeTableEntry->rtekind == RTE_CTE)
+		{
+			unsupportedTableCombination = true;
+			errorDetail = "CTEs in subqueries are currently unsupported";
+			break;
+		}
+		else if (rangeTableEntry->rtekind == RTE_VALUES)
+		{
+			unsupportedTableCombination = true;
+			errorDetail = "VALUES in multi-shard queries is currently unsupported";
+			break;
 		}
 		else
 		{
-			unsupporteTableCombination = true;
-			errorDetail = "Table expressions other than simple relations and "
-						  "subqueries are currently unsupported";
+			unsupportedTableCombination = true;
+			errorDetail = "Table expressions other than relations, subqueries, "
+						  "and immutable functions are currently unsupported";
 			break;
 		}
 	}
 
 	/* finally check and error out if not satisfied */
-	if (unsupporteTableCombination)
+	if (unsupportedTableCombination)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "cannot push down this subquery",
@@ -1084,10 +1307,90 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 
 
 /*
+ * SafeToPushdownWindowFunction checks if the query with window function is supported.
+ * It returns the result accordingly and modifies the error detail.
+ */
+bool
+SafeToPushdownWindowFunction(Query *query, StringInfo *errorDetail)
+{
+	ListCell *windowClauseCell = NULL;
+	List *windowClauseList = query->windowClause;
+
+	/*
+	 * We need to check each window clause separately if there is a partition by clause
+	 * and if it is partitioned on the distribution column.
+	 */
+	foreach(windowClauseCell, windowClauseList)
+	{
+		WindowClause *windowClause = lfirst(windowClauseCell);
+
+		if (!windowClause->partitionClause)
+		{
+			*errorDetail = makeStringInfo();
+			appendStringInfoString(*errorDetail,
+								   "Window functions without PARTITION BY on distribution "
+								   "column is currently unsupported");
+			return false;
+		}
+	}
+
+	if (!WindowPartitionOnDistributionColumn(query))
+	{
+		*errorDetail = makeStringInfo();
+		appendStringInfoString(*errorDetail,
+							   "Window functions with PARTITION BY list missing distribution "
+							   "column is currently unsupported");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * WindowPartitionOnDistributionColumn checks if the given subquery has one
+ * or more window functions and at least one of them is not partitioned by
+ * distribution column. The function returns false if your window function does not
+ * have a partition by clause or it does not include the distribution column.
+ *
+ * Please note that if the query does not have a window function, the function
+ * returns true.
+ */
+static bool
+WindowPartitionOnDistributionColumn(Query *query)
+{
+	List *windowClauseList = query->windowClause;
+	ListCell *windowClauseCell = NULL;
+
+	foreach(windowClauseCell, windowClauseList)
+	{
+		WindowClause *windowClause = lfirst(windowClauseCell);
+		List *groupTargetEntryList = NIL;
+		bool partitionOnDistributionColumn = false;
+		List *partitionClauseList = windowClause->partitionClause;
+		List *targetEntryList = query->targetList;
+
+		groupTargetEntryList =
+			GroupTargetEntryList(partitionClauseList, targetEntryList);
+
+		partitionOnDistributionColumn =
+			TargetListOnPartitionColumn(query, groupTargetEntryList);
+
+		if (!partitionOnDistributionColumn)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * TargetListOnPartitionColumn checks if at least one target list entry is on
  * partition column.
  */
-static bool
+bool
 TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 {
 	bool targetListOnPartitionColumn = false;
@@ -1141,7 +1444,137 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 		}
 	}
 
+	/*
+	 * We could still behave as if the target list is on partition column if
+	 * all range table entries are reference tables or intermediate results,
+	 * and all target expressions are column references to the given query level.
+	 */
+	if (!targetListOnPartitionColumn)
+	{
+		if (!FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE) &&
+			AllTargetExpressionsAreColumnReferences(targetEntryList))
+		{
+			targetListOnPartitionColumn = true;
+		}
+	}
+
 	return targetListOnPartitionColumn;
+}
+
+
+/*
+ * AllTargetExpressionsAreColumnReferences returns true if non of the
+ * elements in the target entry list belong to an outer query (for
+ * example the query is a sublink and references to another query
+ * in the from list).
+ *
+ * The function also returns true if any of the  target entries is not
+ * a column itself. This might be too restrictive, but, given that we're
+ * handling a very specific type of queries, that seems acceptable for now.
+ */
+static bool
+AllTargetExpressionsAreColumnReferences(List *targetEntryList)
+{
+	ListCell *targetEntryCell = NULL;
+
+	foreach(targetEntryCell, targetEntryList)
+	{
+		TargetEntry *targetEntry = lfirst(targetEntryCell);
+		Var *candidateColumn = NULL;
+		Expr *strippedColumnExpression = (Expr *) strip_implicit_coercions(
+			(Node *) targetEntry->expr);
+
+		if (IsA(strippedColumnExpression, Var))
+		{
+			candidateColumn = (Var *) strippedColumnExpression;
+		}
+		else if (IsA(strippedColumnExpression, FieldSelect))
+		{
+			FieldSelect *compositeField = (FieldSelect *) strippedColumnExpression;
+			Expr *fieldExpression = compositeField->arg;
+
+			if (IsA(fieldExpression, Var))
+			{
+				candidateColumn = (Var *) fieldExpression;
+			}
+		}
+
+		/* we don't support target entries that are not columns */
+		if (candidateColumn == NULL)
+		{
+			return false;
+		}
+
+		if (candidateColumn->varlevelsup > 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * FindNodeCheckInRangeTableList finds a node for which the check
+ * function returns true.
+ *
+ * FindNodeCheckInRangeTableList relies on FindNodeCheck() but only
+ * considers the range table entries.
+ */
+bool
+FindNodeCheckInRangeTableList(List *rtable, bool (*check)(Node *))
+{
+	return range_table_walker(rtable, FindNodeCheck, check, QTW_EXAMINE_RTES);
+}
+
+
+/*
+ * QueryContainsDistributedTableRTE determines whether the given
+ * query contains a distributed table.
+ */
+bool
+QueryContainsDistributedTableRTE(Query *query)
+{
+	return FindNodeCheck((Node *) query, IsDistributedTableRTE);
+}
+
+
+/*
+ * IsDistributedTableRTE gets a node and returns true if the node
+ * is a range table relation entry that points to a distributed
+ * relation (i.e., excluding reference tables).
+ */
+static bool
+IsDistributedTableRTE(Node *node)
+{
+	RangeTblEntry *rangeTableEntry = NULL;
+	Oid relationId = InvalidOid;
+
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (!IsA(node, RangeTblEntry))
+	{
+		return false;
+	}
+
+	rangeTableEntry = (RangeTblEntry *) node;
+	if (rangeTableEntry->rtekind != RTE_RELATION)
+	{
+		return false;
+	}
+
+	relationId = rangeTableEntry->relid;
+	if (!IsDistributedTable(relationId) ||
+		PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
+	{
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -1313,7 +1746,7 @@ SubqueryEntryList(Query *queryTree)
 
 
 /*
- * MultiPlanTree takes in a parsed query tree and uses that tree to construct a
+ * MultiNodeTree takes in a parsed query tree and uses that tree to construct a
  * logical plan. This plan is based on multi-relational algebra. This function
  * creates the logical plan in several steps.
  *
@@ -1331,7 +1764,7 @@ SubqueryEntryList(Query *queryTree)
  * group, and limit nodes if they appear in the original query tree.
  */
 static MultiNode *
-MultiPlanTree(Query *queryTree)
+MultiNodeTree(Query *queryTree)
 {
 	List *rangeTableList = queryTree->rtable;
 	List *targetEntryList = queryTree->targetList;
@@ -1347,13 +1780,22 @@ MultiPlanTree(Query *queryTree)
 	MultiProject *projectNode = NULL;
 	MultiExtendedOp *extendedOpNode = NULL;
 	MultiNode *currentTopNode = NULL;
+	DeferredErrorMessage *unsupportedQueryError = NULL;
 
 	/* verify we can perform distributed planning on this query */
-	ErrorIfQueryNotSupported(queryTree);
+	unsupportedQueryError = DeferErrorIfQueryNotSupported(queryTree);
+	if (unsupportedQueryError != NULL)
+	{
+		RaiseDeferredError(unsupportedQueryError, ERROR);
+	}
 
 	/* extract where clause qualifiers and verify we can plan for them */
 	whereClauseList = WhereClauseList(queryTree->jointree);
-	ValidateClauseList(whereClauseList);
+	unsupportedQueryError = DeferErrorIfUnsupportedClause(whereClauseList);
+	if (unsupportedQueryError)
+	{
+		RaiseDeferredErrorInternal(unsupportedQueryError, ERROR);
+	}
 
 	/*
 	 * If we have a subquery, build a multi table node for the subquery and
@@ -1408,7 +1850,7 @@ MultiPlanTree(Query *queryTree)
 		}
 
 		/* recursively create child nested multitree */
-		subqueryExtendedNode = MultiPlanTree(subqueryTree);
+		subqueryExtendedNode = MultiNodeTree(subqueryTree);
 
 		SetChild((MultiUnaryNode *) subqueryCollectNode, (MultiNode *) subqueryNode);
 		SetChild((MultiUnaryNode *) subqueryNode, subqueryExtendedNode);
@@ -1482,7 +1924,7 @@ MultiPlanTree(Query *queryTree)
 
 
 /*
- * HasUnsupportedReferenceTableJoin returns true if there exists a outer join
+ * DeferredErrorIfUnsupportedRecurringTuplesJoin returns true if there exists a outer join
  * between reference table and distributed tables which does not follow
  * the rules :
  * - Reference tables can not be located in the outer part of the semi join or the
@@ -1497,12 +1939,14 @@ MultiPlanTree(Query *queryTree)
  * definitely have duplicate rows. Beside, reference tables can not be used
  * with full outer joins because of the same reason.
  */
-static bool
-HasUnsupportedReferenceTableJoin(PlannerRestrictionContext *plannerRestrictionContext)
+static DeferredErrorMessage *
+DeferredErrorIfUnsupportedRecurringTuplesJoin(
+	PlannerRestrictionContext *plannerRestrictionContext)
 {
 	List *joinRestrictionList =
 		plannerRestrictionContext->joinRestrictionContext->joinRestrictionList;
 	ListCell *joinRestrictionCell = NULL;
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
 
 	foreach(joinRestrictionCell, joinRestrictionList)
 	{
@@ -1515,36 +1959,68 @@ HasUnsupportedReferenceTableJoin(PlannerRestrictionContext *plannerRestrictionCo
 
 		if (joinType == JOIN_SEMI || joinType == JOIN_ANTI || joinType == JOIN_LEFT)
 		{
-			if (ShouldRecurseForReferenceTableJoinChecks(outerrel) &&
-				RelationInfoContainsReferenceTable(plannerInfo, outerrel))
+			if (ShouldRecurseForRecurringTuplesJoinChecks(outerrel) &&
+				RelationInfoContainsRecurringTuples(plannerInfo, outerrel, &recurType))
 			{
-				return true;
+				break;
 			}
 		}
 		else if (joinType == JOIN_FULL)
 		{
-			if ((ShouldRecurseForReferenceTableJoinChecks(innerrel) &&
-				 RelationInfoContainsReferenceTable(plannerInfo, innerrel)) ||
-				(ShouldRecurseForReferenceTableJoinChecks(outerrel) &&
-				 RelationInfoContainsReferenceTable(plannerInfo, outerrel)))
+			if ((ShouldRecurseForRecurringTuplesJoinChecks(innerrel) &&
+				 RelationInfoContainsRecurringTuples(plannerInfo, innerrel,
+													 &recurType)) ||
+				(ShouldRecurseForRecurringTuplesJoinChecks(outerrel) &&
+				 RelationInfoContainsRecurringTuples(plannerInfo, outerrel, &recurType)))
 			{
-				return true;
+				break;
 			}
 		}
 	}
 
-	return false;
+	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "There exist a reference table in the outer "
+							 "part of the outer join", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "There exist a table function in the outer "
+							 "part of the outer join", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_EMPTY_JOIN_TREE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "There exist a subquery without FROM in the outer "
+							 "part of the outer join", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_RESULT_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "Complex subqueries and CTEs cannot be in the outer "
+							 "part of the outer join", NULL);
+	}
+	return NULL;
 }
 
 
 /*
- * ShouldRecurseForReferenceTableJoinChecks is a helper function for deciding
- * on whether the input relOptInfo should be checked for unsupported reference
- * tables.
+ * ShouldRecurseForRecurringTuplesJoinChecks is a helper function for deciding
+ * on whether the input relOptInfo should be checked for table expressions that
+ * generate the same tuples in every query on a shard. We use this to avoid
+ * redundant checks and false positives in complex join trees.
  */
 static bool
-ShouldRecurseForReferenceTableJoinChecks(RelOptInfo *relOptInfo)
+ShouldRecurseForRecurringTuplesJoinChecks(RelOptInfo *relOptInfo)
 {
+	bool shouldRecurse = true;
+
 	/*
 	 * We shouldn't recursively go down for joins since we're already
 	 * going to process each join seperately. Otherwise we'd restrict
@@ -1581,23 +2057,39 @@ ShouldRecurseForReferenceTableJoinChecks(RelOptInfo *relOptInfo)
 
 		if (list_length(subroot->join_rel_list) > 0)
 		{
-			return false;
+			RelOptInfo *subqueryJoin = linitial(subroot->join_rel_list);
+
+			/*
+			 * Subqueries without relations (e.g. SELECT 1) are a little funny.
+			 * They are treated as having a join, but the join is between 0
+			 * relations and won't be in the join restriction list and therefore
+			 * won't be revisited in DeferredErrorIfUnsupportedRecurringTuplesJoin.
+			 *
+			 * We therefore only skip joins with >0 relations.
+			 */
+			if (bms_num_members(subqueryJoin->relids) > 0)
+			{
+				shouldRecurse = false;
+			}
 		}
 	}
 
-	return true;
+	return shouldRecurse;
 }
 
 
 /*
- * RelationInfoContainsReferenceTable checks whether the relationInfo
- * contains any reference tables. If found, the function returns true.
+ * RelationInfoContainsRecurringTuples checks whether the relationInfo
+ * contains any recurring table expression, namely a reference table,
+ * or immutable function. If found, RelationInfoContainsRecurringTuples
+ * returns true.
  *
  * Note that since relation ids of relationInfo indexes to the range
  * table entry list of planner info, planner info is also passed.
  */
 static bool
-RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relationInfo)
+RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo, RelOptInfo *relationInfo,
+									RecurringTuplesType *recurType)
 {
 	Relids relids = bms_copy(relationInfo->relids);
 	int relationId = -1;
@@ -1607,7 +2099,7 @@ RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relatio
 		RangeTblEntry *rangeTableEntry = plannerInfo->simple_rte_array[relationId];
 
 		/* relationInfo has this range table entry */
-		if (HasReferenceTable((Node *) rangeTableEntry))
+		if (IsRecurringRTE(rangeTableEntry, recurType))
 		{
 			return true;
 		}
@@ -1618,23 +2110,131 @@ RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relatio
 
 
 /*
- * HasReferenceTable checks whether there exist a reference table in the
- * given node.
+ * IsRecurringRTE returns whether the range table entry will generate
+ * the same set of tuples when repeating it in a query on different
+ * shards.
+ */
+static bool
+IsRecurringRTE(RangeTblEntry *rangeTableEntry, RecurringTuplesType *recurType)
+{
+	return IsRecurringRangeTable(list_make1(rangeTableEntry), recurType);
+}
+
+
+/*
+ * IsRecurringRangeTable returns whether the range table will generate
+ * the same set of tuples when repeating it in a query on different
+ * shards.
+ */
+static bool
+IsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurType)
+{
+	return range_table_walker(rangeTable, HasRecurringTuples, recurType,
+							  QTW_EXAMINE_RTES);
+}
+
+
+/*
+ * HasRecurringTuples returns whether any part of the expression will generate
+ * the same set of tuples in every query on shards when executing a distributed
+ * query.
  */
 bool
-HasReferenceTable(Node *node)
+HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 {
-	List *relationList = NIL;
-	ListCell *relationCell = NULL;
-	ExtractRangeTableRelationWalkerWithRTEExpand(node, &relationList);
-
-	foreach(relationCell, relationList)
+	if (node == NULL)
 	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(relationCell);
-		Oid relationId = rangeTableEntry->relid;
+		return false;
+	}
 
-		if (IsDistributedTable(relationId) && PartitionMethod(relationId) ==
-			DISTRIBUTE_BY_NONE)
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
+
+		if (rangeTableEntry->rtekind == RTE_RELATION)
+		{
+			Oid relationId = rangeTableEntry->relid;
+			if (IsDistributedTable(relationId) &&
+				PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
+			{
+				*recurType = RECURRING_TUPLES_REFERENCE_TABLE;
+
+				/*
+				 * Tuples from reference tables will recur in every query on shards
+				 * that includes it.
+				 */
+				return true;
+			}
+		}
+		else if (rangeTableEntry->rtekind == RTE_FUNCTION)
+		{
+			List *functionList = rangeTableEntry->functions;
+
+			if (list_length(functionList) == 1 &&
+				ContainsReadIntermediateResultFunction((Node *) functionList))
+			{
+				*recurType = RECURRING_TUPLES_RESULT_FUNCTION;
+			}
+			else
+			{
+				*recurType = RECURRING_TUPLES_FUNCTION;
+			}
+
+			/*
+			 * Tuples from functions will recur in every query on shards that includes
+			 * it.
+			 */
+			return true;
+		}
+
+		return false;
+	}
+	else if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+
+		if (query->rtable == NIL)
+		{
+			*recurType = RECURRING_TUPLES_EMPTY_JOIN_TREE;
+
+			/*
+			 * Queries with empty join trees will recur in every query on shards
+			 * that includes it.
+			 */
+			return true;
+		}
+
+		return query_tree_walker((Query *) node, HasRecurringTuples,
+								 recurType, QTW_EXAMINE_RTES);
+	}
+
+	return expression_tree_walker(node, HasRecurringTuples, recurType);
+}
+
+
+/*
+ * ContainsReadIntermediateResultFunction determines whether an expresion tree contains
+ * a call to the read_intermediate_results function.
+ */
+bool
+ContainsReadIntermediateResultFunction(Node *node)
+{
+	return FindNodeCheck(node, IsReadIntermediateResultFunction);
+}
+
+
+/*
+ * IsReadIntermediateResultFunction determines whether a given node is a function call
+ * to the read_intermediate_result function.
+ */
+static bool
+IsReadIntermediateResultFunction(Node *node)
+{
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr *funcExpr = (FuncExpr *) node;
+
+		if (funcExpr->funcid == CitusReadIntermediateResultFuncId())
 		{
 			return true;
 		}
@@ -1649,8 +2249,8 @@ HasReferenceTable(Node *node)
  * the given query. The checks in this function will be removed as we support
  * more functionality in our distributed planning.
  */
-static void
-ErrorIfQueryNotSupported(Query *queryTree)
+DeferredErrorMessage *
+DeferErrorIfQueryNotSupported(Query *queryTree)
 {
 	char *errorMessage = NULL;
 	bool hasTablesample = false;
@@ -1679,8 +2279,12 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	if (queryTree->hasWindowFuncs)
 	{
 		preconditionsSatisfied = false;
-		errorMessage = "could not run distributed query with window functions";
-		errorHint = filterHint;
+		errorMessage = "could not run distributed query because the window "
+					   "function that is used cannot be pushed down";
+		errorHint = "Window functions are supported in two ways. Either add "
+					"an equality filter on the distributed tables' partition "
+					"column or use the window functions inside a subquery with "
+					"a PARTITION BY clause containing the distribution column";
 	}
 
 	if (queryTree->setOperations)
@@ -1709,13 +2313,6 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	{
 		preconditionsSatisfied = false;
 		errorMessage = "could not run distributed query with FOR UPDATE/SHARE commands";
-		errorHint = filterHint;
-	}
-
-	if (queryTree->distinctClause)
-	{
-		preconditionsSatisfied = false;
-		errorMessage = "could not run distributed query with DISTINCT clause";
 		errorHint = filterHint;
 	}
 
@@ -1765,10 +2362,12 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	if (!preconditionsSatisfied)
 	{
 		bool showHint = ErrorHintRequired(errorHint, queryTree);
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("%s", errorMessage),
-						showHint ? errhint("%s", errorHint) : 0));
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 errorMessage, NULL,
+							 showHint ? errorHint : NULL);
 	}
+
+	return NULL;
 }
 
 
@@ -2067,10 +2666,12 @@ HasComplexRangeTableType(Query *queryTree)
 
 		/*
 		 * Check if the range table in the join tree is a simple relation or a
-		 * subquery.
+		 * subquery or a function. Note that RTE_FUNCTIONs are handled via (sub)query
+		 * pushdown.
 		 */
 		if (rangeTableEntry->rtekind != RTE_RELATION &&
-			rangeTableEntry->rtekind != RTE_SUBQUERY)
+			rangeTableEntry->rtekind != RTE_SUBQUERY &&
+			rangeTableEntry->rtekind != RTE_FUNCTION)
 		{
 			hasComplexRangeTableType = true;
 		}
@@ -2166,57 +2767,28 @@ QualifierList(FromExpr *fromExpr)
 
 
 /*
- * ValidateClauseList walks over the given list of clauses, and checks that we
- * can recognize all the clauses. This function ensures that we do not drop an
- * unsupported clause type on the floor, and thus prevents erroneous results.
+ * DeferErrorIfUnsupportedClause walks over the given list of clauses, and
+ * checks that we can recognize all the clauses. This function ensures that
+ * we do not drop an unsupported clause type on the floor, and thus prevents
+ * erroneous results.
+ *
+ * Returns a deferred error, caller is responsible for raising the error.
  */
-static void
-ValidateClauseList(List *clauseList)
+static DeferredErrorMessage *
+DeferErrorIfUnsupportedClause(List *clauseList)
 {
 	ListCell *clauseCell = NULL;
 	foreach(clauseCell, clauseList)
 	{
 		Node *clause = (Node *) lfirst(clauseCell);
-
-		/*
-		 * There could never be sublinks here given that it is handled
-		 * in subquery pushdown code-path.
-		 */
-		Assert(!IsSublinkClause(clause));
 
 		if (!(IsSelectClause(clause) || IsJoinClause(clause) || or_clause(clause)))
 		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("unsupported clause type")));
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "unsupported clause type", NULL, NULL);
 		}
 	}
-}
-
-
-/*
- * ValidateSubqueryPushdownClauseList walks over the given list of clauses,
- * and checks that we can recognize all the clauses. This function ensures
- * that we do not drop an unsupported clause type on the floor, and thus
- * prevents erroneous results.
- *
- * Note that this function is slightly different than ValidateClauseList(),
- * additionally allowing sublinks.
- */
-static void
-ValidateSubqueryPushdownClauseList(List *clauseList)
-{
-	ListCell *clauseCell = NULL;
-	foreach(clauseCell, clauseList)
-	{
-		Node *clause = (Node *) lfirst(clauseCell);
-
-		if (!(IsSublinkClause(clause) || IsSelectClause(clause) ||
-			  IsJoinClause(clause) || or_clause(clause)))
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("unsupported clause type")));
-		}
-	}
+	return NULL;
 }
 
 
@@ -2364,8 +2936,8 @@ IsJoinClause(Node *clause)
 	List *argumentList = NIL;
 	Node *leftArgument = NULL;
 	Node *rightArgument = NULL;
-	List *leftColumnList = NIL;
-	List *rightColumnList = NIL;
+	Node *strippedLeftArgument = NULL;
+	Node *strippedRightArgument = NULL;
 
 	if (!IsA(clause, OpExpr))
 	{
@@ -2385,14 +2957,14 @@ IsJoinClause(Node *clause)
 	leftArgument = (Node *) linitial(argumentList);
 	rightArgument = (Node *) lsecond(argumentList);
 
-	leftColumnList = pull_var_clause_default(leftArgument);
-	rightColumnList = pull_var_clause_default(rightArgument);
+	strippedLeftArgument = strip_implicit_coercions(leftArgument);
+	strippedRightArgument = strip_implicit_coercions(rightArgument);
 
 	/* each side of the expression should have only one column */
-	if ((list_length(leftColumnList) == 1) && (list_length(rightColumnList) == 1))
+	if (IsA(strippedLeftArgument, Var) && IsA(strippedRightArgument, Var))
 	{
-		Var *leftColumn = (Var *) linitial(leftColumnList);
-		Var *rightColumn = (Var *) linitial(rightColumnList);
+		Var *leftColumn = (Var *) strippedLeftArgument;
+		Var *rightColumn = (Var *) strippedRightArgument;
 		bool equiJoin = false;
 		bool joinBetweenDifferentTables = false;
 
@@ -2700,23 +3272,6 @@ IsSelectClause(Node *clause)
 
 
 /*
- * IsSublinkClause determines if the given node is a sublink or subplan.
- */
-static bool
-IsSublinkClause(Node *clause)
-{
-	NodeTag nodeTag = nodeTag(clause);
-
-	if (nodeTag == T_SubLink || nodeTag == T_SubPlan)
-	{
-		return true;
-	}
-
-	return false;
-}
-
-
-/*
  * MultiProjectNode builds the project node using the target entry information
  * from the query tree. The project node only encapsulates projected columns,
  * and does not include aggregates, group clauses, or project expressions.
@@ -2757,6 +3312,8 @@ MultiExtendedOpNode(Query *queryTree)
 	extendedOpNode->limitCount = queryTree->limitCount;
 	extendedOpNode->limitOffset = queryTree->limitOffset;
 	extendedOpNode->havingQual = queryTree->havingQual;
+	extendedOpNode->distinctClause = queryTree->distinctClause;
+	extendedOpNode->hasDistinctOn = queryTree->hasDistinctOn;
 
 	return extendedOpNode;
 }
@@ -2925,131 +3482,45 @@ FindNodesOfType(MultiNode *node, int type)
 
 
 /*
- * NeedsDistributedPlanning checks if the passed in query is a query running
- * on a distributed table. If it is, we start distributed planning.
- *
- * For distributed relations it also assigns identifiers to the relevant RTEs.
- */
-bool
-NeedsDistributedPlanning(Query *queryTree)
-{
-	CmdType commandType = queryTree->commandType;
-	List *rangeTableList = NIL;
-	ListCell *rangeTableCell = NULL;
-	bool hasLocalRelation = false;
-	bool hasDistributedRelation = false;
-
-	if (commandType != CMD_SELECT && commandType != CMD_INSERT &&
-		commandType != CMD_UPDATE && commandType != CMD_DELETE)
-	{
-		return false;
-	}
-
-	/*
-	 * We can handle INSERT INTO distributed_table SELECT ... even if the SELECT
-	 * part references local tables, so skip the remaining checks.
-	 */
-	if (InsertSelectIntoDistributedTable(queryTree))
-	{
-		return true;
-	}
-
-	/* extract range table entries for simple relations only */
-	ExtractRangeTableRelationWalker((Node *) queryTree, &rangeTableList);
-
-	foreach(rangeTableCell, rangeTableList)
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-
-		/* check if relation is local or distributed */
-		Oid relationId = rangeTableEntry->relid;
-
-		if (IsDistributedTable(relationId))
-		{
-			hasDistributedRelation = true;
-		}
-		else
-		{
-			hasLocalRelation = true;
-		}
-	}
-
-	if (hasLocalRelation && hasDistributedRelation)
-	{
-		ereport(ERROR, (errmsg("cannot plan queries which include both local and "
-							   "distributed relations")));
-	}
-
-	return hasDistributedRelation;
-}
-
-
-/*
- * ExtractRangeTableRelationWalker gathers all range table entries in a query
- * and filters them to preserve only those of the RTE_RELATION type.
+ * ExtractRangeTableRelationWalker gathers all range table relation entries
+ * in a query.
  */
 bool
 ExtractRangeTableRelationWalker(Node *node, List **rangeTableRelationList)
-{
-	List *rangeTableList = NIL;
-	ListCell *rangeTableCell = NULL;
-	bool walkIsComplete = ExtractRangeTableEntryWalker(node, &rangeTableList);
-
-	foreach(rangeTableCell, rangeTableList)
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-		if (rangeTableEntry->rtekind == RTE_RELATION &&
-			rangeTableEntry->relkind != RELKIND_VIEW)
-		{
-			(*rangeTableRelationList) = lappend(*rangeTableRelationList, rangeTableEntry);
-		}
-	}
-
-	return walkIsComplete;
-}
-
-
-/*
- * ExtractRangeTableRelationWalkerWithRTEExpand obtains the list of relations
- * from the given node. Note that the difference between this function and
- * ExtractRangeTableRelationWalker is that this one recursively
- * walk into range table entries if it can.
- */
-bool
-ExtractRangeTableRelationWalkerWithRTEExpand(Node *node, List **rangeTableRelationList)
 {
 	bool walkIsComplete = false;
 
 	if (node == NULL)
 	{
-		return walkIsComplete;
+		return false;
 	}
-	else if (IsA(node, RangeTblEntry))
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
-		List *rangeTableList = list_make1(rangeTableEntry);
 
-		if (rangeTableEntry->rtekind == RTE_RELATION)
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rangeTable = (RangeTblEntry *) node;
+
+		if (rangeTable->rtekind == RTE_RELATION && rangeTable->relkind != RELKIND_VIEW)
 		{
-			(*rangeTableRelationList) = lappend(*rangeTableRelationList, rangeTableEntry);
+			(*rangeTableRelationList) = lappend(*rangeTableRelationList, rangeTable);
+
+			walkIsComplete = false;
 		}
 		else
 		{
-			walkIsComplete = range_table_walker(rangeTableList,
-												ExtractRangeTableRelationWalkerWithRTEExpand,
+			walkIsComplete = range_table_walker(list_make1(rangeTable),
+												ExtractRangeTableRelationWalker,
 												rangeTableRelationList, 0);
 		}
 	}
 	else if (IsA(node, Query))
 	{
 		walkIsComplete = query_tree_walker((Query *) node,
-										   ExtractRangeTableRelationWalkerWithRTEExpand,
+										   ExtractRangeTableRelationWalker,
 										   rangeTableRelationList, QTW_EXAMINE_RTES);
 	}
 	else
 	{
-		walkIsComplete = expression_tree_walker(node,
-												ExtractRangeTableRelationWalkerWithRTEExpand,
+		walkIsComplete = expression_tree_walker(node, ExtractRangeTableRelationWalker,
 												rangeTableRelationList);
 	}
 
@@ -3079,7 +3550,8 @@ ExtractRangeTableEntryWalker(Node *node, List **rangeTableList)
 	}
 	else if (IsA(node, Query))
 	{
-		walkIsComplete = query_tree_walker((Query *) node, ExtractRangeTableEntryWalker,
+		walkIsComplete = query_tree_walker((Query *) node,
+										   ExtractRangeTableEntryWalker,
 										   rangeTableList, QTW_EXAMINE_RTES);
 	}
 	else
@@ -3392,7 +3864,7 @@ ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNode,
 
 
 /*
- * SubqueryPushdownMultiTree creates logical plan for subquery pushdown logic.
+ * SubqueryPushdownMultiNodeTree creates logical plan for subquery pushdown logic.
  * Note that this logic will be changed in next iterations, so we decoupled it
  * from other parts of code although it causes some code duplication.
  *
@@ -3403,10 +3875,9 @@ ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNode,
  * down to workers without invoking join order planner.
  */
 static MultiNode *
-SubqueryPushdownMultiPlanTree(Query *queryTree)
+SubqueryPushdownMultiNodeTree(Query *queryTree)
 {
 	List *targetEntryList = queryTree->targetList;
-	List *qualifierList = NIL;
 	List *columnList = NIL;
 	List *targetColumnList = NIL;
 	MultiCollect *subqueryCollectNode = CitusMakeNode(MultiCollect);
@@ -3417,17 +3888,14 @@ SubqueryPushdownMultiPlanTree(Query *queryTree)
 	Query *pushedDownQuery = NULL;
 	List *subqueryTargetEntryList = NIL;
 	List *havingClauseColumnList = NIL;
+	DeferredErrorMessage *unsupportedQueryError = NULL;
 
 	/* verify we can perform distributed planning on this query */
-	ErrorIfQueryNotSupported(queryTree);
-
-	/*
-	 * Extract qualifiers and verify we can plan for them. Note that since
-	 * subquery pushdown join planning is based on restriction equivalence,
-	 * checking for these qualifiers may not be necessary.
-	 */
-	qualifierList = QualifierList(queryTree->jointree);
-	ValidateSubqueryPushdownClauseList(qualifierList);
+	unsupportedQueryError = DeferErrorIfQueryNotSupported(queryTree);
+	if (unsupportedQueryError != NULL)
+	{
+		RaiseDeferredError(unsupportedQueryError, ERROR);
+	}
 
 	/*
 	 * We would be creating a new Query and pushing down top level query's

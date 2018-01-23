@@ -22,7 +22,9 @@
 #include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/placement_connection.h"
 #include "distributed/remote_commands.h"
+#include "distributed/subplan_execution.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -127,7 +129,8 @@ MultiClientConnect(const char *nodeName, uint32 nodePort, const char *nodeDataba
  * error and returns INVALID_CONNECTION_ID.
  */
 int32
-MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeDatabase)
+MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeDatabase,
+						const char *userName)
 {
 	MultiConnection *connection = NULL;
 	ConnStatusType connStatusType = CONNECTION_OK;
@@ -148,7 +151,8 @@ MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeD
 	}
 
 	/* prepare asynchronous request for worker node connection */
-	connection = StartNodeConnection(connectionFlags, nodeName, nodePort);
+	connection = StartNodeUserDatabaseConnection(connectionFlags, nodeName, nodePort,
+												 userName, nodeDatabase);
 	connStatusType = PQstatus(connection->pgConn);
 
 	/*
@@ -165,6 +169,55 @@ MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeD
 	{
 		ReportConnectionError(connection, WARNING);
 		CloseConnection(connection);
+
+		connectionId = INVALID_CONNECTION_ID;
+	}
+
+	return connectionId;
+}
+
+
+/*
+ * MultiClientPlacementConnectStart asynchronously tries to establish a connection
+ * for a particular set of shard placements. If it succeeds, it returns the
+ * the connection id. Otherwise, it reports connection error and returns
+ * INVALID_CONNECTION_ID.
+ */
+int32
+MultiClientPlacementConnectStart(List *placementAccessList, const char *userName)
+{
+	MultiConnection *connection = NULL;
+	ConnStatusType connStatusType = CONNECTION_OK;
+	int32 connectionId = AllocateConnectionId();
+	int connectionFlags = CONNECTION_PER_PLACEMENT; /* no cached connections for now */
+
+	if (connectionId == INVALID_CONNECTION_ID)
+	{
+		ereport(WARNING, (errmsg("could not allocate connection in connection pool")));
+		return connectionId;
+	}
+
+	/* prepare asynchronous request for worker node connection */
+	connection = StartPlacementListConnection(connectionFlags, placementAccessList,
+											  userName);
+
+	ClaimConnectionExclusively(connection);
+
+	connStatusType = PQstatus(connection->pgConn);
+
+	/*
+	 * If prepared, we save the connection, and set its initial polling status
+	 * to PGRES_POLLING_WRITING as specified in "Database Connection Control
+	 * Functions" section of the PostgreSQL documentation.
+	 */
+	if (connStatusType != CONNECTION_BAD)
+	{
+		ClientConnectionArray[connectionId] = connection;
+		ClientPollingStatusArray[connectionId] = PGRES_POLLING_WRITING;
+	}
+	else
+	{
+		ReportConnectionError(connection, WARNING);
 
 		connectionId = INVALID_CONNECTION_ID;
 	}
@@ -227,6 +280,14 @@ MultiClientConnectPoll(int32 connectionId)
 }
 
 
+/* MultiClientGetConnection returns the connection with the given ID from the pool */
+MultiConnection *
+MultiClientGetConnection(int32 connectionId)
+{
+	return ClientConnectionArray[connectionId];
+}
+
+
 /* MultiClientDisconnect disconnects the connection. */
 void
 MultiClientDisconnect(int32 connectionId)
@@ -239,6 +300,40 @@ MultiClientDisconnect(int32 connectionId)
 	Assert(connection != NULL);
 
 	CloseConnection(connection);
+
+	ClientConnectionArray[connectionId] = NULL;
+	ClientPollingStatusArray[connectionId] = InvalidPollingStatus;
+}
+
+
+/*
+ * MultiClientReleaseConnection removes a connection from the client
+ * executor pool without disconnecting if it is run in the transaction
+ * otherwise it disconnects.
+ *
+ * This allows the connection to be used for other operations in the
+ * same transaction. The connection will still be closed at COMMIT
+ * or ABORT time.
+ */
+void
+MultiClientReleaseConnection(int32 connectionId)
+{
+	MultiConnection *connection = NULL;
+	const int InvalidPollingStatus = -1;
+
+	Assert(connectionId != INVALID_CONNECTION_ID);
+	connection = ClientConnectionArray[connectionId];
+	Assert(connection != NULL);
+
+	/* allow using same connection only in the same transaction */
+	if (!InCoordinatedTransaction())
+	{
+		MultiClientDisconnect(connectionId);
+	}
+	else
+	{
+		UnclaimConnection(connection);
+	}
 
 	ClientConnectionArray[connectionId] = NULL;
 	ClientPollingStatusArray[connectionId] = InvalidPollingStatus;
@@ -302,10 +397,10 @@ MultiClientSendQuery(int32 connectionId, const char *query)
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	querySent = PQsendQuery(connection->pgConn, query);
+	querySent = SendRemoteCommand(connection, query);
 	if (querySent == 0)
 	{
-		char *errorMessage = PQerrorMessage(connection->pgConn);
+		char *errorMessage = pchomp(PQerrorMessage(connection->pgConn));
 		ereport(WARNING, (errmsg("could not send remote query \"%s\"", query),
 						  errdetail("Client error: %s", errorMessage)));
 
@@ -609,7 +704,7 @@ MultiClientQueryStatus(int32 connectionId)
 
 /* MultiClientCopyData copies data from the file. */
 CopyStatus
-MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
+MultiClientCopyData(int32 connectionId, int32 fileDescriptor, uint64 *returnBytesReceived)
 {
 	MultiConnection *connection = NULL;
 	char *receiveBuffer = NULL;
@@ -640,6 +735,11 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 		/* received copy data; append these data to file */
 		int appended = -1;
 		errno = 0;
+
+		if (returnBytesReceived)
+		{
+			*returnBytesReceived += receiveLength;
+		}
 
 		appended = write(fileDescriptor, receiveBuffer, receiveLength);
 		if (appended != receiveLength)
@@ -824,15 +924,11 @@ MultiClientWait(WaitInfo *waitInfo)
 		{
 			/*
 			 * Signals that arrive can interrupt our poll(). In that case just
-			 * check for interrupts, and try again. Every other error is
-			 * unexpected and treated as such.
+			 * return. Every other error is unexpected and treated as such.
 			 */
 			if (errno == EAGAIN || errno == EINTR)
 			{
-				CHECK_FOR_INTERRUPTS();
-
-				/* maximum wait starts at max again, but that's ok, it's just a stopgap */
-				continue;
+				return;
 			}
 			else
 			{
@@ -843,8 +939,8 @@ MultiClientWait(WaitInfo *waitInfo)
 		else if (rc == 0)
 		{
 			ereport(DEBUG5,
-					(errmsg("waiting for activity on tasks took longer than %ld ms",
-							(long) RemoteTaskCheckInterval * 10)));
+					(errmsg("waiting for activity on tasks took longer than %d ms",
+							(int) RemoteTaskCheckInterval * 10)));
 		}
 
 		/*

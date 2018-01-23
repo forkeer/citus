@@ -22,7 +22,7 @@
 #include "distributed/errormessage.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/multi_logical_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "utils/array.h"
@@ -217,23 +217,45 @@ typedef struct JoinSequenceNode
 
 
 /*
- * MultiPlan
+ * DistributedPlan contains all information necessary to execute a
+ * distribute query.
  */
-typedef struct MultiPlan
+typedef struct DistributedPlan
 {
 	CitusNode type;
+
+	/* unique identifier of the plan within the session */
+	uint64 planId;
+
+	/* type of command to execute (SELECT/INSERT/...) */
 	CmdType operation;
 
+	/* specifies whether a DML command has a RETURNING */
 	bool hasReturning;
+
+	/* job tree containing the tasks to be executed on workers */
 	Job *workerJob;
+
+	/* local query that merges results from the workers */
 	Query *masterQuery;
+
+	/* a router executable query is executed entirely on a worker */
 	bool routerExecutable;
+
+	/* which relations are accessed by this distributed plan */
 	List *relationIdList;
 
-	/* INSERT ... SELECT via coordinator only */
+	/* SELECT query in an INSERT ... SELECT via the coordinator */
 	Query *insertSelectSubquery;
+
+	/* target list of an INSERT ... SELECT via the coordinator */
 	List *insertTargetList;
+
+	/* target relation of an INSERT ... SELECT via the coordinator */
 	Oid targetRelationId;
+
+	/* list of subplans to execute before the distributed query */
+	List *subPlanList;
 
 	/*
 	 * NULL if this a valid plan, an error description otherwise. This will
@@ -241,7 +263,22 @@ typedef struct MultiPlan
 	 * or if prepared statement parameters prevented successful planning.
 	 */
 	DeferredErrorMessage *planningError;
-} MultiPlan;
+} DistributedPlan;
+
+
+/*
+ * DistributedSubPlan contains a subplan of a distributed plan. Subplans are
+ * executed before the distributed query and their results are written to
+ * temporary files. This is used to execute CTEs and subquery joins that
+ * cannot be distributed.
+ */
+typedef struct DistributedSubPlan
+{
+	CitusNode type;
+
+	uint32 subPlanId;
+	PlannedStmt *plan;
+} DistributedSubPlan;
 
 
 /* OperatorCacheEntry contains information for each element in OperatorCache */
@@ -263,9 +300,9 @@ extern bool EnableUniqueJobIds;
 
 
 /* Function declarations for building physical plans and constructing queries */
-extern MultiPlan * MultiPhysicalPlanCreate(MultiTreeRoot *multiTree,
-										   PlannerRestrictionContext *
-										   plannerRestrictionContext);
+extern DistributedPlan * CreatePhysicalDistributedPlan(MultiTreeRoot *multiTree,
+													   PlannerRestrictionContext *
+													   plannerRestrictionContext);
 extern StringInfo ShardFetchQueryString(uint64 shardId);
 extern Task * CreateBasicTask(uint64 jobId, uint32 taskId, TaskType taskType,
 							  char *queryString);
@@ -287,7 +324,6 @@ extern Const * MakeInt4Constant(Datum constantValue);
 extern int CompareShardPlacements(const void *leftElement, const void *rightElement);
 extern bool ShardIntervalsOverlap(ShardInterval *firstInterval,
 								  ShardInterval *secondInterval);
-extern bool HasReferenceTable(Node *node);
 
 /* function declarations for Task and Task list operations */
 extern bool TasksEqual(const Task *a, const Task *b);

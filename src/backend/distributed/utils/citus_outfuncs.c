@@ -25,7 +25,7 @@
 #include "distributed/errormessage.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/master_metadata_utility.h"
 #include "lib/stringinfo.h"
@@ -69,10 +69,6 @@
 /* Write an OID field (don't hard-wire assumption that OID is same as uint) */
 #define WRITE_OID_FIELD(fldname) \
 	appendStringInfo(str, " :" CppAsString(fldname) " %u", node->fldname)
-
-/* Write a long-integer field */
-#define WRITE_LONG_FIELD(fldname) \
-	appendStringInfo(str, " :" CppAsString(fldname) " %ld", node->fldname)
 
 /* Write a char field (ie, one ascii character) */
 #define WRITE_CHAR_FIELD(fldname) \
@@ -173,12 +169,13 @@ OutMultiTreeRoot(OUTFUNC_ARGS)
 
 
 void
-OutMultiPlan(OUTFUNC_ARGS)
+OutDistributedPlan(OUTFUNC_ARGS)
 {
-	WRITE_LOCALS(MultiPlan);
+	WRITE_LOCALS(DistributedPlan);
 
-	WRITE_NODE_TYPE("MULTIPLAN");
+	WRITE_NODE_TYPE("DISTRIBUTEDPLAN");
 
+	WRITE_UINT64_FIELD(planId);
 	WRITE_INT_FIELD(operation);
 	WRITE_BOOL_FIELD(hasReturning);
 
@@ -191,7 +188,21 @@ OutMultiPlan(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(insertTargetList);
 	WRITE_OID_FIELD(targetRelationId);
 
+	WRITE_NODE_FIELD(subPlanList);
+
 	WRITE_NODE_FIELD(planningError);
+}
+
+
+void
+OutDistributedSubPlan(OUTFUNC_ARGS)
+{
+	WRITE_LOCALS(DistributedSubPlan);
+
+	WRITE_NODE_TYPE("DISTRIBUTEDSUBPLAN");
+
+	WRITE_UINT_FIELD(subPlanId);
+	WRITE_NODE_FIELD(plan);
 }
 
 
@@ -292,6 +303,8 @@ OutMultiExtendedOp(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(limitCount);
 	WRITE_NODE_FIELD(limitOffset);
 	WRITE_NODE_FIELD(havingQual);
+	WRITE_BOOL_FIELD(hasDistinctOn);
+	WRITE_NODE_FIELD(distinctClause);
 
 	OutMultiUnaryNodeFields(str, (const MultiUnaryNode *) node);
 }

@@ -56,6 +56,9 @@ int MaxTrackedTasksPerNode = 1024; /* max number of tracked tasks */
 int MaxTaskStringSize = 12288; /* max size of a worker task call string in bytes */
 WorkerTasksSharedStateData *WorkerTasksSharedState; /* shared memory state */
 
+/* Hash table shared by the task tracker and task tracker protocol functions */
+HTAB *TaskTrackerTaskHash = NULL; /* shared memory */
+
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* Flags set by interrupt handlers for later service in the main loop */
@@ -97,11 +100,16 @@ TaskTrackerRegister(void)
 {
 	BackgroundWorker worker;
 
-	/* organize and register initialization of required shared memory */
-	RequestAddinShmemSpace(TaskTrackerShmemSize());
-
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = TaskTrackerShmemInit;
+
+	if (IsUnderPostmaster)
+	{
+		return;
+	}
+
+	/* organize and register initialization of required shared memory */
+	RequestAddinShmemSpace(TaskTrackerShmemSize());
 
 	/* and that the task tracker is started as background worker */
 	memset(&worker, 0, sizeof(worker));
@@ -246,17 +254,17 @@ TaskTrackerMain(Datum main_arg)
 			ExitOnAnyError = true;
 
 			/* Close open connections to local backends */
-			TrackerCleanupConnections(WorkerTasksSharedState->taskHash);
+			TrackerCleanupConnections(TaskTrackerTaskHash);
 
 			/* Add a sentinel task to the shared hash to mark shutdown */
-			TrackerRegisterShutDown(WorkerTasksSharedState->taskHash);
+			TrackerRegisterShutDown(TaskTrackerTaskHash);
 
 			/* Normal exit from the task tracker is here */
 			proc_exit(0);
 		}
 
 		/* Call the function that does the actual work */
-		ManageWorkerTasksHash(WorkerTasksSharedState->taskHash);
+		ManageWorkerTasksHash(TaskTrackerTaskHash);
 
 		/* Sleep for the configured time */
 		TrackerDelayLoop();
@@ -281,7 +289,7 @@ WorkerTasksHashEnter(uint64 jobId, uint32 taskId)
 	searchTask.taskId = taskId;
 
 	hashKey = (void *) &searchTask;
-	workerTask = (WorkerTask *) hash_search(WorkerTasksSharedState->taskHash, hashKey,
+	workerTask = (WorkerTask *) hash_search(TaskTrackerTaskHash, hashKey,
 											HASH_ENTER_NULL, &handleFound);
 	if (workerTask == NULL)
 	{
@@ -318,7 +326,7 @@ WorkerTasksHashFind(uint64 jobId, uint32 taskId)
 	searchTask.taskId = taskId;
 
 	hashKey = (void *) &searchTask;
-	workerTask = (WorkerTask *) hash_search(WorkerTasksSharedState->taskHash, hashKey,
+	workerTask = (WorkerTask *) hash_search(TaskTrackerTaskHash, hashKey,
 											HASH_FIND, NULL);
 
 	return workerTask;
@@ -340,8 +348,8 @@ TrackerCleanupJobDirectories(void)
 	StringInfo jobCacheDirectory = makeStringInfo();
 	appendStringInfo(jobCacheDirectory, "base/%s", PG_JOB_CACHE_DIR);
 
-	RemoveDirectory(jobCacheDirectory);
-	CreateDirectory(jobCacheDirectory);
+	CitusRemoveDirectory(jobCacheDirectory);
+	CitusCreateDirectory(jobCacheDirectory);
 
 	FreeStringInfo(jobCacheDirectory);
 }
@@ -601,14 +609,12 @@ TaskTrackerShmemInit(void)
 	}
 
 	/*  allocate hash table */
-	WorkerTasksSharedState->taskHash =
-		ShmemInitHash("Worker Task Hash",
-					  initTableSize, maxTableSize,
-					  &info, hashFlags);
+	TaskTrackerTaskHash = ShmemInitHash("Worker Task Hash", initTableSize, maxTableSize,
+										&info, hashFlags);
 
 	LWLockRelease(AddinShmemInitLock);
 
-	Assert(WorkerTasksSharedState->taskHash != NULL);
+	Assert(TaskTrackerTaskHash != NULL);
 	Assert(WorkerTasksSharedState->taskHashTrancheId != 0);
 
 	if (prev_shmem_startup_hook != NULL)
@@ -1086,7 +1092,7 @@ CreateJobDirectoryIfNotExists(uint64 jobId)
 	bool jobDirectoryExists = DirectoryExists(jobDirectoryName);
 	if (!jobDirectoryExists)
 	{
-		CreateDirectory(jobDirectoryName);
+		CitusCreateDirectory(jobDirectoryName);
 	}
 
 	FreeStringInfo(jobDirectoryName);

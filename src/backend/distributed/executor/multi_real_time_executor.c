@@ -19,23 +19,30 @@
 #include "postgres.h"
 #include "miscadmin.h"
 
-#include <sys/stat.h>
 #include <unistd.h>
-#include <poll.h>
 
+#include "access/xact.h"
 #include "commands/dbcommands.h"
+#include "distributed/citus_custom_scan.h"
 #include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_executor.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_resowner.h"
+#include "distributed/multi_router_executor.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/resource_lock.h"
+#include "distributed/subplan_execution.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/version_compat.h"
 #include "storage/fd.h"
 #include "utils/timestamp.h"
 
 
 /* Local functions forward declarations */
 static ConnectAction ManageTaskExecution(Task *task, TaskExecution *taskExecution,
-										 TaskExecutionStatus *executionStatus);
+										 TaskExecutionStatus *executionStatus,
+										 DistributedExecutionStats *executionStats);
 static bool TaskExecutionReadyToStart(TaskExecution *taskExecution);
 static bool TaskExecutionCompleted(TaskExecution *taskExecution);
 static void CancelTaskExecutionIfActive(TaskExecution *taskExecution);
@@ -76,6 +83,8 @@ MultiRealTimeExecute(Job *job)
 	bool allTasksCompleted = false;
 	bool taskCompleted = false;
 	bool taskFailed = false;
+	bool sizeLimitIsExceeded = false;
+	DistributedExecutionStats executionStats = { 0 };
 
 	List *workerNodeList = NIL;
 	HTAB *workerHash = NULL;
@@ -84,6 +93,11 @@ MultiRealTimeExecute(Job *job)
 
 	workerNodeList = ActiveReadableNodeList();
 	workerHash = WorkerHash(workerHashName, workerNodeList);
+
+	if (IsTransactionBlock())
+	{
+		BeginOrContinueCoordinatedTransaction();
+	}
 
 	/* initialize task execution structures for remote execution */
 	foreach(taskCell, taskList)
@@ -95,7 +109,8 @@ MultiRealTimeExecute(Job *job)
 	}
 
 	/* loop around until all tasks complete, one task fails, or user cancels */
-	while (!(allTasksCompleted || taskFailed || QueryCancelPending))
+	while (!(allTasksCompleted || taskFailed || QueryCancelPending ||
+			 sizeLimitIsExceeded))
 	{
 		uint32 taskCount = list_length(taskList);
 		uint32 completedTaskCount = 0;
@@ -125,7 +140,8 @@ MultiRealTimeExecute(Job *job)
 			}
 
 			/* call the function that performs the core task execution logic */
-			connectAction = ManageTaskExecution(task, taskExecution, &executionStatus);
+			connectAction = ManageTaskExecution(task, taskExecution, &executionStatus,
+												&executionStats);
 
 			/* update the connection counter for throttling */
 			UpdateConnectionCounter(workerNodeState, connectAction);
@@ -159,6 +175,13 @@ MultiRealTimeExecute(Job *job)
 				 */
 				MultiClientRegisterWait(waitInfo, executionStatus, connectionId);
 			}
+		}
+
+		/* in case the task has intermediate results */
+		if (CheckIfSizeLimitIsExceeded(&executionStats))
+		{
+			sizeLimitIsExceeded = true;
+			break;
 		}
 
 		/*
@@ -223,7 +246,11 @@ MultiRealTimeExecute(Job *job)
 	 * user cancellation request, we can now safely emit an error message (all
 	 * client-side resources have been cleared).
 	 */
-	if (taskFailed)
+	if (sizeLimitIsExceeded)
+	{
+		ErrorSizeLimitIsExceeded();
+	}
+	else if (taskFailed)
 	{
 		ereport(ERROR, (errmsg("failed to execute task %u", failedTaskId)));
 	}
@@ -246,7 +273,8 @@ MultiRealTimeExecute(Job *job)
  */
 static ConnectAction
 ManageTaskExecution(Task *task, TaskExecution *taskExecution,
-					TaskExecutionStatus *executionStatus)
+					TaskExecutionStatus *executionStatus,
+					DistributedExecutionStats *executionStats)
 {
 	TaskExecStatus *taskStatusArray = taskExecution->taskStatusArray;
 	int32 *connectionIdArray = taskExecution->connectionIdArray;
@@ -255,8 +283,6 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 	TaskExecStatus currentStatus = taskStatusArray[currentIndex];
 	List *taskPlacementList = task->taskPlacementList;
 	ShardPlacement *taskPlacement = list_nth(taskPlacementList, currentIndex);
-	char *nodeName = taskPlacement->nodeName;
-	uint32 nodePort = taskPlacement->nodePort;
 	ConnectAction connectAction = CONNECT_ACTION_NONE;
 
 	/* as most state transitions don't require blocking, default to not waiting */
@@ -267,12 +293,18 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 		case EXEC_TASK_CONNECT_START:
 		{
 			int32 connectionId = INVALID_CONNECTION_ID;
-			char *nodeDatabase = NULL;
+			List *relationShardList = task->relationShardList;
+			List *placementAccessList = NIL;
 
-			/* we use the same database name on the master and worker nodes */
-			nodeDatabase = get_database_name(MyDatabaseId);
+			/* create placement accesses for placements that appear in a subselect */
+			placementAccessList = BuildPlacementSelectList(taskPlacement->groupId,
+														   relationShardList);
 
-			connectionId = MultiClientConnectStart(nodeName, nodePort, nodeDatabase);
+			/* should at least have an entry for the anchor shard */
+			Assert(list_length(placementAccessList) > 0);
+
+			connectionId = MultiClientPlacementConnectStart(placementAccessList,
+															NULL);
 			connectionIdArray[currentIndex] = connectionId;
 
 			/* if valid, poll the connection until the connection is initiated */
@@ -304,7 +336,15 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 			if (pollStatus == CLIENT_CONNECTION_READY)
 			{
 				taskExecution->dataFetchTaskIndex = -1;
-				taskStatusArray[currentIndex] = EXEC_FETCH_TASK_LOOP;
+
+				if (InCoordinatedTransaction())
+				{
+					taskStatusArray[currentIndex] = EXEC_BEGIN_START;
+				}
+				else
+				{
+					taskStatusArray[currentIndex] = EXEC_FETCH_TASK_LOOP;
+				}
 			}
 			else if (pollStatus == CLIENT_CONNECTION_BUSY)
 			{
@@ -347,6 +387,8 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 
 		case EXEC_TASK_FAILED:
 		{
+			bool raiseError = false;
+
 			/*
 			 * On task failure, we close the connection. We also reset our execution
 			 * status assuming that we might fail on all other worker nodes and come
@@ -354,14 +396,34 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 			 * and compute task(s) on this node again.
 			 */
 			int32 connectionId = connectionIdArray[currentIndex];
+			MultiConnection *connection = MultiClientGetConnection(connectionId);
+			bool isCritical = connection->remoteTransaction.transactionCritical;
+
+			/*
+			 * Mark the connection as failed in case it was already used to perform
+			 * writes. We do not error out here, because the abort handler currently
+			 * cannot handle connections with COPY (SELECT ...) TO STDOUT commands
+			 * in progress.
+			 */
+			raiseError = false;
+			MarkRemoteTransactionFailed(connection, raiseError);
+
 			MultiClientDisconnect(connectionId);
 			connectionIdArray[currentIndex] = INVALID_CONNECTION_ID;
 			connectAction = CONNECT_ACTION_CLOSED;
 
 			taskStatusArray[currentIndex] = EXEC_TASK_CONNECT_START;
 
-			/* try next worker node */
-			AdjustStateForFailure(taskExecution);
+			if (isCritical)
+			{
+				/* cannot recover when error occurs in a critical transaction */
+				taskExecution->criticalErrorOccurred = true;
+			}
+			else
+			{
+				/* try next worker node */
+				AdjustStateForFailure(taskExecution);
+			}
 
 			/*
 			 * Add a delay, to avoid potentially excerbating problems by
@@ -370,6 +432,74 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 			*executionStatus = TASK_STATUS_ERROR;
 
 			break;
+		}
+
+		case EXEC_BEGIN_START:
+		{
+			int32 connectionId = connectionIdArray[currentIndex];
+			MultiConnection *connection = MultiClientGetConnection(connectionId);
+			RemoteTransaction *transaction = &connection->remoteTransaction;
+
+			/*
+			 * If BEGIN was not yet sent on this connection, send it now.
+			 * Otherwise, continue with the task.
+			 */
+			if (transaction->transactionState == REMOTE_TRANS_INVALID)
+			{
+				StartRemoteTransactionBegin(connection);
+				taskStatusArray[currentIndex] = EXEC_BEGIN_RUNNING;
+				break;
+			}
+			else
+			{
+				/*
+				 * We skip data fetches when in a distributed transaction since
+				 * they cannot be performed in a transactional way (e.g. would
+				 * trigger deadlock detection).
+				 */
+				taskStatusArray[currentIndex] = EXEC_COMPUTE_TASK_START;
+				break;
+			}
+		}
+
+		case EXEC_BEGIN_RUNNING:
+		{
+			int32 connectionId = connectionIdArray[currentIndex];
+			MultiConnection *connection = MultiClientGetConnection(connectionId);
+			RemoteTransaction *transaction = &connection->remoteTransaction;
+
+			/* check if query results are in progress or unavailable */
+			ResultStatus resultStatus = MultiClientResultStatus(connectionId);
+			if (resultStatus == CLIENT_RESULT_BUSY)
+			{
+				*executionStatus = TASK_STATUS_SOCKET_READ;
+				taskStatusArray[currentIndex] = EXEC_BEGIN_RUNNING;
+				break;
+			}
+			else if (resultStatus == CLIENT_RESULT_UNAVAILABLE)
+			{
+				taskStatusArray[currentIndex] = EXEC_TASK_FAILED;
+				break;
+			}
+
+			/* read the results from BEGIN and update the transaction state */
+			FinishRemoteTransactionBegin(connection);
+
+			if (transaction->transactionFailed)
+			{
+				taskStatusArray[currentIndex] = EXEC_TASK_FAILED;
+				break;
+			}
+			else
+			{
+				/*
+				 * We skip data fetches when in a distributed transaction since
+				 * they cannot be performed in a transactional way (e.g. would
+				 * trigger deadlock detection).
+				 */
+				taskStatusArray[currentIndex] = EXEC_COMPUTE_TASK_START;
+				break;
+			}
 		}
 
 		case EXEC_FETCH_TASK_LOOP:
@@ -521,7 +651,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 				int fileFlags = (O_APPEND | O_CREAT | O_RDWR | O_TRUNC | PG_BINARY);
 				int fileMode = (S_IRUSR | S_IWUSR);
 
-				int32 fileDescriptor = BasicOpenFile(filename, fileFlags, fileMode);
+				int32 fileDescriptor = BasicOpenFilePerm(filename, fileFlags, fileMode);
 				if (fileDescriptor >= 0)
 				{
 					/*
@@ -557,9 +687,16 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 			int32 connectionId = connectionIdArray[currentIndex];
 			int32 fileDesc = fileDescriptorArray[currentIndex];
 			int closed = -1;
+			uint64 bytesReceived = 0;
 
 			/* copy data from worker node, and write to local file */
-			CopyStatus copyStatus = MultiClientCopyData(connectionId, fileDesc);
+			CopyStatus copyStatus = MultiClientCopyData(connectionId, fileDesc,
+														&bytesReceived);
+
+			if (SubPlanLevel > 0)
+			{
+				executionStats->totalIntermediateResultSize += bytesReceived;
+			}
 
 			/* if worker node will continue to send more data, keep reading */
 			if (copyStatus == CLIENT_COPY_MORE)
@@ -577,7 +714,7 @@ ManageTaskExecution(Task *task, TaskExecution *taskExecution,
 					taskStatusArray[currentIndex] = EXEC_TASK_DONE;
 
 					/* we are done executing; we no longer need the connection */
-					MultiClientDisconnect(connectionId);
+					MultiClientReleaseConnection(connectionId);
 					connectionIdArray[currentIndex] = INVALID_CONNECTION_ID;
 					connectAction = CONNECT_ACTION_CLOSED;
 				}
@@ -920,4 +1057,56 @@ UpdateConnectionCounter(WorkerNodeState *workerNode, ConnectAction connectAction
 	{
 		workerNode->openConnectionCount--;
 	}
+}
+
+
+/*
+ * RealTimeExecScan is a callback function which returns next tuple from a real-time
+ * execution. In the first call, it executes distributed real-time plan and loads
+ * results from temporary files into custom scan's tuple store. Then, it returns
+ * tuples one by one from this tuple store.
+ */
+TupleTableSlot *
+RealTimeExecScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+	TupleTableSlot *resultSlot = NULL;
+
+	if (!scanState->finishedRemoteScan)
+	{
+		DistributedPlan *distributedPlan = scanState->distributedPlan;
+		Job *workerJob = distributedPlan->workerJob;
+
+		/* we are taking locks on partitions of partitioned tables */
+		LockPartitionsInRelationList(distributedPlan->relationIdList, AccessShareLock);
+
+		PrepareMasterJobDirectory(workerJob);
+
+		ExecuteSubPlans(distributedPlan);
+		MultiRealTimeExecute(workerJob);
+
+		LoadTuplesIntoTupleStore(scanState, workerJob);
+
+		scanState->finishedRemoteScan = true;
+	}
+
+	resultSlot = ReturnTupleFromTuplestore(scanState);
+
+	return resultSlot;
+}
+
+
+/*
+ * PrepareMasterJobDirectory creates a directory on the master node to keep job
+ * execution results. We also register this directory for automatic cleanup on
+ * portal delete.
+ */
+void
+PrepareMasterJobDirectory(Job *workerJob)
+{
+	StringInfo jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
+	CitusCreateDirectory(jobDirectoryName);
+
+	ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
+	ResourceOwnerRememberJobDirectory(CurrentResourceOwner, workerJob->jobId);
 }

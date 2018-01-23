@@ -6,11 +6,11 @@
 -- and that we don't partition or join prune shards that have null values.
 
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 760000;
+SET citus.next_shard_id TO 760000;
 
--- print major version to make version-specific tests clear
+-- print whether we're using version > 9 to make version-specific tests clear
 SHOW server_version \gset
-SELECT substring(:'server_version', '\d+') AS major_version;
+SELECT substring(:'server_version', '\d+')::int > 9 AS version_above_nine;
 
 SET client_min_messages TO DEBUG2;
 SET citus.explain_all_tasks TO on;

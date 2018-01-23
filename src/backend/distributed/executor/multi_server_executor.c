@@ -23,32 +23,32 @@
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_resowner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/subplan_execution.h"
 #include "distributed/worker_protocol.h"
-
 
 int RemoteTaskCheckInterval = 100; /* per cycle sleep interval in millisecs */
 int TaskExecutorType = MULTI_EXECUTOR_REAL_TIME; /* distributed executor type */
 bool BinaryMasterCopyFormat = false; /* copy data from workers in binary format */
-int MultiTaskQueryLogLevel = MULTI_TASK_QUERY_INFO_OFF; /* multi-task query log level */
+bool EnableRepartitionJoins = false;
 
 
 /*
- * JobExecutorType selects the executor type for the given multiPlan using the task
- * executor type config value. The function then checks if the given multiPlan needs
+ * JobExecutorType selects the executor type for the given distributedPlan using the task
+ * executor type config value. The function then checks if the given distributedPlan needs
  * more resources than those provided to it by other config values, and issues
  * warnings accordingly. If the selected executor type cannot execute the given
- * multiPlan, the function errors out.
+ * distributedPlan, the function errors out.
  */
 MultiExecutorType
-JobExecutorType(MultiPlan *multiPlan)
+JobExecutorType(DistributedPlan *distributedPlan)
 {
-	Job *job = multiPlan->workerJob;
+	Job *job = distributedPlan->workerJob;
 	List *workerNodeList = NIL;
 	int workerNodeCount = 0;
 	int taskCount = 0;
 	double tasksPerNode = 0.;
 	MultiExecutorType executorType = TaskExecutorType;
-	bool routerExecutablePlan = multiPlan->routerExecutable;
+	bool routerExecutablePlan = distributedPlan->routerExecutable;
 
 	/* check if can switch to router executor */
 	if (routerExecutablePlan)
@@ -57,21 +57,12 @@ JobExecutorType(MultiPlan *multiPlan)
 		return MULTI_EXECUTOR_ROUTER;
 	}
 
-	if (multiPlan->insertSelectSubquery != NULL)
+	if (distributedPlan->insertSelectSubquery != NULL)
 	{
 		return MULTI_EXECUTOR_COORDINATOR_INSERT_SELECT;
 	}
 
-	/* if it is not a router executable plan, inform user according to the log level */
-	if (MultiTaskQueryLogLevel != MULTI_TASK_QUERY_INFO_OFF)
-	{
-		ereport(MultiTaskQueryLogLevel, (errmsg("multi-task query about to be executed"),
-										 errhint("Queries are split to multiple tasks "
-												 "if they have to be split into several"
-												 " queries on the workers.")));
-	}
-
-	Assert(multiPlan->operation == CMD_SELECT);
+	Assert(distributedPlan->operation == CMD_SELECT);
 
 	workerNodeList = ActiveReadableNodeList();
 	workerNodeCount = list_length(workerNodeList);
@@ -108,13 +99,25 @@ JobExecutorType(MultiPlan *multiPlan)
 									  "\"task-tracker\".")));
 		}
 
-		/* if we have repartition jobs with real time executor, error out */
+		/* if we have repartition jobs with real time executor and repartition
+		 * joins are not enabled, error out. Otherwise, switch to task-tracker
+		 */
 		dependedJobCount = list_length(job->dependedJobList);
 		if (dependedJobCount > 0)
 		{
-			ereport(ERROR, (errmsg("cannot use real time executor with repartition jobs"),
-							errhint("Set citus.task_executor_type to "
-									"\"task-tracker\".")));
+			if (!EnableRepartitionJoins)
+			{
+				ereport(ERROR, (errmsg(
+									"the query contains a join that requires repartitioning"),
+								errhint("Set citus.enable_repartition_joins to on "
+										"to enable repartitioning")));
+			}
+
+			ereport(DEBUG1, (errmsg(
+								 "cannot use real time executor with repartition jobs"),
+							 errhint("Since you enabled citus.enable_repartition_joins "
+									 "Citus chose to use task-tracker.")));
+			return MULTI_EXECUTOR_TASK_TRACKER;
 		}
 	}
 	else
@@ -155,7 +158,7 @@ void
 RemoveJobDirectory(uint64 jobId)
 {
 	StringInfo jobDirectoryName = MasterJobDirectoryName(jobId);
-	RemoveDirectory(jobDirectoryName);
+	CitusRemoveDirectory(jobDirectoryName);
 
 	ResourceOwnerForgetJobDirectory(CurrentResourceOwner, jobId);
 }
@@ -246,6 +249,11 @@ CleanupTaskExecution(TaskExecution *taskExecution)
 bool
 TaskExecutionFailed(TaskExecution *taskExecution)
 {
+	if (taskExecution->criticalErrorOccurred)
+	{
+		return true;
+	}
+
 	if (taskExecution->failureCount >= MAX_TASK_EXECUTION_FAILURES)
 	{
 		return true;
@@ -277,4 +285,48 @@ AdjustStateForFailure(TaskExecution *taskExecution)
 
 	taskExecution->dataFetchTaskIndex = -1; /* reset data fetch counter */
 	taskExecution->failureCount++;          /* record failure */
+}
+
+
+/*
+ * CheckIfSizeLimitIsExceeded checks if the limit is exceeded by intermediate
+ * results, if there is any.
+ */
+bool
+CheckIfSizeLimitIsExceeded(DistributedExecutionStats *executionStats)
+{
+	uint64 maxIntermediateResultInBytes = 0;
+
+	if (!SubPlanLevel || MaxIntermediateResult < 0)
+	{
+		return false;
+	}
+
+	maxIntermediateResultInBytes = MaxIntermediateResult * 1024L;
+	if (executionStats->totalIntermediateResultSize < maxIntermediateResultInBytes)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * This function is called when the intermediate result size limitation is
+ * exceeded. It basically errors out with a detailed explanation.
+ */
+void
+ErrorSizeLimitIsExceeded()
+{
+	ereport(ERROR, (errmsg("the intermediate result size exceeds "
+						   "citus.max_intermediate_result_size (currently %d kB)",
+						   MaxIntermediateResult),
+					errdetail("Citus restricts the size of intermediate "
+							  "results of complex subqueries and CTEs to "
+							  "avoid accidentally pulling large result sets "
+							  "into once place."),
+					errhint("To run the current query, set "
+							"citus.max_intermediate_result_size to a higher"
+							" value or -1 to disable.")));
 }

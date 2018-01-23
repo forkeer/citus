@@ -112,6 +112,9 @@ get_colocated_shard_array(PG_FUNCTION_ARGS)
 	Oid arrayTypeId = OIDOID;
 	int colocatedShardIndex = 0;
 
+	/* sort to get consistent output */
+	colocatedShardList = SortList(colocatedShardList, CompareShardIntervalsById);
+
 	foreach(colocatedShardCell, colocatedShardList)
 	{
 		ShardInterval *colocatedShardInterval = (ShardInterval *) lfirst(
@@ -272,8 +275,9 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 		{
 			ereport(ERROR, (errmsg("cannot colocate tables %s and %s",
 								   leftRelationName, rightRelationName),
-							errdetail("Shard %ld of %s and shard %ld of %s "
-									  "have different number of shard placements.",
+							errdetail("Shard " UINT64_FORMAT
+									  " of %s and shard " UINT64_FORMAT
+									  " of %s have different number of shard placements.",
 									  leftShardId, leftRelationName,
 									  rightShardId, rightRelationName)));
 		}
@@ -304,8 +308,8 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 			{
 				ereport(ERROR, (errmsg("cannot colocate tables %s and %s",
 									   leftRelationName, rightRelationName),
-								errdetail("Shard %ld of %s and shard %ld of %s "
-										  "are not colocated.",
+								errdetail("Shard " UINT64_FORMAT " of %s and shard "
+										  UINT64_FORMAT " of %s are not colocated.",
 										  leftShardId, leftRelationName,
 										  rightShardId, rightRelationName)));
 			}
@@ -959,25 +963,46 @@ ColocatedTableId(Oid colocationId)
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_colocationid,
 				BTEqualStrategyNumber, F_INT4EQ, ObjectIdGetDatum(colocationId));
 
-	/* do not allow any tables to be dropped while we read from pg_dist_partition */
-	pgDistPartition = heap_open(DistPartitionRelationId(), ShareLock);
+	pgDistPartition = heap_open(DistPartitionRelationId(), AccessShareLock);
 	tupleDescriptor = RelationGetDescr(pgDistPartition);
 	scanDescriptor = systable_beginscan(pgDistPartition,
 										DistPartitionColocationidIndexId(),
 										indexOK, NULL, scanKeyCount, scanKey);
 
 	heapTuple = systable_getnext(scanDescriptor);
-	if (HeapTupleIsValid(heapTuple))
+	while (HeapTupleIsValid(heapTuple))
 	{
+		Relation colocatedRelation = NULL;
+
 		colocatedTableId = heap_getattr(heapTuple, Anum_pg_dist_partition_logicalrelid,
 										tupleDescriptor, &isNull);
 
-		/* make sure the table isn't dropped for the remainder of the transaction */
+		/*
+		 * Make sure the relation isn't dropped for the remainder of
+		 * the transaction.
+		 */
 		LockRelationOid(colocatedTableId, AccessShareLock);
+
+		/*
+		 * The relation might have been dropped just before we locked it.
+		 * Let's look it up.
+		 */
+		colocatedRelation = RelationIdGetRelation(colocatedTableId);
+		if (RelationIsValid(colocatedRelation))
+		{
+			/* relation still exists, we can use it */
+			RelationClose(colocatedRelation);
+			break;
+		}
+
+		/* relation was dropped, try the next one */
+		colocatedTableId = InvalidOid;
+
+		heapTuple = systable_getnext(scanDescriptor);
 	}
 
 	systable_endscan(scanDescriptor);
-	heap_close(pgDistPartition, ShareLock);
+	heap_close(pgDistPartition, AccessShareLock);
 
 	return colocatedTableId;
 }

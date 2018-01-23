@@ -1,7 +1,7 @@
 --
 -- MULTI_DEPARSE_SHARD_QUERY
 --
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 13100000;
+SET citus.next_shard_id TO 13100000;
 CREATE FUNCTION deparse_shard_query_test(text)
 	RETURNS VOID
 	AS 'citus'
@@ -410,8 +410,6 @@ INFO:  query: INSERT INTO public.raw_events_1 (tenant_id, value_4, value_6, valu
 
 -- test dropped table as well
 ALTER TABLE raw_events_1 DROP COLUMN value_5;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 SELECT deparse_shard_query_test('
 INSERT INTO raw_events_1(tenant_id, value_7, value_4)
 SELECT

@@ -91,7 +91,8 @@ DETAIL:  Key (id)=(32743) already exists.
 CONTEXT:  while executing command on localhost:57638
 -- INSERT, with RETURNING specified, failing with a non-constraint error
 INSERT INTO limit_orders_mx VALUES (34153, 'LEE', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING id / 0;
-ERROR:  could not modify any active placements
+ERROR:  division by zero
+CONTEXT:  while executing command on localhost:57638
 SET client_min_messages TO DEFAULT;
 -- commands with non-constant partition values are unsupported
 INSERT INTO limit_orders_mx VALUES (random() * 100, 'ORCL', 152, '2011-08-25 11:50:45',
@@ -157,24 +158,21 @@ SELECT COUNT(*) FROM limit_orders_mx WHERE id = 246;
      0
 (1 row)
 
--- commands with no constraints on the partition key are not supported
+-- multi shard delete is supported
 DELETE FROM limit_orders_mx WHERE bidder_id = 162;
-ERROR:  cannot run DELETE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- commands with a USING clause are unsupported
 CREATE TABLE bidders ( name text, id bigint );
 DELETE FROM limit_orders_mx USING bidders WHERE limit_orders_mx.id = 246 AND
 											 limit_orders_mx.bidder_id = bidders.id AND
 											 bidders.name = 'Bernie Madoff';
-ERROR:  cannot plan queries which include both local and distributed relations
+ERROR:  relation bidders is not distributed
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders_mx DEFAULT VALUES RETURNING *)
 DELETE FROM limit_orders_mx;
 ERROR:  common table expressions are not supported in distributed modifications
 -- cursors are not supported
 DELETE FROM limit_orders_mx WHERE CURRENT OF cursor_name;
-ERROR:  cannot run DELETE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
+ERROR:  cannot run DML queries with cursors
 INSERT INTO limit_orders_mx VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 -- simple UPDATE
 UPDATE limit_orders_mx SET symbol = 'GM' WHERE id = 246;
@@ -227,10 +225,8 @@ INSERT INTO limit_orders_mx VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sel
 ERROR:  duplicate key value violates unique constraint "limit_orders_mx_pkey_1220093"
 DETAIL:  Key (id)=(275) already exists.
 CONTEXT:  while executing command on localhost:57638
--- commands with no constraints on the partition key are not supported
+-- multi shard update is supported
 UPDATE limit_orders_mx SET limit_price = 0.00;
-ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- attempting to change the partition key is unsupported
 UPDATE limit_orders_mx SET id = 0 WHERE id = 246;
 ERROR:  modifying the partition value of rows is not allowed
@@ -239,7 +235,7 @@ UPDATE limit_orders_mx SET limit_price = 0.00 FROM bidders
 					WHERE limit_orders_mx.id = 246 AND
 						  limit_orders_mx.bidder_id = bidders.id AND
 						  bidders.name = 'Bernie Madoff';
-ERROR:  cannot plan queries which include both local and distributed relations
+ERROR:  relation bidders is not distributed
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders_mx DEFAULT VALUES RETURNING *)
 UPDATE limit_orders_mx SET symbol = 'GM';
@@ -272,8 +268,6 @@ UPDATE limit_orders_mx SET symbol = UPPER(symbol) WHERE id = 246 RETURNING id, L
 -- connect coordinator to run the DDL
 \c - - - :master_port
 ALTER TABLE limit_orders_mx ADD COLUMN array_of_values integer[];
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 -- connect back to the other node
 \c - - - :worker_2_port
 -- updates referencing STABLE functions are allowed
@@ -303,7 +297,7 @@ CREATE FUNCTION temp_strict_func(integer,integer) RETURNS integer AS
 'SELECT COALESCE($1, 2) + COALESCE($1, 3);' LANGUAGE SQL STABLE STRICT;
 UPDATE limit_orders_mx SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
 ERROR:  null value in column "bidder_id" violates not-null constraint
-DETAIL:  Failing row contains (246, GM, null, 2007-07-02 16:32:15, buy, 999, {1,2}).
+DETAIL:  Failing row contains (246, GM, null, 2007-07-02 16:32:15, buy, 0.00, {1,2}).
 CONTEXT:  while executing command on localhost:57637
 SELECT array_of_values FROM limit_orders_mx WHERE id = 246;
  array_of_values 
@@ -314,8 +308,6 @@ SELECT array_of_values FROM limit_orders_mx WHERE id = 246;
 -- connect coordinator to run the DDL
 \c - - - :master_port
 ALTER TABLE limit_orders_mx DROP array_of_values;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 -- connect back to the other node
 \c - - - :worker_2_port
 -- even in RETURNING
@@ -323,8 +315,7 @@ UPDATE limit_orders_mx SET placed_at = placed_at WHERE id = 246 RETURNING NOW();
 ERROR:  non-IMMUTABLE functions are not allowed in the RETURNING clause
 -- cursors are not supported
 UPDATE limit_orders_mx SET symbol = 'GM' WHERE CURRENT OF cursor_name;
-ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
+ERROR:  cannot run DML queries with cursors
 -- check that multi-row UPDATE/DELETEs with RETURNING work
 INSERT INTO multiple_hash_mx VALUES ('0', '1');
 INSERT INTO multiple_hash_mx VALUES ('0', '2');
@@ -433,14 +424,12 @@ SELECT * FROM multiple_hash_mx WHERE category = '2' ORDER BY category, data;
 INSERT INTO multiple_hash_mx
 SELECT s, s*2 FROM generate_series(1,10) s;
 INSERT 0 10
--- but are never distributed
+-- including distributed INSERT ... SELECT
 BEGIN;
 BEGIN
 SET LOCAL client_min_messages TO DEBUG1;
 SET
 INSERT INTO multiple_hash_mx SELECT * FROM multiple_hash_mx;
-DEBUG:  distributed INSERT ... SELECT can only be performed from the coordinator
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
 INSERT 0 10
 END;
 COMMIT

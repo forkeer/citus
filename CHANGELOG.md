@@ -1,3 +1,165 @@
+### citus v7.2.0 (January 16, 2018) ###
+
+* Adds support for CTEs
+
+* Adds support for subqueries that require merge step
+
+* Adds support for set operations (UNION, INTERSECT, ...)
+
+* Adds support for querying local tables in CTEs and subqueries
+
+* Adds support for more SQL coverage in subqueries for reference tables
+
+* Adds support for count(distinct) in queries with a subquery
+
+* Adds support for non-equijoins when there is already an equijoin for queries
+
+* Adds support for non-equijoins when there is already an equijoin for subquery
+
+* Adds support for real-time executor to run in transaction blocks
+
+* Adds infrastructure for storing intermediate distributed query results
+
+* Adds a new GUC named `enable_repartition_joins` for auto executor switch
+
+* Adds support for limiting the intermediate result size
+
+* Improves support for queries with unions containing filters
+
+* Improves support for queries with unions containing joins
+
+* Improves support for subqueries in the `WHERE` clause
+
+* Increases `COPY` throughput
+
+* Enables pushing down queries containing only recurring tuples and `GROUP BY`
+
+* Load-balance queries that read from 0 shards
+
+* Improves support for using functions in subqueries
+
+* Fixes a bug that could cause real-time executor to crash during cancellation
+
+* Fixes a bug that could cause real-time executor to get stuck on cancellation
+
+* Fixes a bug that could block modification queries unnecessarily
+
+* Fixes a bug that could cause assigning wrong IDs to transactions
+
+* Fixes a bug that could cause an assert failure with `ANALYZE` statements
+
+* Fixes a bug that could allow pushing down wrong set operations in subqueries
+
+* Fixes a bug that could cause a deadlock in create_distributed_table
+
+* Fixes a bug that could confuse user about `ANALYZE` usage
+
+* Fixes a bug that could lead to false positive distributed deadlock detections
+
+* Relaxes the locking for DDL commands on partitioned tables
+
+* Relaxes the locking on `COPY` with replication
+
+* Logs more remote commands when citus.log_remote_commands is set
+
+### citus v6.2.5 (January 11, 2018) ###
+
+* Fixes a bug that could crash the coordinator while reporting a remote error
+
+### citus v7.1.2 (January 4, 2018) ###
+
+* Fixes a bug that could cause assigning wrong IDs to transactions
+
+* Increases `COPY` throughput
+
+### citus v7.1.1 (December 1, 2017) ###
+
+* Fixes a bug that could prevent pushing down subqueries with reference tables
+
+* Fixes a bug that could create false positive distributed deadlocks
+
+* Fixes a bug that could prevent running concurrent COPY and multi-shard DDL
+
+* Fixes a bug that could mislead users about `ANALYZE` queries
+
+### citus v7.1.0 (November 14, 2017) ###
+
+* Adds support for native queries with multi shard `UPDATE`/`DELETE` queries
+
+* Expands reference table support in subquery pushdown
+
+* Adds window function support for subqueries and `INSERT ... SELECT` queries
+
+* Adds support for `COUNT(DISTINCT) [ON]` queries on non-partition columns
+
+* Adds support for `DISTINCT [ON]` queries on non-partition columns
+
+* Introduces basic usage statistic collector
+
+* Adds support for setting replica identity while creating distributed tables
+
+* Adds support for `ALTER TABLE ... REPLICA IDENTITY` queries
+
+* Adds pushdown support for `LIMIT` and `HAVING` grouped by partition key
+
+* Adds support for `INSERT ... SELECT` queries via worker nodes on MX clusters
+
+* Adds support for adding primary key using already defined index
+
+* Adds parameter to shard copy functions to support distinct replication models
+
+* Changes `shard_name` UDF to omit public schema name
+
+* Adds `master_move_node` UDF to make changes on nodename/nodeport more easy
+
+* Fixes a bug that could cause casting error with `INSERT ... SELECT` queries
+
+* Fixes a bug that could prevent upgrading servers from Citus 6.1
+
+* Fixes a bug that could prevent attaching partitions to a table in schema
+
+* Fixes a bug that could prevent adding a node to cluster with reference table
+
+* Fixes a bug that could cause a crash with `INSERT ... SELECT` queries
+
+* Fixes a bug that could prevent creating a partitoned table on Cloud
+
+* Implements various performance improvements
+
+* Adds internal infrastructures and tests to improve development process
+
+* Addresses various race conditions and deadlocks
+
+* Improves and standardizes error messages
+
+### citus v7.0.3 (October 16, 2017) ###
+
+* Fixes several bugs that could cause crash
+
+* Fixes a bug that could cause deadlock while creating reference tables
+
+* Fixes a bug that could cause false-positives in deadlock detection
+
+* Fixes a bug that could cause  2PC recovery not to work from MX workers
+
+* Fixes a bug that could cause cache incohorency
+
+* Fixes a bug that could cause maintenance daemon to skip cache invalidations
+
+* Improves performance of transaction recovery by using correct index
+
+### citus v7.0.2 (September 28, 2017) ###
+
+* Updates task-tracker to limit file access
+
+### citus v6.2.4 (September 28, 2017) ###
+
+* Updates task-tracker to limit file access
+
+### citus v6.1.3 (September 28, 2017) ###
+
+* Updates task-tracker to limit file access
+
 ### citus v7.0.1 (September 12, 2017) ###
 
 * Fixes a bug that could cause memory leaks in `INSERT ... SELECT` queries

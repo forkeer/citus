@@ -37,6 +37,7 @@
 #include "commands/prepare.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/intermediate_results.h"
 #include "distributed/maintenanced.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
@@ -45,7 +46,7 @@
 #include "distributed/multi_copy.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_partitioning_utils.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_shard_transaction.h"
@@ -56,6 +57,7 @@
 #include "distributed/transmit.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
+#include "distributed/version_compat.h"
 #include "executor/executor.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
@@ -107,6 +109,7 @@ static bool IsCitusExtensionStmt(Node *parsetree);
 /* Local functions forward declarations for Transmit statement */
 static bool IsTransmitStmt(Node *parsetree);
 static void VerifyTransmitStmt(CopyStmt *copyStatement);
+static bool IsCopyResultStmt(CopyStmt *copyStatement);
 
 /* Local functions forward declarations for processing distributed table commands */
 static Node * ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag,
@@ -136,6 +139,7 @@ static void ErrorIfUnstableCreateOrAlterExtensionStmt(Node *parsetree);
 static void ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement);
 static void ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement);
 static void ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement);
+static void ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement);
 static void ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement);
 static void ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt);
 static void ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt);
@@ -152,10 +156,10 @@ static void ErrorIfUnsupportedForeignConstraint(Relation relation,
 static char * ExtractNewExtensionVersion(Node *parsetree);
 static void CreateLocalTable(RangeVar *relation, char *nodeName, int32 nodePort);
 static bool IsAlterTableRenameStmt(RenameStmt *renameStmt);
+static bool IsIndexRenameStmt(RenameStmt *renameStmt);
 static bool AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
 										 AlterTableCmd *command);
 static void ExecuteDistributedDDLJob(DDLJob *ddlJob);
-static void ShowNoticeIfNotUsing2PC(void);
 static List * DDLTaskList(Oid relationId, const char *commandString);
 static List * CreateIndexTaskList(Oid relationId, IndexStmt *indexStmt);
 static List * DropIndexTaskList(Oid relationId, Oid indexId, DropStmt *dropStmt);
@@ -166,9 +170,6 @@ static void RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid ol
 static void CheckCopyPermissions(CopyStmt *copyStatement);
 static List * CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
 static void PostProcessUtility(Node *parsetree);
-
-
-static bool warnedUserAbout2PC = false;
 
 
 /*
@@ -366,7 +367,8 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		if (IsA(parsetree, AlterTableStmt))
 		{
 			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parsetree;
-			if (alterTableStmt->relkind == OBJECT_TABLE)
+			if (alterTableStmt->relkind == OBJECT_TABLE ||
+				alterTableStmt->relkind == OBJECT_INDEX)
 			{
 				ddlJobs = PlanAlterTableStmt(alterTableStmt, queryString);
 			}
@@ -567,6 +569,37 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 		ProcessVacuumStmt(vacuumStmt, queryString);
 	}
 
+	/* warn for CLUSTER command on distributed tables */
+	if (IsA(parsetree, ClusterStmt))
+	{
+		ClusterStmt *clusterStmt = (ClusterStmt *) parsetree;
+		bool showPropagationWarning = false;
+
+		/* CLUSTER all */
+		if (clusterStmt->relation == NULL)
+		{
+			showPropagationWarning = true;
+		}
+		else
+		{
+			Oid relationId = InvalidOid;
+			bool missingOK = false;
+
+			relationId = RangeVarGetRelid(clusterStmt->relation, AccessShareLock,
+										  missingOK);
+
+			if (OidIsValid(relationId))
+			{
+				showPropagationWarning = IsDistributedTable(relationId);
+			}
+		}
+
+		if (showPropagationWarning)
+		{
+			ereport(WARNING, (errmsg("not propagating CLUSTER command to worker nodes")));
+		}
+	}
+
 	/*
 	 * Ensure value is valid, we can't do some checks during CREATE
 	 * EXTENSION. This is important to register some invalidation callbacks.
@@ -634,12 +667,30 @@ IsTransmitStmt(Node *parsetree)
 static void
 VerifyTransmitStmt(CopyStmt *copyStatement)
 {
+	char *fileName = NULL;
+
+	EnsureSuperUser();
+
 	/* do some minimal option verification */
 	if (copyStatement->relation == NULL ||
 		copyStatement->relation->relname == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("FORMAT 'transmit' requires a target file")));
+	}
+
+	fileName = copyStatement->relation->relname;
+
+	if (is_absolute_path(fileName))
+	{
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						(errmsg("absolute path not allowed"))));
+	}
+	else if (!path_is_relative_and_below_cwd(fileName))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("path must be in or below the current directory"))));
 	}
 
 	if (copyStatement->filename != NULL)
@@ -661,6 +712,34 @@ VerifyTransmitStmt(CopyStmt *copyStatement)
 
 
 /*
+ * IsCopyResultStmt determines whether the given copy statement is a
+ * COPY "resultkey" FROM STDIN WITH (format result) statement, which is used
+ * to copy query results from the coordinator into workers.
+ */
+static bool
+IsCopyResultStmt(CopyStmt *copyStatement)
+{
+	ListCell *optionCell = NULL;
+	bool hasFormatReceive = false;
+
+	/* extract WITH (...) options from the COPY statement */
+	foreach(optionCell, copyStatement->options)
+	{
+		DefElem *defel = (DefElem *) lfirst(optionCell);
+
+		if (strncmp(defel->defname, "format", NAMEDATALEN) == 0 &&
+			strncmp(defGetString(defel), "result", NAMEDATALEN) == 0)
+		{
+			hasFormatReceive = true;
+			break;
+		}
+	}
+
+	return hasFormatReceive;
+}
+
+
+/*
  * ProcessCopyStmt handles Citus specific concerns for COPY like supporting
  * COPYing from distributed tables and preventing unsupported actions. The
  * function returns a modified COPY statement to be executed, or NULL if no
@@ -676,6 +755,19 @@ static Node *
 ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, bool *commandMustRunAsOwner)
 {
 	*commandMustRunAsOwner = false; /* make sure variable is initialized */
+
+	/*
+	 * Handle special COPY "resultid" FROM STDIN WITH (format result) commands
+	 * for sending intermediate results to workers.
+	 */
+	if (IsCopyResultStmt(copyStatement))
+	{
+		const char *resultId = copyStatement->relation->relname;
+
+		ReceiveQueryResultViaCopy(resultId);
+
+		return NULL;
+	}
 
 	/*
 	 * We check whether a distributed relation is affected. For that, we need to open the
@@ -855,7 +947,7 @@ ProcessCreateTableStmtPartitionOf(CreateStmt *createStatement)
 											  missingOk);
 			Var *parentDistributionColumn = DistPartitionKey(parentRelationId);
 			char parentDistributionMethod = DISTRIBUTE_BY_HASH;
-			char *parentRelationName = get_rel_name(parentRelationId);
+			char *parentRelationName = generate_qualified_relation_name(parentRelationId);
 			bool viaDeprecatedAPI = false;
 
 			CreateDistributedTable(relationId, parentDistributionColumn,
@@ -933,11 +1025,11 @@ ProcessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement)
 			{
 				Var *distributionColumn = DistPartitionKey(relationId);
 				char distributionMethod = DISTRIBUTE_BY_HASH;
-				char *relationName = get_rel_name(relationId);
+				char *parentRelationName = generate_qualified_relation_name(relationId);
 				bool viaDeprecatedAPI = false;
 
 				CreateDistributedTable(partitionRelationId, distributionColumn,
-									   distributionMethod, relationName,
+									   distributionMethod, parentRelationName,
 									   viaDeprecatedAPI);
 			}
 		}
@@ -1148,6 +1240,7 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 	LOCKMODE lockmode = 0;
 	Oid leftRelationId = InvalidOid;
 	Oid rightRelationId = InvalidOid;
+	char leftRelationKind;
 	bool isDistributedRelation = false;
 	List *commandList = NIL;
 	ListCell *commandCell = NULL;
@@ -1165,13 +1258,38 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 		return NIL;
 	}
 
+	/*
+	 * AlterTableStmt applies also to INDEX relations, and we have support for
+	 * SET/SET storage parameters in Citus, so we might have to check for
+	 * another relation here.
+	 */
+	leftRelationKind = get_rel_relkind(leftRelationId);
+	if (leftRelationKind == RELKIND_INDEX)
+	{
+		leftRelationId = IndexGetRelation(leftRelationId, false);
+	}
+
 	isDistributedRelation = IsDistributedTable(leftRelationId);
 	if (!isDistributedRelation)
 	{
 		return NIL;
 	}
 
-	ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
+	/*
+	 * The PostgreSQL parser dispatches several commands into the node type
+	 * AlterTableStmt, from ALTER INDEX to ALTER SEQUENCE or ALTER VIEW. Here
+	 * we have a special implementation for ALTER INDEX, and a specific error
+	 * message in case of unsupported sub-command.
+	 */
+	if (leftRelationKind == RELKIND_INDEX)
+	{
+		ErrorIfUnsupportedAlterIndexStmt(alterTableStatement);
+	}
+	else
+	{
+		/* this function also accepts more than just RELKIND_RELATION... */
+		ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
+	}
 
 	/*
 	 * We check if there is a ADD FOREIGN CONSTRAINT command in sub commands list.
@@ -1282,11 +1400,17 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 static List *
 PlanRenameStmt(RenameStmt *renameStmt, const char *renameCommand)
 {
-	Oid relationId = InvalidOid;
+	Oid objectRelationId = InvalidOid; /* SQL Object OID */
+	Oid tableRelationId = InvalidOid; /* Relation OID, maybe not the same. */
 	bool isDistributedRelation = false;
 	DDLJob *ddlJob = NULL;
 
-	if (!IsAlterTableRenameStmt(renameStmt))
+	/*
+	 * We only support some of the PostgreSQL supported RENAME statements, and
+	 * our list include only renaming table and index (related) objects.
+	 */
+	if (!IsAlterTableRenameStmt(renameStmt) &&
+		!IsIndexRenameStmt(renameStmt))
 	{
 		return NIL;
 	}
@@ -1296,32 +1420,70 @@ PlanRenameStmt(RenameStmt *renameStmt, const char *renameCommand)
 	 * RenameRelation(), renameatt() and RenameConstraint(). However, since all
 	 * three statements have identical lock levels, we just use a single statement.
 	 */
-	relationId = RangeVarGetRelid(renameStmt->relation, AccessExclusiveLock,
-								  renameStmt->missing_ok);
+	objectRelationId = RangeVarGetRelid(renameStmt->relation,
+										AccessExclusiveLock,
+										renameStmt->missing_ok);
 
 	/*
 	 * If the table does not exist, don't do anything here to allow PostgreSQL
 	 * to throw the appropriate error or notice message later.
 	 */
-	if (!OidIsValid(relationId))
+	if (!OidIsValid(objectRelationId))
 	{
 		return NIL;
 	}
 
 	/* we have no planning to do unless the table is distributed */
-	isDistributedRelation = IsDistributedTable(relationId);
+	switch (renameStmt->renameType)
+	{
+		case OBJECT_TABLE:
+		case OBJECT_COLUMN:
+		case OBJECT_TABCONSTRAINT:
+		{
+			/* the target object is our tableRelationId. */
+			tableRelationId = objectRelationId;
+			break;
+		}
+
+		case OBJECT_INDEX:
+		{
+			/*
+			 * here, objRelationId points to the index relation entry, and we
+			 * are interested into the entry of the table on which the index is
+			 * defined.
+			 */
+			tableRelationId = IndexGetRelation(objectRelationId, false);
+			break;
+		}
+
+		default:
+
+			/*
+			 * Nodes that are not supported by Citus: we pass-through to the
+			 * main PostgreSQL executor. Any Citus-supported RenameStmt
+			 * renameType must appear above in the switch, explicitly.
+			 */
+			return NIL;
+	}
+
+	isDistributedRelation = IsDistributedTable(tableRelationId);
 	if (!isDistributedRelation)
 	{
 		return NIL;
 	}
 
+	/*
+	 * We might ERROR out on some commands, but only for Citus tables where
+	 * isDistributedRelation is true. That's why this test comes this late in
+	 * the function.
+	 */
 	ErrorIfUnsupportedRenameStmt(renameStmt);
 
 	ddlJob = palloc0(sizeof(DDLJob));
-	ddlJob->targetRelationId = relationId;
+	ddlJob->targetRelationId = tableRelationId;
 	ddlJob->concurrentIndexCmd = false;
 	ddlJob->commandString = renameCommand;
-	ddlJob->taskList = DDLTaskList(relationId, renameCommand);
+	ddlJob->taskList = DDLTaskList(tableRelationId, renameCommand);
 
 	return list_make1(ddlJob);
 }
@@ -1466,10 +1628,18 @@ ProcessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
 
 	taskList = VacuumTaskList(relationId, vacuumStmt);
 
-	/* save old commit protocol to restore at xact end */
-	Assert(SavedMultiShardCommitProtocol == COMMIT_PROTOCOL_BARE);
-	SavedMultiShardCommitProtocol = MultiShardCommitProtocol;
-	MultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
+	/*
+	 * VACUUM commands cannot run inside a transaction block, so we use
+	 * the "bare" commit protocol without BEGIN/COMMIT. However, ANALYZE
+	 * commands can run inside a transaction block.
+	 */
+	if ((vacuumStmt->options & VACOPT_VACUUM) != 0)
+	{
+		/* save old commit protocol to restore at xact end */
+		Assert(SavedMultiShardCommitProtocol == COMMIT_PROTOCOL_BARE);
+		SavedMultiShardCommitProtocol = MultiShardCommitProtocol;
+		MultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
+	}
 
 	ExecuteModifyTasksWithoutResults(taskList);
 }
@@ -1488,39 +1658,39 @@ static bool
 IsSupportedDistributedVacuumStmt(Oid relationId, VacuumStmt *vacuumStmt)
 {
 	const char *stmtName = (vacuumStmt->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
+	bool distributeStmt = false;
 
 	if (vacuumStmt->relation == NULL)
 	{
-		/* WARN and exit early for unqualified VACUUM commands */
+		/* WARN for unqualified VACUUM commands */
 		ereport(WARNING, (errmsg("not propagating %s command to worker nodes", stmtName),
 						  errhint("Provide a specific table in order to %s "
 								  "distributed tables.", stmtName)));
-
-		return false;
 	}
-
-	if (!OidIsValid(relationId) || !IsDistributedTable(relationId))
+	else if (!OidIsValid(relationId) || !IsDistributedTable(relationId))
 	{
-		return false;
+		/* Nothing to do here; relation no longer exists or is not distributed */
 	}
-
-	if (!EnableDDLPropagation)
+	else if (!EnableDDLPropagation)
 	{
-		/* WARN and exit early if DDL propagation is not enabled */
+		/* WARN if DDL propagation is not enabled */
 		ereport(WARNING, (errmsg("not propagating %s command to worker nodes", stmtName),
 						  errhint("Set citus.enable_ddl_propagation to true in order to "
 								  "send targeted %s commands to worker nodes.",
 								  stmtName)));
 	}
-
-	if (vacuumStmt->options & VACOPT_VERBOSE)
+	else if (vacuumStmt->options & VACOPT_VERBOSE)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("the VERBOSE option is currently unsupported in "
 							   "distributed %s commands", stmtName)));
 	}
+	else
+	{
+		distributeStmt = true;
+	}
 
-	return true;
+	return distributeStmt;
 }
 
 
@@ -1869,15 +2039,18 @@ ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement)
 
 
 /*
- * ErrorIfUnsupportedAlterTableStmt checks if the corresponding alter table statement
- * is supported for distributed tables and errors out if it is not. Currently,
- * only the following commands are supported.
+ * ErrorIfUnsupportedAlterTableStmt checks if the corresponding alter table
+ * statement is supported for distributed tables and errors out if it is not.
+ * Currently, only the following commands are supported.
  *
  * ALTER TABLE ADD|DROP COLUMN
  * ALTER TABLE ALTER COLUMN SET DATA TYPE
  * ALTER TABLE SET|DROP NOT NULL
  * ALTER TABLE SET|DROP DEFAULT
  * ALTER TABLE ADD|DROP CONSTRAINT
+ * ALTER TABLE REPLICA IDENTITY
+ * ALTER TABLE SET ()
+ * ALTER TABLE RESET ()
  */
 static void
 ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
@@ -2017,23 +2190,81 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 			case AT_DropConstraint:
 			case AT_EnableTrigAll:
 			case AT_DisableTrigAll:
+			case AT_ReplicaIdentity:
 			{
 				/*
 				 * We will not perform any special check for ALTER TABLE DROP CONSTRAINT
 				 * , ALTER TABLE .. ALTER COLUMN .. SET NOT NULL and ALTER TABLE ENABLE/
-				 * DISABLE TRIGGER ALL
+				 * DISABLE TRIGGER ALL, ALTER TABLE .. REPLICA IDENTITY ..
 				 */
+				break;
+			}
+
+			case AT_SetRelOptions:  /* SET (...) */
+			case AT_ResetRelOptions:    /* RESET (...) */
+			case AT_ReplaceRelOptions:  /* replace entire option list */
+			{
+				/* this command is supported by Citus */
 				break;
 			}
 
 			default:
 			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("alter table command is currently unsupported"),
-								errdetail("Only ADD|DROP COLUMN, SET|DROP NOT NULL, "
-										  "SET|DROP DEFAULT, ADD|DROP CONSTRAINT, "
-										  "ATTACH|DETACH PARTITION and TYPE subcommands "
-										  "are supported.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("alter table command is currently unsupported"),
+						 errdetail("Only ADD|DROP COLUMN, SET|DROP NOT NULL, "
+								   "SET|DROP DEFAULT, ADD|DROP CONSTRAINT, "
+								   "SET (), RESET (), "
+								   "ATTACH|DETACH PARTITION and TYPE subcommands "
+								   "are supported.")));
+			}
+		}
+	}
+}
+
+
+/*
+ * ErrorIfUnsupportedAlterIndexStmt checks if the corresponding alter index
+ * statement is supported for distributed tables and errors out if it is not.
+ * Currently, only the following commands are supported.
+ *
+ * ALTER INDEX SET ()
+ * ALTER INDEX RESET ()
+ */
+static void
+ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement)
+{
+	List *commandList = alterTableStatement->cmds;
+	ListCell *commandCell = NULL;
+
+	/* error out if any of the subcommands are unsupported */
+	foreach(commandCell, commandList)
+	{
+		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
+		AlterTableType alterTableType = command->subtype;
+
+		switch (alterTableType)
+		{
+			case AT_SetRelOptions:  /* SET (...) */
+			case AT_ResetRelOptions:    /* RESET (...) */
+			case AT_ReplaceRelOptions:  /* replace entire option list */
+			{
+				/* this command is supported by Citus */
+				break;
+			}
+
+			/* unsupported create index statements */
+			case AT_SetTableSpace:
+			default:
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("alter index ... set tablespace ... "
+								"is currently unsupported"),
+						 errdetail("Only RENAME TO, SET (), and RESET () "
+								   "are supported.")));
+				return; /* keep compiler happy */
 			}
 		}
 	}
@@ -2634,19 +2865,14 @@ OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId)
  * ErrorIfDistributedRenameStmt errors out if the corresponding rename statement
  * operates on any part of a distributed table other than a column.
  *
- * Note: This function handles only those rename statements which operate on tables.
+ * Note: This function handles RenameStmt applied to relations handed by Citus.
+ * At the moment of writing this comment, it could be either tables or indexes.
  */
 static void
 ErrorIfUnsupportedRenameStmt(RenameStmt *renameStmt)
 {
-	Assert(IsAlterTableRenameStmt(renameStmt));
-
-	if (renameStmt->renameType == OBJECT_TABLE)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("renaming distributed tables is currently unsupported")));
-	}
-	else if (renameStmt->renameType == OBJECT_TABCONSTRAINT)
+	if (IsAlterTableRenameStmt(renameStmt) &&
+		renameStmt->renameType == OBJECT_TABCONSTRAINT)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("renaming constraints belonging to distributed tables is "
@@ -2767,6 +2993,26 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 
 
 /*
+ * IsIndexRenameStmt returns whether the passed-in RenameStmt is the following
+ * form:
+ *
+ *   - ALTER INDEX RENAME
+ */
+static bool
+IsIndexRenameStmt(RenameStmt *renameStmt)
+{
+	bool isIndexRenameStmt = false;
+
+	if (renameStmt->renameType == OBJECT_INDEX)
+	{
+		isIndexRenameStmt = true;
+	}
+
+	return isIndexRenameStmt;
+}
+
+
+/*
  * AlterInvolvesPartitionColumn checks if the given alter table command
  * involves relation's partition column.
  */
@@ -2824,8 +3070,6 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 
 	if (!ddlJob->concurrentIndexCmd)
 	{
-		ShowNoticeIfNotUsing2PC();
-
 		if (shouldSyncMetadata)
 		{
 			SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
@@ -2863,25 +3107,6 @@ ExecuteDistributedDDLJob(DDLJob *ddlJob)
 							 "invalid index, then retry the original command.")));
 		}
 		PG_END_TRY();
-	}
-}
-
-
-/*
- * ShowNoticeIfNotUsing2PC shows a notice message about using 2PC by setting
- * citus.multi_shard_commit_protocol to 2PC. The notice message is shown only once in a
- * session
- */
-static void
-ShowNoticeIfNotUsing2PC(void)
-{
-	if (MultiShardCommitProtocol != COMMIT_PROTOCOL_2PC && !warnedUserAbout2PC)
-	{
-		ereport(NOTICE, (errmsg("using one-phase commit for distributed DDL commands"),
-						 errhint("You can enable two-phase commit for extra safety with: "
-								 "SET citus.multi_shard_commit_protocol TO '2pc'")));
-
-		warnedUserAbout2PC = true;
 	}
 }
 
@@ -3257,16 +3482,13 @@ CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist)
 	if (attnamelist == NIL)
 	{
 		/* Generate default column list */
-		Form_pg_attribute *attr = tupDesc->attrs;
 		int			attr_count = tupDesc->natts;
 		int			i;
 
 		for (i = 0; i < attr_count; i++)
 		{
-			if (attr[i]->attisdropped)
-			{
+			if (TupleDescAttr(tupDesc, i)->attisdropped)
 				continue;
-			}
 			attnums = lappend_int(attnums, i + 1);
 		}
 	}
@@ -3285,41 +3507,35 @@ CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist)
 			attnum = InvalidAttrNumber;
 			for (i = 0; i < tupDesc->natts; i++)
 			{
-				if (tupDesc->attrs[i]->attisdropped)
-				{
+				Form_pg_attribute att = TupleDescAttr(tupDesc, i);
+
+				if (att->attisdropped)
 					continue;
-				}
-				if (namestrcmp(&(tupDesc->attrs[i]->attname), name) == 0)
+				if (namestrcmp(&(att->attname), name) == 0)
 				{
-					attnum = tupDesc->attrs[i]->attnum;
+					attnum = att->attnum;
 					break;
 				}
 			}
 			if (attnum == InvalidAttrNumber)
 			{
 				if (rel != NULL)
-				{
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
-					errmsg("column \"%s\" of relation \"%s\" does not exist",
-						   name, RelationGetRelationName(rel))));
-				}
+							 errmsg("column \"%s\" of relation \"%s\" does not exist",
+									name, RelationGetRelationName(rel))));
 				else
-				{
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
 							 errmsg("column \"%s\" does not exist",
 									name)));
-				}
 			}
 			/* Check for duplicates */
 			if (list_member_int(attnums, attnum))
-			{
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_COLUMN),
 						 errmsg("column \"%s\" specified more than once",
 								name)));
-			}
 			attnums = lappend_int(attnums, attnum);
 		}
 	}

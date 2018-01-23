@@ -68,10 +68,11 @@ int ShardCount = 32;
 int ShardReplicationFactor = 1; /* desired replication factor for shards */
 int ShardMaxSize = 1048576;     /* maximum size in KB one shard can grow to */
 int ShardPlacementPolicy = SHARD_PLACEMENT_ROUND_ROBIN;
+int NextShardId = 0;
+int NextPlacementId = 0;
 
-
+static List * GetTableReplicaIdentityCommand(Oid relationId);
 static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor);
-
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_get_table_metadata);
@@ -79,6 +80,9 @@ PG_FUNCTION_INFO_V1(master_get_table_ddl_events);
 PG_FUNCTION_INFO_V1(master_get_new_shardid);
 PG_FUNCTION_INFO_V1(master_get_new_placementid);
 PG_FUNCTION_INFO_V1(master_get_active_worker_nodes);
+PG_FUNCTION_INFO_V1(master_get_round_robin_candidate_nodes);
+PG_FUNCTION_INFO_V1(master_stage_shard_row);
+PG_FUNCTION_INFO_V1(master_stage_shard_placement_row);
 
 
 /*
@@ -289,13 +293,32 @@ master_get_new_shardid(PG_FUNCTION_ARGS)
 uint64
 GetNextShardId()
 {
-	text *sequenceName = cstring_to_text(SHARDID_SEQUENCE_NAME);
-	Oid sequenceId = ResolveRelationId(sequenceName);
-	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
+	text *sequenceName = NULL;
+	Oid sequenceId = InvalidOid;
+	Datum sequenceIdDatum = 0;
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
 	Datum shardIdDatum = 0;
 	uint64 shardId = 0;
+
+	/*
+	 * In regression tests, we would like to generate shard IDs consistently
+	 * even if the tests run in parallel. Instead of the sequence, we can use
+	 * the next_shard_id GUC to specify which shard ID the current session should
+	 * generate next. The GUC is automatically increased by 1 every time a new
+	 * shard ID is generated.
+	 */
+	if (NextShardId > 0)
+	{
+		shardId = NextShardId;
+		NextShardId += 1;
+
+		return shardId;
+	}
+
+	sequenceName = cstring_to_text(SHARDID_SEQUENCE_NAME);
+	sequenceId = ResolveRelationId(sequenceName);
+	sequenceIdDatum = ObjectIdGetDatum(sequenceId);
 
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
@@ -349,13 +372,32 @@ master_get_new_placementid(PG_FUNCTION_ARGS)
 uint64
 GetNextPlacementId(void)
 {
-	text *sequenceName = cstring_to_text(PLACEMENTID_SEQUENCE_NAME);
-	Oid sequenceId = ResolveRelationId(sequenceName);
-	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
+	text *sequenceName = NULL;
+	Oid sequenceId = InvalidOid;
+	Datum sequenceIdDatum = 0;
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
 	Datum placementIdDatum = 0;
 	uint64 placementId = 0;
+
+	/*
+	 * In regression tests, we would like to generate placement IDs consistently
+	 * even if the tests run in parallel. Instead of the sequence, we can use
+	 * the next_placement_id GUC to specify which shard ID the current session
+	 * should generate next. The GUC is automatically increased by 1 every time
+	 * a new placement ID is generated.
+	 */
+	if (NextPlacementId > 0)
+	{
+		placementId = NextPlacementId;
+		NextPlacementId += 1;
+
+		return placementId;
+	}
+
+	sequenceName = cstring_to_text(PLACEMENTID_SEQUENCE_NAME);
+	sequenceId = ResolveRelationId(sequenceName);
+	sequenceIdDatum = ObjectIdGetDatum(sequenceId);
 
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
@@ -368,6 +410,45 @@ GetNextPlacementId(void)
 	placementId = DatumGetInt64(placementIdDatum);
 
 	return placementId;
+}
+
+
+/*
+ * master_get_round_robin_candidate_nodes is a stub UDF to make pg_upgrade
+ * work flawlessly while upgrading servers from 6.1. This implementation
+ * will be removed after the UDF dropped on the sql side properly.
+ */
+Datum
+master_get_round_robin_candidate_nodes(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("this function is deprecated and no longer is used")));
+}
+
+
+/*
+ * master_stage_shard_row is a stub UDF to make pg_upgrade
+ * work flawlessly while upgrading servers from 6.1. This implementation
+ * will be removed after the UDF dropped on the sql side properly.
+ */
+Datum
+master_stage_shard_row(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("this function is deprecated and no longer is used")));
+}
+
+
+/*
+ * master_stage_shard_placement_row is a stub UDF to make pg_upgrade
+ * work flawlessly while upgrading servers from 6.1. This implementation
+ * will be removed after the UDF dropped on the sql side properly.
+ */
+Datum
+master_stage_shard_placement_row(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("this function is deprecated and no longer is used")));
 }
 
 
@@ -474,6 +555,7 @@ GetTableDDLEvents(Oid relationId, bool includeSequenceDefaults)
 	List *tableDDLEventList = NIL;
 	List *tableCreationCommandList = NIL;
 	List *indexAndConstraintCommandList = NIL;
+	List *replicaIdentityEvents = NIL;
 
 	tableCreationCommandList = GetTableCreationCommands(relationId,
 														includeSequenceDefaults);
@@ -482,7 +564,42 @@ GetTableDDLEvents(Oid relationId, bool includeSequenceDefaults)
 	indexAndConstraintCommandList = GetTableIndexAndConstraintCommands(relationId);
 	tableDDLEventList = list_concat(tableDDLEventList, indexAndConstraintCommandList);
 
+	replicaIdentityEvents = GetTableReplicaIdentityCommand(relationId);
+	tableDDLEventList = list_concat(tableDDLEventList, replicaIdentityEvents);
+
 	return tableDDLEventList;
+}
+
+
+/*
+ * GetTableReplicaIdentityCommand returns the list of DDL commands to
+ * (re)define the replica identity choice for a given table.
+ */
+static List *
+GetTableReplicaIdentityCommand(Oid relationId)
+{
+	List *replicaIdentityCreateCommandList = NIL;
+	char *replicaIdentityCreateCommand = NULL;
+
+	/*
+	 * We skip non-relations because postgres does not support
+	 * ALTER TABLE .. REPLICA IDENTITY on non-relations.
+	 */
+	char relationKind = get_rel_relkind(relationId);
+	if (relationKind != RELKIND_RELATION)
+	{
+		return NIL;
+	}
+
+	replicaIdentityCreateCommand = pg_get_replica_identity_command(relationId);
+
+	if (replicaIdentityCreateCommand)
+	{
+		replicaIdentityCreateCommandList = lappend(replicaIdentityCreateCommandList,
+												   replicaIdentityCreateCommand);
+	}
+
+	return replicaIdentityCreateCommandList;
 }
 
 

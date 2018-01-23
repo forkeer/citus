@@ -36,11 +36,12 @@
 #include "distributed/multi_executor.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_shard_transaction.h"
 #include "distributed/placement_connection.h"
+#include "distributed/subplan_execution.h"
 #include "distributed/relay_utility.h"
 #include "distributed/remote_commands.h"
 #include "distributed/remote_transaction.h"
@@ -96,10 +97,10 @@ static void ExtractParametersFromParamListInfo(ParamListInfo paramListInfo,
 static bool SendQueryInSingleRowMode(MultiConnection *connection, char *query,
 									 ParamListInfo paramListInfo);
 static bool StoreQueryResult(CitusScanState *scanState, MultiConnection *connection,
-							 bool failOnError, int64 *rows);
+							 bool failOnError, int64 *rows,
+							 DistributedExecutionStats *executionStats);
 static bool ConsumeQueryResult(MultiConnection *connection, bool failOnError,
 							   int64 *rows);
-static LOCKMODE LockModeForModifyTask(Task *task);
 
 
 /*
@@ -394,8 +395,8 @@ void
 CitusModifyBeginScan(CustomScanState *node, EState *estate, int eflags)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
-	MultiPlan *multiPlan = scanState->multiPlan;
-	Job *workerJob = multiPlan->workerJob;
+	DistributedPlan *distributedPlan = scanState->distributedPlan;
+	Job *workerJob = distributedPlan->workerJob;
 	Query *jobQuery = workerJob->jobQuery;
 	List *taskList = workerJob->taskList;
 	bool deferredPruning = workerJob->deferredPruning;
@@ -440,7 +441,7 @@ CitusModifyBeginScan(CustomScanState *node, EState *estate, int eflags)
 	 * We are taking locks on partitions of partitioned tables. These locks are
 	 * necessary for locking tables that appear in the SELECT part of the query.
 	 */
-	LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
+	LockPartitionsInRelationList(distributedPlan->relationIdList, AccessShareLock);
 
 	/* modify tasks are always assigned using first-replica policy */
 	workerJob->taskList = FirstReplicaAssignTaskList(taskList);
@@ -459,9 +460,9 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 
 	if (!scanState->finishedRemoteScan)
 	{
-		MultiPlan *multiPlan = scanState->multiPlan;
-		bool hasReturning = multiPlan->hasReturning;
-		Job *workerJob = multiPlan->workerJob;
+		DistributedPlan *distributedPlan = scanState->distributedPlan;
+		bool hasReturning = distributedPlan->hasReturning;
+		Job *workerJob = distributedPlan->workerJob;
 		List *taskList = workerJob->taskList;
 		ListCell *taskCell = NULL;
 		bool multipleTasks = list_length(taskList) > 1;
@@ -506,10 +507,10 @@ RouterMultiModifyExecScan(CustomScanState *node)
 
 	if (!scanState->finishedRemoteScan)
 	{
-		MultiPlan *multiPlan = scanState->multiPlan;
-		Job *workerJob = multiPlan->workerJob;
+		DistributedPlan *distributedPlan = scanState->distributedPlan;
+		Job *workerJob = distributedPlan->workerJob;
 		List *taskList = workerJob->taskList;
-		bool hasReturning = multiPlan->hasReturning;
+		bool hasReturning = distributedPlan->hasReturning;
 		bool isModificationQuery = true;
 
 		ExecuteMultipleTasks(scanState, taskList, isModificationQuery, hasReturning);
@@ -536,12 +537,14 @@ RouterSelectExecScan(CustomScanState *node)
 
 	if (!scanState->finishedRemoteScan)
 	{
-		MultiPlan *multiPlan = scanState->multiPlan;
-		Job *workerJob = multiPlan->workerJob;
+		DistributedPlan *distributedPlan = scanState->distributedPlan;
+		Job *workerJob = distributedPlan->workerJob;
 		List *taskList = workerJob->taskList;
 
 		/* we are taking locks on partitions of partitioned tables */
-		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
+		LockPartitionsInRelationList(distributedPlan->relationIdList, AccessShareLock);
+
+		ExecuteSubPlans(distributedPlan);
 
 		if (list_length(taskList) > 0)
 		{
@@ -575,6 +578,7 @@ ExecuteSingleSelectTask(CitusScanState *scanState, Task *task)
 	ListCell *taskPlacementCell = NULL;
 	char *queryString = task->queryString;
 	List *relationShardList = task->relationShardList;
+	DistributedExecutionStats executionStats = { 0 };
 
 	/*
 	 * Try to run the query to completion on one placement. If the query fails
@@ -594,6 +598,8 @@ ExecuteSingleSelectTask(CitusScanState *scanState, Task *task)
 		{
 			placementAccessList = BuildPlacementSelectList(taskPlacement->groupId,
 														   relationShardList);
+
+			Assert(list_length(placementAccessList) == list_length(relationShardList));
 		}
 		else
 		{
@@ -613,6 +619,20 @@ ExecuteSingleSelectTask(CitusScanState *scanState, Task *task)
 		connection = GetPlacementListConnection(connectionFlags, placementAccessList,
 												NULL);
 
+		/*
+		 * Make sure we open a transaction block and assign a distributed transaction
+		 * ID if we are in a coordinated transaction.
+		 *
+		 * This can happen when the SELECT goes to a node that was not involved in
+		 * the transaction so far, or when existing connections to the node are
+		 * claimed exclusively, e.g. the connection might be claimed to copy the
+		 * intermediate result of a CTE to the node. Especially in the latter case,
+		 * we want to make sure that we open a transaction block and assign a
+		 * distributed transaction ID, such that the query can read intermediate
+		 * results.
+		 */
+		RemoteTransactionBeginIfNecessary(connection);
+
 		queryOK = SendQueryInSingleRowMode(connection, queryString, paramListInfo);
 		if (!queryOK)
 		{
@@ -620,7 +640,14 @@ ExecuteSingleSelectTask(CitusScanState *scanState, Task *task)
 		}
 
 		queryOK = StoreQueryResult(scanState, connection, dontFailOnError,
-								   &currentAffectedTupleCount);
+								   &currentAffectedTupleCount,
+								   &executionStats);
+
+		if (CheckIfSizeLimitIsExceeded(&executionStats))
+		{
+			ErrorSizeLimitIsExceeded();
+		}
+
 		if (queryOK)
 		{
 			return;
@@ -634,7 +661,8 @@ ExecuteSingleSelectTask(CitusScanState *scanState, Task *task)
 /*
  * BuildPlacementSelectList builds a list of SELECT placement accesses
  * which can be used to call StartPlacementListConnection or
- * GetPlacementListConnection.
+ * GetPlacementListConnection. If the node group does not have a placement
+ * (e.g. in case of a broadcast join) then the shard is skipped.
  */
 List *
 BuildPlacementSelectList(uint32 groupId, List *relationShardList)
@@ -651,8 +679,7 @@ BuildPlacementSelectList(uint32 groupId, List *relationShardList)
 		placement = FindShardPlacementOnGroup(groupId, relationShard->shardId);
 		if (placement == NULL)
 		{
-			ereport(ERROR, (errmsg("no active placement of shard %ld found on group %d",
-								   relationShard->shardId, groupId)));
+			continue;
 		}
 
 		placementAccess = CreatePlacementAccess(placement, PLACEMENT_ACCESS_SELECT);
@@ -693,7 +720,7 @@ static void
 ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTasks,
 						bool expectResults)
 {
-	CmdType operation = scanState->multiPlan->operation;
+	CmdType operation = scanState->distributedPlan->operation;
 	EState *executorState = scanState->customScanState.ss.ps.state;
 	ParamListInfo paramListInfo = executorState->es_param_list_info;
 	List *taskPlacementList = task->taskPlacementList;
@@ -701,6 +728,7 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	ListCell *taskPlacementCell = NULL;
 	ListCell *connectionCell = NULL;
 	int64 affectedTupleCount = -1;
+	int failureCount = 0;
 	bool resultsOK = false;
 	bool gotResults = false;
 
@@ -732,12 +760,13 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	/*
 	 * If we are dealing with a partitioned table, we also need to lock its
 	 * partitions.
+	 *
+	 * For DDL commands, we already obtained the appropriate locks in
+	 * ProcessUtility, so we only need to do this for DML commands.
 	 */
-	if (PartitionedTable(relationId))
+	if (PartitionedTable(relationId) && task->taskType == MODIFY_TASK)
 	{
-		LOCKMODE lockMode = LockModeForModifyTask(task);
-
-		LockPartitionRelations(relationId, lockMode);
+		LockPartitionRelations(relationId, RowExclusiveLock);
 	}
 
 	/* prevent replicas of the same shard from diverging */
@@ -761,12 +790,14 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 			 * MarkFailedShardPlacements() to ensure future statements will not use this
 			 * placement.
 			 */
+			failureCount++;
 			continue;
 		}
 
 		queryOK = SendQueryInSingleRowMode(connection, queryString, paramListInfo);
 		if (!queryOK)
 		{
+			failureCount++;
 			continue;
 		}
 
@@ -782,6 +813,15 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 			failOnError = true;
 		}
 
+		if (failureCount + 1 == list_length(taskPlacementList))
+		{
+			/*
+			 * If we already failed on all other placements (possibly 0),
+			 * relay errors directly.
+			 */
+			failOnError = true;
+		}
+
 		/*
 		 * If caller is interested, store query results the first time
 		 * through. The output of the query's execution on other shards is
@@ -790,7 +830,7 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		if (!gotResults && expectResults)
 		{
 			queryOK = StoreQueryResult(scanState, connection, failOnError,
-									   &currentAffectedTupleCount);
+									   &currentAffectedTupleCount, NULL);
 		}
 		else
 		{
@@ -818,9 +858,18 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 			resultsOK = true;
 			gotResults = true;
 		}
+		else
+		{
+			failureCount++;
+		}
 	}
 
-	/* if all placements failed, error out */
+	/*
+	 * If a command results in an error on all workers, we relay the last error
+	 * in the loop above by setting failOnError. However, if all connections fail
+	 * we still complete the loop without throwing an error. In that case, throw
+	 * an error below.
+	 */
 	if (!resultsOK)
 	{
 		ereport(ERROR, (errmsg("could not modify any active placements")));
@@ -865,6 +914,8 @@ GetModifyConnections(Task *task, bool markCritical)
 		/* create placement accesses for placements that appear in a subselect */
 		placementAccessList = BuildPlacementSelectList(taskPlacement->groupId,
 													   relationShardList);
+
+		Assert(list_length(placementAccessList) == list_length(relationShardList));
 
 		/* create placement access for the placement that we're modifying */
 		placementModification = CreatePlacementAccess(taskPlacement,
@@ -1000,18 +1051,27 @@ ExecuteModifyTasks(List *taskList, bool expectResults, ParamListInfo paramListIn
 	 * In multi shard modification, we expect that all tasks operates on the
 	 * same relation, so it is enough to acquire a lock on the first task's
 	 * anchor relation's partitions.
+	 *
+	 * For DDL commands, we already obtained the appropriate locks in
+	 * ProcessUtility, so we only need to do this for DML commands.
 	 */
 	firstTask = (Task *) linitial(taskList);
 	firstShardInterval = LoadShardInterval(firstTask->anchorShardId);
-	if (PartitionedTable(firstShardInterval->relationId))
+	if (PartitionedTable(firstShardInterval->relationId) &&
+		firstTask->taskType == MODIFY_TASK)
 	{
-		LOCKMODE lockMode = LockModeForModifyTask(firstTask);
-
-		LockPartitionRelations(firstShardInterval->relationId, lockMode);
+		LockPartitionRelations(firstShardInterval->relationId, RowExclusiveLock);
 	}
 
-	/* ensure that there are no concurrent modifications on the same shards */
-	AcquireExecutorMultiShardLocks(taskList);
+	/*
+	 * Ensure that there are no concurrent modifications on the same
+	 * shards. For DDL commands, we already obtained the appropriate
+	 * locks in ProcessUtility.
+	 */
+	if (firstTask->taskType == MODIFY_TASK)
+	{
+		AcquireExecutorMultiShardLocks(taskList);
+	}
 
 	BeginOrContinueCoordinatedTransaction();
 
@@ -1112,7 +1172,7 @@ ExecuteModifyTasks(List *taskList, bool expectResults, ParamListInfo paramListIn
 				Assert(scanState != NULL);
 
 				queryOK = StoreQueryResult(scanState, connection, failOnError,
-										   &currentAffectedTupleCount);
+										   &currentAffectedTupleCount, NULL);
 			}
 			else
 			{
@@ -1120,8 +1180,11 @@ ExecuteModifyTasks(List *taskList, bool expectResults, ParamListInfo paramListIn
 											 &currentAffectedTupleCount);
 			}
 
-			/* should have rolled back on error */
-			Assert(queryOK);
+			/* We error out if the worker fails to return a result for the query. */
+			if (!queryOK)
+			{
+				ReportConnectionError(connection, ERROR);
+			}
 
 			if (placementIndex == 0)
 			{
@@ -1295,7 +1358,8 @@ ExtractParametersFromParamListInfo(ParamListInfo paramListInfo, Oid **parameterT
  */
 static bool
 StoreQueryResult(CitusScanState *scanState, MultiConnection *connection,
-				 bool failOnError, int64 *rows)
+				 bool failOnError, int64 *rows,
+				 DistributedExecutionStats *executionStats)
 {
 	TupleDesc tupleDescriptor =
 		scanState->customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
@@ -1395,6 +1459,12 @@ StoreQueryResult(CitusScanState *scanState, MultiConnection *connection,
 				else
 				{
 					columnArray[columnIndex] = PQgetvalue(result, rowIndex, columnIndex);
+					if (SubPlanLevel > 0)
+					{
+						executionStats->totalIntermediateResultSize += PQgetlength(result,
+																				   rowIndex,
+																				   columnIndex);
+					}
 				}
 			}
 
@@ -1513,30 +1583,4 @@ ConsumeQueryResult(MultiConnection *connection, bool failOnError, int64 *rows)
 	}
 
 	return gotResponse && !commandFailed;
-}
-
-
-/*
- * LockModeForRouterModifyTask returns appropriate LOCKMODE for given router
- * modify task.
- */
-static LOCKMODE
-LockModeForModifyTask(Task *task)
-{
-	LOCKMODE lockMode = NoLock;
-	if (task->taskType == DDL_TASK)
-	{
-		lockMode = AccessExclusiveLock;
-	}
-	else if (task->taskType == MODIFY_TASK)
-	{
-		lockMode = RowExclusiveLock;
-	}
-	else
-	{
-		/* we do not allow any other task type in these code path */
-		Assert(false);
-	}
-
-	return lockMode;
 }

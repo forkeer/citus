@@ -2,10 +2,11 @@
 -- MULTI_EXPLAIN
 --
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 570000;
+SET citus.next_shard_id TO 570000;
 
--- print major version to make version-specific tests clear
-SELECT substring(version(), '\d+(?:\.\d+)?') AS major_version;
+-- print whether we're using version > 9 to make version-specific tests clear
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int > 9 AS version_above_nine;
 
 \a\t
 
@@ -355,6 +356,8 @@ ORDER BY
 LIMIT
 	10;
 
+RESET citus.subquery_pushdown;
+
 -- Test all tasks output
 SET citus.explain_all_tasks TO on;
 
@@ -366,6 +369,20 @@ SELECT true AS valid FROM explain_xml($$
 
 SELECT true AS valid FROM explain_json($$
 	SELECT avg(l_linenumber) FROM lineitem WHERE l_orderkey > 9030$$);
+	
+-- Test multi shard update
+EXPLAIN (COSTS FALSE)
+	UPDATE lineitem_hash_part
+	SET l_suppkey = 12;
+	
+EXPLAIN (COSTS FALSE)
+	UPDATE lineitem_hash_part
+	SET l_suppkey = 12
+	WHERE l_orderkey = 1 OR l_orderkey = 3;
+
+-- Test multi shard delete
+EXPLAIN (COSTS FALSE)
+	DELETE FROM lineitem_hash_part;
 
 -- Test track tracker
 SET citus.task_executor_type TO 'task-tracker';
@@ -504,3 +521,36 @@ EXPLAIN (COSTS OFF)
 INSERT INTO lineitem_hash_part
 ( SELECT s FROM generate_series(1,5) s) UNION
 ( SELECT s FROM generate_series(5,10) s);
+
+-- explain with recursive planning
+EXPLAIN (COSTS OFF, VERBOSE true)
+WITH keys AS (
+  SELECT DISTINCT l_orderkey FROM lineitem_hash_part
+),
+series AS (
+  SELECT s FROM generate_series(1,10) s
+)
+SELECT l_orderkey FROM series JOIN keys ON (s = l_orderkey)
+ORDER BY s;
+
+SELECT true AS valid FROM explain_json($$
+  WITH result AS (
+    SELECT l_quantity, count(*) count_quantity FROM lineitem
+	GROUP BY l_quantity ORDER BY count_quantity, l_quantity
+  ),
+  series AS (
+    SELECT s FROM generate_series(1,10) s
+  )
+  SELECT * FROM result JOIN series ON (s = count_quantity) JOIN orders_hash_part ON (s = o_orderkey)
+$$);
+
+SELECT true AS valid FROM explain_xml($$
+  WITH result AS (
+    SELECT l_quantity, count(*) count_quantity FROM lineitem
+	GROUP BY l_quantity ORDER BY count_quantity, l_quantity
+  ),
+  series AS (
+    SELECT s FROM generate_series(1,10) s
+  )
+  SELECT * FROM result JOIN series ON (s = l_quantity) JOIN orders_hash_part ON (s = o_orderkey)
+$$);

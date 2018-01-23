@@ -3,11 +3,11 @@
 --
 -- Check that we can run CREATE INDEX and DROP INDEX statements on distributed
 -- tables.
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 640000;
+SET citus.next_shard_id TO 640000;
 --
 -- CREATE TEST TABLES
 --
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 102080;
+SET citus.next_shard_id TO 102080;
 CREATE TABLE index_test_range(a int, b int, c int);
 SELECT master_create_distributed_table('index_test_range', 'a', 'range');
  master_create_distributed_table 
@@ -64,8 +64,6 @@ SELECT master_create_empty_shard('index_test_append');
 --
 -- Verify that we can create different types of indexes
 CREATE INDEX lineitem_orderkey_index ON lineitem (l_orderkey);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 CREATE INDEX lineitem_partkey_desc_index ON lineitem (l_partkey DESC);
 CREATE INDEX lineitem_partial_index ON lineitem (l_shipdate)
 	WHERE l_shipdate < '1995-01-01';
@@ -92,9 +90,16 @@ CREATE INDEX IF NOT EXISTS lineitem_orderkey_index on index_test_hash(a);
 NOTICE:  relation "lineitem_orderkey_index" already exists, skipping
 -- Verify that we can create indexes concurrently
 CREATE INDEX CONCURRENTLY lineitem_concurrently_index ON lineitem (l_orderkey);
+-- Verify that we warn out on CLUSTER command for distributed tables and no parameter
+CLUSTER index_test_hash USING index_test_hash_index_a;
+WARNING:  not propagating CLUSTER command to worker nodes
+CLUSTER;
+WARNING:  not propagating CLUSTER command to worker nodes
 -- Verify that no-name local CREATE INDEX CONCURRENTLY works
 CREATE TABLE local_table (id integer, name text);
-CREATE INDEX CONCURRENTLY ON local_table(id);
+CREATE INDEX CONCURRENTLY local_table_index ON local_table(id);
+-- Vefify we don't warn out on CLUSTER command for local tables
+CLUSTER local_table USING local_table_index;
 DROP TABLE local_table;
 -- Verify that all indexes got created on the master node and one of the workers
 SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_test_%' ORDER BY indexname;
@@ -203,8 +208,6 @@ ERROR:  cannot drop multiple distributed objects in a single command
 HINT:  Try dropping each object in a separate DROP command.
 -- Verify that we can succesfully drop indexes
 DROP INDEX lineitem_orderkey_index;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 DROP INDEX lineitem_orderkey_index_new;
 DROP INDEX lineitem_partkey_desc_index;
 DROP INDEX lineitem_partial_index;

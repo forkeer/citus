@@ -16,7 +16,7 @@
 #include "distributed/multi_executor.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
 #include "executor/executor.h"
@@ -36,8 +36,6 @@
 
 static void ExecuteSelectIntoRelation(Oid targetRelationId, List *insertTargetList,
 									  Query *selectQuery, EState *executorState);
-static void ExecuteIntoDestReceiver(Query *query, ParamListInfo params,
-									DestReceiver *dest);
 
 
 /*
@@ -55,10 +53,10 @@ CoordinatorInsertSelectExecScan(CustomScanState *node)
 	if (!scanState->finishedRemoteScan)
 	{
 		EState *executorState = scanState->customScanState.ss.ps.state;
-		MultiPlan *multiPlan = scanState->multiPlan;
-		Query *selectQuery = multiPlan->insertSelectSubquery;
-		List *insertTargetList = multiPlan->insertTargetList;
-		Oid targetRelationId = multiPlan->targetRelationId;
+		DistributedPlan *distributedPlan = scanState->distributedPlan;
+		Query *selectQuery = distributedPlan->insertSelectSubquery;
+		List *insertTargetList = distributedPlan->insertTargetList;
+		Oid targetRelationId = distributedPlan->targetRelationId;
 
 		ereport(DEBUG1, (errmsg("Collecting INSERT ... SELECT results on coordinator")));
 
@@ -137,50 +135,9 @@ ExecuteSelectIntoRelation(Oid targetRelationId, List *insertTargetList,
 										   partitionColumnIndex, executorState,
 										   stopOnFailure);
 
-	ExecuteIntoDestReceiver(selectQuery, paramListInfo, (DestReceiver *) copyDest);
+	ExecuteQueryIntoDestReceiver(selectQuery, paramListInfo, (DestReceiver *) copyDest);
 
 	executorState->es_processed = copyDest->tuplesSent;
 
 	XactModificationLevel = XACT_MODIFICATION_DATA;
-}
-
-
-/*
- * ExecuteIntoDestReceiver plans and executes a query and sends results to the given
- * DestReceiver.
- */
-static void
-ExecuteIntoDestReceiver(Query *query, ParamListInfo params, DestReceiver *dest)
-{
-	PlannedStmt *queryPlan = NULL;
-	Portal portal = NULL;
-	int eflags = 0;
-	int cursorOptions = 0;
-	long count = FETCH_ALL;
-
-	/* create a new portal for executing the query */
-	portal = CreateNewPortal();
-
-	/* don't display the portal in pg_cursors, it is for internal use only */
-	portal->visible = false;
-
-	cursorOptions = CURSOR_OPT_PARALLEL_OK;
-
-	/* plan the subquery, this may be another distributed query */
-	queryPlan = pg_plan_query(query, cursorOptions, params);
-
-	PortalDefineQuery(portal,
-					  NULL,
-					  "",
-					  "SELECT",
-					  list_make1(queryPlan),
-					  NULL);
-
-	PortalStart(portal, params, eflags, GetActiveSnapshot());
-#if (PG_VERSION_NUM >= 100000)
-	PortalRun(portal, count, false, true, dest, dest, NULL);
-#else
-	PortalRun(portal, count, false, dest, dest, NULL);
-#endif
-	PortalDrop(portal, false);
 }

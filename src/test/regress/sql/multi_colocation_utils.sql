@@ -1,5 +1,5 @@
 
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1300000;
+SET citus.next_shard_id TO 1300000;
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 4;
 
 -- ===================================================================
@@ -134,14 +134,14 @@ SELECT shards_colocated(1300000, 1300016);
 SELECT shards_colocated(1300000, 1300020);
 
 -- check co-located table list
-SELECT UNNEST(get_colocated_table_array('table1_group1'))::regclass;
-SELECT UNNEST(get_colocated_table_array('table5_groupX'))::regclass;
-SELECT UNNEST(get_colocated_table_array('table6_append'))::regclass;
+SELECT UNNEST(get_colocated_table_array('table1_group1'))::regclass ORDER BY 1;
+SELECT UNNEST(get_colocated_table_array('table5_groupX'))::regclass ORDER BY 1;
+SELECT UNNEST(get_colocated_table_array('table6_append'))::regclass ORDER BY 1;
 
 -- check co-located shard list
-SELECT get_colocated_shard_array(1300000);
-SELECT get_colocated_shard_array(1300016);
-SELECT get_colocated_shard_array(1300020);
+SELECT UNNEST(get_colocated_shard_array(1300000))::regclass ORDER BY 1;
+SELECT UNNEST(get_colocated_shard_array(1300016))::regclass ORDER BY 1;
+SELECT UNNEST(get_colocated_shard_array(1300020))::regclass ORDER BY 1;
 
 -- check FindShardIntervalIndex function
 SELECT find_shard_interval_index(1300000);
@@ -184,7 +184,7 @@ CREATE TABLE table2_groupC ( id text );
 SELECT create_distributed_table('table2_groupC', 'id');
 
 -- change shard count
-SET citus.shard_count = 4;
+SET citus.shard_count = 8;
 
 CREATE TABLE table1_groupD ( id int );
 SELECT create_distributed_table('table1_groupD', 'id');
@@ -285,13 +285,13 @@ SELECT create_distributed_table('table_failing', 'id', colocate_with => NULL);
 -- check with different distribution column types
 CREATE TABLE table_bigint ( id bigint );
 SELECT create_distributed_table('table_bigint', 'id', colocate_with => 'table1_groupE');
-
 -- check worker table schemas
 \c - - - :worker_1_port
-SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.table3_groupE_1300050'::regclass;
-SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='schema_collocation.table4_groupE_1300052'::regclass;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.table3_groupE_1300062'::regclass;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='schema_collocation.table4_groupE_1300064'::regclass;
 
 \c - - - :master_port
+SET citus.next_shard_id TO 1300080;
 
 CREATE TABLE table1_groupF ( id int );
 SELECT create_reference_table('table1_groupF');

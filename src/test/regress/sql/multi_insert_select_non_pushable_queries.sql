@@ -1,5 +1,17 @@
 ------------------------------------
 ------------------------------------
+-- Insert into local table
+------------------------------------
+------------------------------------
+CREATE TABLE test_table_1(id int);
+
+INSERT INTO test_table_1 
+SELECT user_id FROM users_table;
+
+DROP TABLE test_table_1;
+
+------------------------------------
+------------------------------------
 -- Vanilla funnel query
 ------------------------------------
 ------------------------------------
@@ -650,7 +662,7 @@ FROM
   ON users_table.user_id = temp.user_id 
   WHERE users_table.value_1 < 50;
 
--- not supported since one of the queries doesn't have a relation
+-- supported via recursive planning
 INSERT INTO agg_results (user_id, agg_time, value_2_agg)
 SELECT
     user_id,
@@ -669,7 +681,7 @@ FROM (
         users_table.value_1 > 10 AND users_table.value_1 < 12
         ) u LEFT JOIN LATERAL (
           SELECT event_type, time
-          FROM events_table, (SELECT 1 as x) as f
+          FROM events_table, (SELECT random()::int as x) as f
           WHERE user_id = u.user_id AND
           events_table.event_type > 10 AND events_table.event_type < 12
         ) t ON true

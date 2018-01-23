@@ -22,9 +22,11 @@
 #include "distributed/backend_data.h"
 #include "distributed/connection_management.h"
 #include "distributed/hash_helpers.h"
+#include "distributed/intermediate_results.h"
 #include "distributed/multi_shard_transaction.h"
 #include "distributed/transaction_management.h"
 #include "distributed/placement_connection.h"
+#include "distributed/subplan_execution.h"
 #include "utils/hsearch.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -33,7 +35,7 @@
 CoordinatedTransactionState CurrentCoordinatedTransactionState = COORD_TRANS_NONE;
 
 /* GUC, the commit protocol to use for commands affecting more than one connection */
-int MultiShardCommitProtocol = COMMIT_PROTOCOL_1PC;
+int MultiShardCommitProtocol = COMMIT_PROTOCOL_2PC;
 int SavedMultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
 
 /* state needed to keep track of operations used during a transaction */
@@ -154,6 +156,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 * transaction management. Do so before doing other work, so the
 			 * callbacks still can perform work if needed.
 			 */
+			RemoveIntermediateResultsDirectory();
 			ResetShardPlacementTransactionState();
 
 			if (CurrentCoordinatedTransactionState == COORD_TRANS_PREPARED)
@@ -191,6 +194,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 * transaction management. Do so before doing other work, so the
 			 * callbacks still can perform work if needed.
 			 */
+			RemoveIntermediateResultsDirectory();
 			ResetShardPlacementTransactionState();
 
 			/* handles both already prepared and open transactions */
@@ -210,6 +214,16 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			XactModificationLevel = XACT_MODIFICATION_NONE;
 			dlist_init(&InProgressTransactions);
 			CoordinatedTransactionUses2PC = false;
+
+			/*
+			 * We should reset SubPlanLevel in case a transaction is aborted,
+			 * otherwise this variable would stay +ve if the transaction is
+			 * aborted in the middle of a CTE/complex subquery execution
+			 * which would cause the subsequent queries to error out in
+			 * case the copy size is greater than
+			 * citus.max_intermediate_result_size
+			 */
+			SubPlanLevel = 0;
 			UnSetDistributedTransactionId();
 			break;
 		}

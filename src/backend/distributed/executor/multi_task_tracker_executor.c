@@ -25,14 +25,19 @@
 #include <math.h>
 
 #include "commands/dbcommands.h"
+#include "distributed/citus_custom_scan.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/connection_management.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_executor.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/pg_dist_partition.h"
+#include "distributed/resource_lock.h"
+#include "distributed/subplan_execution.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/version_compat.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -71,7 +76,8 @@ static Task * TaskHashLookup(HTAB *trackerHash, TaskType taskType, uint64 jobId,
 							 uint32 taskId);
 static bool TopLevelTask(Task *task);
 static bool TransmitExecutionCompleted(TaskExecution *taskExecution);
-static HTAB * TrackerHash(const char *taskTrackerHashName, List *workerNodeList);
+static HTAB * TrackerHash(const char *taskTrackerHashName, List *workerNodeList,
+						  char *userName);
 static HTAB * TrackerHashCreate(const char *taskTrackerHashName,
 								uint32 taskTrackerHashSize);
 static TaskTracker * TrackerHashEnter(HTAB *taskTrackerHash, char *nodeName,
@@ -91,7 +97,9 @@ static TaskExecStatus ManageTaskExecution(TaskTracker *taskTracker,
 										  Task *task, TaskExecution *taskExecution);
 static TransmitExecStatus ManageTransmitExecution(TaskTracker *transmitTracker,
 												  Task *task,
-												  TaskExecution *taskExecution);
+												  TaskExecution *taskExecution,
+												  DistributedExecutionStats *
+												  executionStats);
 static bool TaskExecutionsCompleted(List *taskList);
 static StringInfo MapFetchTaskQueryString(Task *mapFetchTask, Task *mapTask);
 static void TrackerQueueSqlTask(TaskTracker *taskTracker, Task *task);
@@ -156,10 +164,13 @@ MultiTaskTrackerExecute(Job *job)
 	bool taskFailed = false;
 	bool taskTransmitFailed = false;
 	bool clusterFailed = false;
+	bool sizeLimitIsExceeded = false;
 
+	DistributedExecutionStats executionStats = { 0 };
 	List *workerNodeList = NIL;
 	HTAB *taskTrackerHash = NULL;
 	HTAB *transmitTrackerHash = NULL;
+	char *extensionOwner = CitusExtensionOwnerName();
 	const char *taskTrackerHashName = "Task Tracker Hash";
 	const char *transmitTrackerHashName = "Transmit Tracker Hash";
 	List *jobIdList = NIL;
@@ -201,15 +212,19 @@ MultiTaskTrackerExecute(Job *job)
 	workerNodeList = ActivePrimaryNodeList();
 	taskTrackerCount = (uint32) list_length(workerNodeList);
 
-	taskTrackerHash = TrackerHash(taskTrackerHashName, workerNodeList);
-	transmitTrackerHash = TrackerHash(transmitTrackerHashName, workerNodeList);
+	/* connect as the current user for running queries */
+	taskTrackerHash = TrackerHash(taskTrackerHashName, workerNodeList, NULL);
+
+	/* connect as the superuser for fetching result files */
+	transmitTrackerHash = TrackerHash(transmitTrackerHashName, workerNodeList,
+									  extensionOwner);
 
 	TrackerHashConnect(taskTrackerHash);
 	TrackerHashConnect(transmitTrackerHash);
 
 	/* loop around until all tasks complete, one task fails, or user cancels */
 	while (!(allTasksCompleted || taskFailed || taskTransmitFailed ||
-			 clusterFailed || QueryCancelPending))
+			 clusterFailed || QueryCancelPending || sizeLimitIsExceeded))
 	{
 		TaskTracker *taskTracker = NULL;
 		TaskTracker *transmitTracker = NULL;
@@ -318,7 +333,8 @@ MultiTaskTrackerExecute(Job *job)
 
 			/* call the function that fetches results for completed SQL tasks */
 			transmitExecutionStatus = ManageTransmitExecution(execTransmitTracker,
-															  task, taskExecution);
+															  task, taskExecution,
+															  &executionStats);
 
 			/*
 			 * If we cannot transmit SQL task's results to the master, we first
@@ -351,6 +367,13 @@ MultiTaskTrackerExecute(Job *job)
 			{
 				completedTransmitCount++;
 			}
+		}
+
+
+		if (CheckIfSizeLimitIsExceeded(&executionStats))
+		{
+			sizeLimitIsExceeded = true;
+			break;
 		}
 
 		/* third, loop around task trackers and manage them */
@@ -418,7 +441,11 @@ MultiTaskTrackerExecute(Job *job)
 	 * If we previously broke out of the execution loop due to a task failure or
 	 * user cancellation request, we can now safely emit an error message.
 	 */
-	if (taskFailed)
+	if (sizeLimitIsExceeded)
+	{
+		ErrorSizeLimitIsExceeded();
+	}
+	else if (taskFailed)
 	{
 		ereport(ERROR, (errmsg("failed to execute task %u", failedTaskId)));
 	}
@@ -575,7 +602,7 @@ TaskHashEnter(HTAB *taskHash, Task *task)
 	/* if same node appears twice, we error-out */
 	if (handleFound)
 	{
-		ereport(ERROR, (errmsg("multiple entries for task: \"%d:%ld:%d\"",
+		ereport(ERROR, (errmsg("multiple entries for task: \"%d:" UINT64_FORMAT ":%u\"",
 							   task->taskType, task->jobId, task->taskId)));
 	}
 
@@ -666,10 +693,11 @@ TransmitExecutionCompleted(TaskExecution *taskExecution)
 /*
  * TrackerHash creates a task tracker hash with the given name. The function
  * then inserts one task tracker entry for each node in the given worker node
- * list, and initializes state for each task tracker.
+ * list, and initializes state for each task tracker. The userName argument
+ * indicates which user to connect as.
  */
 static HTAB *
-TrackerHash(const char *taskTrackerHashName, List *workerNodeList)
+TrackerHash(const char *taskTrackerHashName, List *workerNodeList, char *userName)
 {
 	/* create task tracker hash */
 	uint32 taskTrackerHashSize = list_length(workerNodeList);
@@ -711,6 +739,7 @@ TrackerHash(const char *taskTrackerHashName, List *workerNodeList)
 		}
 
 		taskTracker->taskStateHash = taskStateHash;
+		taskTracker->userName = userName;
 	}
 
 	return taskTrackerHash;
@@ -844,9 +873,10 @@ TrackerConnectPoll(TaskTracker *taskTracker)
 			char *nodeName = taskTracker->workerName;
 			uint32 nodePort = taskTracker->workerPort;
 			char *nodeDatabase = get_database_name(MyDatabaseId);
+			char *nodeUser = taskTracker->userName;
 
 			int32 connectionId = MultiClientConnectStart(nodeName, nodePort,
-														 nodeDatabase);
+														 nodeDatabase, nodeUser);
 			if (connectionId != INVALID_CONNECTION_ID)
 			{
 				taskTracker->connectionId = connectionId;
@@ -1260,7 +1290,8 @@ ManageTaskExecution(TaskTracker *taskTracker, TaskTracker *sourceTaskTracker,
  */
 static TransmitExecStatus
 ManageTransmitExecution(TaskTracker *transmitTracker,
-						Task *task, TaskExecution *taskExecution)
+						Task *task, TaskExecution *taskExecution,
+						DistributedExecutionStats *executionStats)
 {
 	int32 *fileDescriptorArray = taskExecution->fileDescriptorArray;
 	uint32 currentNodeIndex = taskExecution->currentNodeIndex;
@@ -1340,7 +1371,7 @@ ManageTransmitExecution(TaskTracker *transmitTracker,
 				int fileFlags = (O_APPEND | O_CREAT | O_RDWR | O_TRUNC | PG_BINARY);
 				int fileMode = (S_IRUSR | S_IWUSR);
 
-				int32 fileDescriptor = BasicOpenFile(filename, fileFlags, fileMode);
+				int32 fileDescriptor = BasicOpenFilePerm(filename, fileFlags, fileMode);
 				if (fileDescriptor >= 0)
 				{
 					/*
@@ -1384,12 +1415,20 @@ ManageTransmitExecution(TaskTracker *transmitTracker,
 			int32 fileDescriptor = fileDescriptorArray[currentNodeIndex];
 			CopyStatus copyStatus = CLIENT_INVALID_COPY;
 			int closed = -1;
+			uint64 bytesReceived = 0;
 
 			/* the open connection belongs to this task */
 			int32 connectionId = TransmitTrackerConnectionId(transmitTracker, task);
 			Assert(connectionId != INVALID_CONNECTION_ID);
 
-			copyStatus = MultiClientCopyData(connectionId, fileDescriptor);
+			copyStatus = MultiClientCopyData(connectionId, fileDescriptor,
+											 &bytesReceived);
+
+			if (SubPlanLevel > 0)
+			{
+				executionStats->totalIntermediateResultSize += bytesReceived;
+			}
+
 			if (copyStatus == CLIENT_COPY_MORE)
 			{
 				/* worker node continues to send more data, keep reading */
@@ -2993,4 +3032,45 @@ TrackerHashDisconnect(HTAB *taskTrackerHash)
 
 		taskTracker = (TaskTracker *) hash_seq_search(&status);
 	}
+}
+
+
+/*
+ * TaskTrackerExecScan is a callback function which returns next tuple from a
+ * task-tracker execution. In the first call, it executes distributed task-tracker
+ * plan and loads results from temporary files into custom scan's tuple store.
+ * Then, it returns tuples one by one from this tuple store.
+ */
+TupleTableSlot *
+TaskTrackerExecScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+	TupleTableSlot *resultSlot = NULL;
+
+	if (!scanState->finishedRemoteScan)
+	{
+		DistributedPlan *distributedPlan = scanState->distributedPlan;
+		Job *workerJob = distributedPlan->workerJob;
+		Query *jobQuery = workerJob->jobQuery;
+
+		if (ContainsReadIntermediateResultFunction((Node *) jobQuery))
+		{
+			ereport(ERROR, (errmsg("Complex subqueries and CTEs are not supported when "
+								   "task_executor_type is set to 'task-tracker'")));
+		}
+
+		/* we are taking locks on partitions of partitioned tables */
+		LockPartitionsInRelationList(distributedPlan->relationIdList, AccessShareLock);
+
+		PrepareMasterJobDirectory(workerJob);
+		MultiTaskTrackerExecute(workerJob);
+
+		LoadTuplesIntoTupleStore(scanState, workerJob);
+
+		scanState->finishedRemoteScan = true;
+	}
+
+	resultSlot = ReturnTupleFromTuplestore(scanState);
+
+	return resultSlot;
 }

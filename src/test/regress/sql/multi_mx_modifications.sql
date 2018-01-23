@@ -106,7 +106,7 @@ SELECT COUNT(*) FROM limit_orders_mx WHERE id = 246;
 DELETE FROM limit_orders_mx WHERE id = (2 * 123);
 SELECT COUNT(*) FROM limit_orders_mx WHERE id = 246;
 
--- commands with no constraints on the partition key are not supported
+-- multi shard delete is supported
 DELETE FROM limit_orders_mx WHERE bidder_id = 162;
 
 -- commands with a USING clause are unsupported
@@ -149,7 +149,7 @@ UPDATE limit_orders_mx SET (kind, limit_price) = ('buy', 999) WHERE id = 246 RET
 INSERT INTO limit_orders_mx VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
 INSERT INTO limit_orders_mx VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
 
--- commands with no constraints on the partition key are not supported
+-- multi shard update is supported
 UPDATE limit_orders_mx SET limit_price = 0.00;
 
 -- attempting to change the partition key is unsupported
@@ -276,7 +276,7 @@ SELECT * FROM multiple_hash_mx WHERE category = '2' ORDER BY category, data;
 INSERT INTO multiple_hash_mx
 SELECT s, s*2 FROM generate_series(1,10) s;
 
--- but are never distributed
+-- including distributed INSERT ... SELECT
 BEGIN;
 SET LOCAL client_min_messages TO DEBUG1;
 INSERT INTO multiple_hash_mx SELECT * FROM multiple_hash_mx;

@@ -1,25 +1,28 @@
 /*-------------------------------------------------------------------------
  *
- * multi_planner.h
+ * distributed_planner.h
  *	  General Citus planner code.
  *
  * Copyright (c) 2012-2016, Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
-#ifndef MULTI_PLANNER_H
-#define MULTI_PLANNER_H
+#ifndef DISTRIBUTED_PLANNER_H
+#define DISTRIBUTED_PLANNER_H
 
 #include "nodes/plannodes.h"
 #include "nodes/relation.h"
 
 #include "distributed/citus_nodes.h"
+#include "distributed/errormessage.h"
 
 
 /* values used by jobs and tasks which do not require identifiers */
 #define INVALID_JOB_ID 0
 #define INVALID_TASK_ID 0
+#define MULTI_TASK_QUERY_INFO_OFF 0  /* do not log multi-task queries */
 
+#define CURSOR_OPT_FORCE_DISTRIBUTED 0x080000
 
 typedef struct RelationRestrictionContext
 {
@@ -71,9 +74,10 @@ typedef struct RelationShard
 } RelationShard;
 
 
-extern PlannedStmt * multi_planner(Query *parse, int cursorOptions,
-								   ParamListInfo boundParams);
-extern struct MultiPlan * GetMultiPlan(CustomScan *node);
+extern PlannedStmt * distributed_planner(Query *parse, int cursorOptions,
+										 ParamListInfo boundParams);
+extern bool NeedsDistributedPlanning(Query *query);
+extern struct DistributedPlan * GetDistributedPlan(CustomScan *node);
 extern void multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 											Index index, RangeTblEntry *rte);
 extern void multi_join_restriction_hook(PlannerInfo *root,
@@ -83,10 +87,11 @@ extern void multi_join_restriction_hook(PlannerInfo *root,
 										JoinType jointype,
 										JoinPathExtraData *extra);
 extern bool IsModifyCommand(Query *query);
-extern bool IsModifyMultiPlan(struct MultiPlan *multiPlan);
+extern bool IsUpdateOrDelete(struct DistributedPlan *distributedPlan);
+extern bool IsModifyDistributedPlan(struct DistributedPlan *distributedPlan);
+extern bool IsMultiTaskPlan(struct DistributedPlan *distributedPlan);
+extern bool IsMultiShardModifyPlan(struct DistributedPlan *distributedPlan);
 extern RangeTblEntry * RemoteScanRangeTableEntry(List *columnNameList);
-
-
 extern int GetRTEIdentity(RangeTblEntry *rte);
 
-#endif /* MULTI_PLANNER_H */
+#endif /* DISTRIBUTED_PLANNER_H */

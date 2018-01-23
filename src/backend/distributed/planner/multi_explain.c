@@ -30,9 +30,10 @@
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_master_planner.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/remote_commands.h"
+#include "distributed/recursive_planning.h"
 #include "distributed/placement_connection.h"
 #include "distributed/worker_protocol.h"
 #include "lib/stringinfo.h"
@@ -72,6 +73,7 @@ typedef struct RemoteExplainPlan
 
 
 /* Explain functions for distributed queries */
+static void ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es);
 static void ExplainJob(Job *job, ExplainState *es);
 static void ExplainMapMergeJob(MapMergeJob *mapMergeJob, ExplainState *es);
 static void ExplainTaskList(List *taskList, ExplainState *es);
@@ -92,6 +94,7 @@ static void ExplainOneQuery(Query *query, int cursorOptions,
 static void ExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 							const char *queryString, ParamListInfo params);
 #endif
+#if (PG_VERSION_NUM < 110000)
 static void ExplainOpenGroup(const char *objtype, const char *labelname,
 							 bool labeled, ExplainState *es);
 static void ExplainCloseGroup(const char *objtype, const char *labelname,
@@ -99,6 +102,7 @@ static void ExplainCloseGroup(const char *objtype, const char *labelname,
 static void ExplainXMLTag(const char *tagname, int flags, ExplainState *es);
 static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
+#endif
 
 
 /*
@@ -110,7 +114,7 @@ void
 CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
-	MultiPlan *multiPlan = scanState->multiPlan;
+	DistributedPlan *distributedPlan = scanState->distributedPlan;
 
 	if (!ExplainDistributedQueries)
 	{
@@ -122,7 +126,12 @@ CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es
 
 	ExplainOpenGroup("Distributed Query", "Distributed Query", true, es);
 
-	ExplainJob(multiPlan->workerJob, es);
+	if (distributedPlan->subPlanList != NIL)
+	{
+		ExplainSubPlans(distributedPlan, es);
+	}
+
+	ExplainJob(distributedPlan->workerJob, es);
 
 	ExplainCloseGroup("Distributed Query", "Distributed Query", true, es);
 }
@@ -138,8 +147,8 @@ CoordinatorInsertSelectExplainScan(CustomScanState *node, List *ancestors,
 								   struct ExplainState *es)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
-	MultiPlan *multiPlan = scanState->multiPlan;
-	Query *query = multiPlan->insertSelectSubquery;
+	DistributedPlan *distributedPlan = scanState->distributedPlan;
+	Query *query = distributedPlan->insertSelectSubquery;
 	IntoClause *into = NULL;
 	ParamListInfo params = NULL;
 	char *queryString = NULL;
@@ -161,6 +170,58 @@ CoordinatorInsertSelectExplainScan(CustomScanState *node, List *ancestors,
 #endif
 
 	ExplainCloseGroup("Select Query", "Select Query", false, es);
+}
+
+
+/*
+ * ExplainSubPlans generates EXPLAIN output for subplans for CTEs
+ * and complex subqueries. Because the planning for these queries
+ * is done along with the top-level plan, we cannot determine the
+ * planning time and set it to 0.
+ */
+static void
+ExplainSubPlans(DistributedPlan *distributedPlan, ExplainState *es)
+{
+	ListCell *subPlanCell = NULL;
+	uint64 planId = distributedPlan->planId;
+
+	ExplainOpenGroup("Subplans", "Subplans", false, es);
+
+	foreach(subPlanCell, distributedPlan->subPlanList)
+	{
+		DistributedSubPlan *subPlan = (DistributedSubPlan *) lfirst(subPlanCell);
+		PlannedStmt *plan = subPlan->plan;
+		IntoClause *into = NULL;
+		ParamListInfo params = NULL;
+		char *queryString = NULL;
+		instr_time planduration;
+
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			char *resultId = GenerateResultId(planId, subPlan->subPlanId);
+
+			appendStringInfoSpaces(es->str, es->indent * 2);
+			appendStringInfo(es->str, "->  Distributed Subplan %s\n", resultId);
+			es->indent += 3;
+		}
+
+		/* set the planning time to 0 */
+		INSTR_TIME_SET_CURRENT(planduration);
+		INSTR_TIME_SUBTRACT(planduration, planduration);
+
+#if (PG_VERSION_NUM >= 100000)
+		ExplainOnePlan(plan, into, es, queryString, params, NULL, &planduration);
+#else
+		ExplainOnePlan(plan, into, es, queryString, params, &planduration);
+#endif
+
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			es->indent -= 3;
+		}
+	}
+
+	ExplainCloseGroup("Subplans", "Subplans", false, es);
 }
 
 
@@ -635,6 +696,7 @@ ExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 	}
 }
 
+#if (PG_VERSION_NUM < 110000)
 /*
  * Open a group of related objects.
  *
@@ -811,3 +873,4 @@ ExplainYAMLLineStarting(ExplainState *es)
 		appendStringInfoSpaces(es->str, es->indent * 2);
 	}
 }
+#endif

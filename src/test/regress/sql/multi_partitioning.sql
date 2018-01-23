@@ -1,7 +1,7 @@
 --
 -- Distributed Partitioned Table Tests
 --
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1660000;
+SET citus.next_shard_id TO 1660000;
 
 SET citus.shard_count TO 4;
 SET citus.shard_replication_factor TO 1;
@@ -445,8 +445,8 @@ SELECT create_distributed_table('partitioned_users_table', 'user_id', colocate_w
 SELECT create_distributed_table('partitioned_events_table', 'user_id', colocate_with => 'events_table');
 
 -- INSERT/SELECT from regular table to partitioned table
-CREATE TABLE partitioned_users_table_2009 PARTITION OF partitioned_users_table FOR VALUES FROM ('2014-01-01') TO ('2015-01-01');
-CREATE TABLE partitioned_events_table_2009 PARTITION OF partitioned_events_table FOR VALUES FROM ('2014-01-01') TO ('2015-01-01');
+CREATE TABLE partitioned_users_table_2009 PARTITION OF partitioned_users_table FOR VALUES FROM ('2017-01-01') TO ('2018-01-01');
+CREATE TABLE partitioned_events_table_2009 PARTITION OF partitioned_events_table FOR VALUES FROM ('2017-01-01') TO ('2018-01-01');
 
 INSERT INTO partitioned_events_table SELECT * FROM events_table;
 INSERT INTO partitioned_users_table_2009 SELECT * FROM users_table;
@@ -471,28 +471,28 @@ FROM
                    FROM 
                     partitioned_events_table as  "events"
                    WHERE 
-                    event_type IN (10, 11, 12, 13, 14, 15))
+                    event_type IN (1, 2) )
                UNION 
                     (SELECT 
                         "events"."user_id", "events"."time", 1 AS event
                      FROM 
                         partitioned_events_table as "events"
                      WHERE 
-                        event_type IN (15, 16, 17, 18, 19) )
+                        event_type IN (3, 4) )
                UNION 
                     (SELECT 
                         "events"."user_id", "events"."time", 2 AS event
                      FROM 
                         partitioned_events_table as  "events"
                      WHERE 
-                        event_type IN (20, 21, 22, 23, 24, 25) )
+                        event_type IN (5, 6) )
                UNION 
                     (SELECT 
                         "events"."user_id", "events"."time", 3 AS event
                      FROM 
                         partitioned_events_table as "events"
                      WHERE 
-                        event_type IN (26, 27, 28, 29, 30, 13))) t1
+                        event_type IN (1, 6))) t1
          GROUP BY "t1"."user_id") AS t) "q" 
 ) AS final_query
 GROUP BY types
@@ -518,7 +518,7 @@ FROM
                     FROM 
                       partitioned_events_table as "events"
                     WHERE 
-                      event_type IN (10, 11, 12, 13, 14, 15) ) events_subquery_1) 
+                      event_type IN (1, 2)) events_subquery_1) 
                 UNION 
                  (SELECT *
                   FROM
@@ -533,7 +533,7 @@ FROM
                                 events_table as  "events", users_table as "users"
                               WHERE 
                                 events.user_id = users.user_id AND
-                                event_type IN (10, 11, 12, 13, 14, 15)
+                                event_type IN (1, 2)
                                 GROUP BY   "events"."user_id"
                           ) as events_subquery_5
                      ) events_subquery_2)
@@ -545,7 +545,7 @@ FROM
                      FROM 
                         partitioned_events_table as  "events"
                      WHERE 
-                      event_type IN (20, 21, 22, 23, 24, 25) ) events_subquery_3)
+                      event_type IN (3, 4)) events_subquery_3)
                UNION 
                  (SELECT *
                   FROM
@@ -554,7 +554,7 @@ FROM
                      FROM 
                       events_table as "events"
                      WHERE 
-                      event_type IN (26, 27, 28, 29, 30, 13)) events_subquery_4)
+                      event_type IN (5, 6)) events_subquery_4)
                  ) t1
          GROUP BY "t1"."user_id") AS t) "q" 
 INNER JOIN
@@ -563,7 +563,7 @@ INNER JOIN
       FROM 
         partitioned_users_table as "users"
       WHERE 
-        value_1 > 50 and value_1 < 70) AS t 
+        value_1 > 2 and value_1 < 5) AS t 
      ON (t.user_id = q.user_id)) as final_query
 GROUP BY 
   types
@@ -572,9 +572,9 @@ ORDER BY
 
 -- test LIST partitioning
 CREATE TABLE list_partitioned_events_table (user_id int, time date, event_type int, value_2 int, value_3 float, value_4 bigint) PARTITION BY LIST (time);
-CREATE TABLE list_partitioned_events_table_2014_01_01_05 PARTITION OF list_partitioned_events_table FOR VALUES IN ('2014-01-01', '2014-01-02', '2014-01-03', '2014-01-04', '2014-01-05');
-CREATE TABLE list_partitioned_events_table_2014_01_06_10 PARTITION OF list_partitioned_events_table FOR VALUES IN ('2014-01-06', '2014-01-07', '2014-01-08', '2014-01-09', '2014-01-10');
-CREATE TABLE list_partitioned_events_table_2014_01_11_15 PARTITION OF list_partitioned_events_table FOR VALUES IN ('2014-01-11', '2014-01-12', '2014-01-13', '2014-01-14', '2014-01-15');
+CREATE TABLE list_partitioned_events_table_2014_01_01_05 PARTITION OF list_partitioned_events_table FOR VALUES IN ('2017-11-21', '2017-11-22', '2017-11-23', '2017-11-24', '2017-11-25');
+CREATE TABLE list_partitioned_events_table_2014_01_06_10 PARTITION OF list_partitioned_events_table FOR VALUES IN ('2017-11-26', '2017-11-27', '2017-11-28', '2017-11-29', '2017-11-30');
+CREATE TABLE list_partitioned_events_table_2014_01_11_15 PARTITION OF list_partitioned_events_table FOR VALUES IN ('2017-12-01', '2017-12-02', '2017-12-03', '2017-12-04', '2017-12-05');
 
 -- test distributing partitioned table colocated with another partitioned table
 SELECT create_distributed_table('list_partitioned_events_table', 'user_id', colocate_with => 'partitioned_events_table');
@@ -592,8 +592,8 @@ SELECT
 FROM
     events_table
 WHERE
-    time >= '2014-01-01' AND
-    time <= '2014-01-15';
+    time >= '2017-11-21' AND
+    time <= '2017-12-01';
 
 -- LEFT JOINs used with INNER JOINs on range partitioned table, list partitioned table and non-partitioned table
 SELECT
@@ -612,14 +612,14 @@ count(*) AS cnt, "generated_group_field"
             FROM 
              list_partitioned_events_table as "list_partitioned_events_table"
             WHERE 
-              user_id > 80) "temp_data_queries"
+              user_id > 2) "temp_data_queries"
            INNER JOIN
            (SELECT 
               "users"."user_id"
             FROM 
               partitioned_users_table as "users"
             WHERE 
-              user_id > 80 and value_2 = 5) "user_filters_1" 
+              user_id > 2 and value_2 = 1) "user_filters_1" 
            ON ("temp_data_queries".event_user_id = "user_filters_1".user_id)) AS "multi_group_wrapper_1"
         LEFT JOIN
         (SELECT 
@@ -806,11 +806,101 @@ COMMIT;
 
 DROP TABLE
 IF EXISTS
-    partitioning_test_2012,
-    partitioning_test_2013,
+    partitioning_test_2009,
     partitioned_events_table,
     partitioned_users_table,
     list_partitioned_events_table,
     multi_column_partitioning,
     partitioning_locks,
     partitioning_locks_for_select;
+
+-- make sure we can create a partitioned table with streaming replication
+SET citus.replication_model TO 'streaming';
+CREATE TABLE partitioning_test(id int, time date) PARTITION BY RANGE (time);
+CREATE TABLE partitioning_test_2009 PARTITION OF partitioning_test FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
+SELECT create_distributed_table('partitioning_test', 'id');
+DROP TABLE partitioning_test;
+
+-- make sure we can attach partitions to a distributed table in a schema
+CREATE SCHEMA partitioning_schema;
+CREATE TABLE partitioning_schema."schema-test"(id int, time date) PARTITION BY RANGE (time);
+SELECT create_distributed_table('partitioning_schema."schema-test"', 'id');
+CREATE TABLE partitioning_schema."schema-test_2009"(id int, time date);
+ALTER TABLE partitioning_schema."schema-test" ATTACH PARTITION partitioning_schema."schema-test_2009" FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
+
+-- attached partition is distributed as well
+SELECT 
+	logicalrelid 
+FROM 
+	pg_dist_partition 
+WHERE 
+	logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
+ORDER BY 1;
+
+SELECT 
+	logicalrelid, count(*) 
+FROM
+    pg_dist_shard 
+WHERE
+    logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
+GROUP BY
+	logicalrelid
+ORDER BY
+	1,2;
+
+DROP TABLE partitioning_schema."schema-test";
+
+-- make sure we can create partition of a distributed table in a schema
+CREATE TABLE partitioning_schema."schema-test"(id int, time date) PARTITION BY RANGE (time);
+SELECT create_distributed_table('partitioning_schema."schema-test"', 'id');
+CREATE TABLE partitioning_schema."schema-test_2009" PARTITION OF partitioning_schema."schema-test" FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
+
+-- newly created partition is distributed as well
+SELECT 
+	logicalrelid 
+FROM 
+	pg_dist_partition 
+WHERE 
+	logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
+ORDER BY 1;
+
+SELECT 
+	logicalrelid, count(*) 
+FROM
+    pg_dist_shard 
+WHERE
+    logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
+GROUP BY
+	logicalrelid
+ORDER BY
+	1,2;
+
+DROP TABLE partitioning_schema."schema-test";
+
+-- make sure creating partitioned tables works while search_path is set
+CREATE TABLE partitioning_schema."schema-test"(id int, time date) PARTITION BY RANGE (time);
+SET search_path = partitioning_schema;
+SELECT create_distributed_table('"schema-test"', 'id');
+CREATE TABLE partitioning_schema."schema-test_2009" PARTITION OF "schema-test" FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
+
+-- newly created partition is distributed as well
+SELECT 
+	logicalrelid 
+FROM 
+	pg_dist_partition 
+WHERE 
+	logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
+ORDER BY 1;
+
+SELECT 
+	logicalrelid, count(*) 
+FROM
+    pg_dist_shard 
+WHERE
+    logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
+GROUP BY
+	logicalrelid
+ORDER BY
+	1,2;
+
+DROP SCHEMA partitioning_schema CASCADE;

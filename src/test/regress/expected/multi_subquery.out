@@ -2,7 +2,7 @@
 -- MULTI_SUBQUERY
 --
 -- no need to set shardid sequence given that we're not creating any shards
-SET citus.enable_router_execution TO FALSE;
+SET citus.next_shard_id TO 570032;
 -- Check that we error out if shard min/max values are not exactly same.
 SELECT
 	avg(unit_price)
@@ -27,8 +27,7 @@ SET
 	shardmaxvalue = '14947' 
 WHERE 
 	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'orders_subquery'::regclass ORDER BY shardid DESC LIMIT 1);
--- If group by is not on partition column then we error out from single table
--- repartition code path
+-- If group by is not on partition column then we recursively plan
 SELECT
 	avg(order_count)
 FROM
@@ -39,8 +38,11 @@ FROM
 		lineitem_subquery
 	GROUP BY
 		l_suppkey) AS order_counts;
-ERROR:  cannot use real time executor with repartition jobs
-HINT:  Set citus.task_executor_type to "task-tracker".
+        avg         
+--------------------
+ 1.7199369356456930
+(1 row)
+
 -- Check that we error out if join is not on partition columns.
 SELECT
 	avg(unit_price)
@@ -53,8 +55,7 @@ FROM
 		orders_subquery
 	GROUP BY
 		l_orderkey) AS unit_prices;
-ERROR:  cannot pushdown the subquery since all relations are not joined using distribution keys
-DETAIL:  Each relation should be joined with at least one another relation using distribution keys and equality operator.
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
 SELECT
 	avg(unit_price)
 FROM
@@ -68,25 +69,55 @@ FROM
 		l_orderkey = o_custkey
 	GROUP BY
 		l_orderkey) AS unit_prices;
-ERROR:  cannot pushdown the subquery since all relations are not joined using distribution keys
-DETAIL:  Each relation should be joined with at least one another relation using distribution keys and equality operator.
--- Check that we error out if there is non relation subqueries
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- Subqueries without relation with a volatile functions (non-constant) are planned recursively
+SELECT count(*) FROM (
+   SELECT l_orderkey FROM lineitem_subquery JOIN (SELECT random()::int r) sub ON (l_orderkey = r) WHERE r > 10
+) b;
+ count 
+-------
+     0
+(1 row)
+
+SET client_min_messages TO DEBUG;
+-- If there is non relation subqueries then we recursively plan
 SELECT count(*) FROM
 (
    (SELECT l_orderkey FROM lineitem_subquery) UNION ALL
    (SELECT 1::bigint)
 ) b;
-ERROR:  cannot push down this subquery
-DETAIL:  Subqueries without relations are unsupported
--- Check that we error out if queries in union do not include partition columns.
+DEBUG:  generating subplan 7_1 for subquery SELECT l_orderkey FROM public.lineitem_subquery
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  generating subplan 7_2 for subquery SELECT intermediate_result.l_orderkey FROM read_intermediate_result('7_1'::text, 'binary'::citus_copy_format) intermediate_result(l_orderkey bigint) UNION ALL SELECT (1)::bigint AS int8
+DEBUG:  Plan 7 query after replacing subqueries and CTEs: SELECT count(*) AS count FROM (SELECT intermediate_result.l_orderkey FROM read_intermediate_result('7_2'::text, 'binary'::citus_copy_format) intermediate_result(l_orderkey bigint)) b
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ count 
+-------
+ 12001
+(1 row)
+
+-- If queries in union do not include partition columns then we recursively plan
 SELECT count(*) FROM
 (
    (SELECT l_orderkey FROM lineitem_subquery) UNION
    (SELECT l_partkey FROM lineitem_subquery)
 ) b;
-ERROR:  cannot pushdown the subquery since all leaves of the UNION does not include partition key at the same position
-DETAIL:  Each leaf query of the UNION should return partition key at the same position on its target list.
--- Check that we run union queries if partition column is selected.
+DEBUG:  generating subplan 10_1 for subquery SELECT l_orderkey FROM public.lineitem_subquery
+DEBUG:  generating subplan 10_2 for subquery SELECT l_partkey FROM public.lineitem_subquery
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  generating subplan 10_3 for subquery SELECT intermediate_result.l_orderkey FROM read_intermediate_result('10_1'::text, 'binary'::citus_copy_format) intermediate_result(l_orderkey bigint) UNION SELECT intermediate_result.l_partkey FROM read_intermediate_result('10_2'::text, 'binary'::citus_copy_format) intermediate_result(l_partkey integer)
+DEBUG:  Plan 10 query after replacing subqueries and CTEs: SELECT count(*) AS count FROM (SELECT intermediate_result.l_orderkey FROM read_intermediate_result('10_3'::text, 'binary'::citus_copy_format) intermediate_result(l_orderkey bigint)) b
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ count 
+-------
+ 14496
+(1 row)
+
+-- Check that we push down union queries if partition column is selected (no DEBUG messages)
 SELECT count(*) FROM
 (
    (SELECT l_orderkey FROM lineitem_subquery) UNION
@@ -97,7 +128,9 @@ SELECT count(*) FROM
   2985
 (1 row)
 
--- Check that we error out if inner query has Limit but subquery_pushdown is not set
+RESET client_min_messages;
+-- we'd error out if inner query has Limit but subquery_pushdown is not set
+-- but we recursively plan the query
 SELECT
 	avg(o_totalprice/l_quantity)
 FROM
@@ -117,8 +150,11 @@ FROM
 			orders_subquery
 		WHERE
 			lineitem_quantities.l_orderkey = o_orderkey) orders_price ON true;
-ERROR:  cannot push down this subquery
-DETAIL:  Limit in subquery is currently unsupported
+           avg           
+-------------------------
+ 129027.1270000000000000
+(1 row)
+
 -- Limit is only supported when subquery_pushdown is set
 -- Check that we error out if inner query has limit but outer query has not.
 SET citus.subquery_pushdown to ON;
@@ -145,7 +181,412 @@ ERROR:  cannot push down this subquery
 DETAIL:  Limit in subquery without limit in the outermost query is unsupported
 -- reset the flag for next query
 SET citus.subquery_pushdown to OFF;
--- Check that we error out if the outermost query is a distinct clause.
+-- some queries without a subquery uses subquery planner
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+         39
+         39
+         39
+         39
+         38
+         37
+         37
+         37
+         36
+         33
+(10 rows)
+
+-- query is still supported if contains additional join
+-- clauses that includes arithmetic expressions
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity + 3)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+         39
+         39
+         39
+         39
+         38
+         37
+         37
+         37
+         36
+         35
+(10 rows)
+
+-- implicit typecasts in joins is supported
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey::int8 = o_orderkey::int8)
+WHERE
+	(o_orderkey < l_quantity + 3)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+         39
+         39
+         39
+         39
+         38
+         37
+         37
+         37
+         36
+         35
+(10 rows)
+
+-- non-implicit typecasts in joins is not supported
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey::int8 = o_orderkey::int4)
+WHERE
+	(o_orderkey < l_quantity + 3)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- implicit typecast supported in equi-join
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey::int8 = o_orderkey::int8)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+      14946
+      14946
+      14945
+      14945
+      14945
+      14945
+      14945
+      14945
+      14944
+      14944
+(10 rows)
+
+-- non-implicit typecast is not supported in equi-join
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey::int4 = o_orderkey::int8)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- type casts in filters are supported as long as
+-- a valid equi-join exists
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey::int8 < l_quantity::int8 + 3)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+         39
+         39
+         39
+         39
+         38
+         37
+         37
+         37
+         36
+         35
+(10 rows)
+
+-- even if type cast is non-implicit
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey::int4 < l_quantity::int8 + 3)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+         39
+         39
+         39
+         39
+         38
+         37
+         37
+         37
+         36
+         35
+(10 rows)
+
+-- query is not supported if contains an partition column
+-- equi join that includes arithmetic expressions
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey + 1)
+WHERE
+	(o_orderkey < l_quantity)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- query is not supported if there is a single
+-- join clause with arithmetic expression. It fails
+-- with a different error message
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey + 1)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- query is not supported if does not have equi-join clause
+SELECT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey < o_orderkey)
+WHERE
+	(o_orderkey < l_quantity)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- outer joins on reference tables with functions works
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+FROM events_table t1
+LEFT JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+LIMIT 5;
+ user_id | value_1 | value_2 | value_3 
+---------+---------+---------+---------
+       6 |       5 |       2 |       0
+       5 |       5 |       5 |       1
+       4 |       5 |       4 |       1
+       3 |       5 |       5 |       3
+       2 |       4 |       4 |       5
+(5 rows)
+
+-- outer joins on reference tables with simple expressions should work
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+FROM events_table t1
+LEFT JOIN users_reference_table t2 ON t1.user_id > t2.user_id
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+LIMIT 5;
+ user_id | value_1 | value_2 | value_3 
+---------+---------+---------+---------
+       6 |       5 |       5 |       3
+       5 |       5 |       5 |       3
+       4 |       5 |       5 |       3
+       3 |       5 |       4 |       3
+       2 |       5 |       4 |       3
+(5 rows)
+
+-- outer joins on distributed tables with simple expressions should not work
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+FROM events_table t1
+LEFT JOIN users_table t2 ON t1.user_id > t2.user_id
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+LIMIT 5;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- outer joins on reference tables with expressions should work
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+FROM events_table t1
+LEFT JOIN users_reference_table t2 ON t1.user_id = (CASE WHEN t2.user_id > 3 THEN 3 ELSE t2.user_id END)
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+LIMIT 5;
+ user_id | value_1 | value_2 | value_3 
+---------+---------+---------+---------
+       6 |         |         |        
+       5 |         |         |        
+       4 |         |         |        
+       3 |       5 |       5 |       3
+       2 |       4 |       4 |       5
+(5 rows)
+
+-- outer joins on distributed tables and reference tables with expressions should work
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+ FROM 
+ users_table t0 LEFT JOIN
+ events_table t1  ON t0.user_id = t1.user_id
+ LEFT JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
+ ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ LIMIT 5;
+ user_id | value_1 | value_2 | value_3 
+---------+---------+---------+---------
+       6 |       5 |       2 |       0
+       5 |       5 |       5 |       1
+       4 |       5 |       4 |       1
+       3 |       5 |       5 |       3
+       2 |       4 |       4 |       5
+(5 rows)
+
+-- outer joins on distributed tables with expressions should not work
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+ FROM 
+ users_table t0 LEFT JOIN
+ events_table t1  ON t0.user_id = trunc(t1.user_id)
+ LEFT JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
+ ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ LIMIT 5;
+ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+-- inner joins on reference tables with functions works
+SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
+FROM events_table t1
+JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+LIMIT 5;
+ user_id | value_1 | value_2 | value_3 
+---------+---------+---------+---------
+       6 |       5 |       2 |       0
+       5 |       5 |       5 |       1
+       4 |       5 |       4 |       1
+       3 |       5 |       5 |       3
+       2 |       4 |       4 |       5
+(5 rows)
+
+-- distinct queries work
+SELECT DISTINCT l_orderkey
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity)
+ORDER BY l_orderkey DESC
+LIMIT 10;
+ l_orderkey 
+------------
+         39
+         38
+         37
+         36
+         33
+         32
+          7
+          6
+          5
+          4
+(10 rows)
+
+-- count(distinct) queries work
+SELECT COUNT(DISTINCT l_orderkey)
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity);
+ count 
+-------
+    13
+(1 row)
+
+-- the same queries returning a non-partition column
+SELECT l_quantity
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity)
+ORDER BY l_quantity DESC
+LIMIT 10;
+ l_quantity 
+------------
+      50.00
+      49.00
+      46.00
+      46.00
+      45.00
+      44.00
+      44.00
+      44.00
+      43.00
+      43.00
+(10 rows)
+
+-- distinct queries work
+SELECT DISTINCT l_quantity
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity)
+ORDER BY l_quantity DESC
+LIMIT 10;
+ l_quantity 
+------------
+      50.00
+      49.00
+      46.00
+      45.00
+      44.00
+      43.00
+      42.00
+      41.00
+      40.00
+      39.00
+(10 rows)
+
+-- count(distinct) queries work
+SELECT COUNT(DISTINCT l_quantity)
+FROM
+	lineitem_subquery l
+JOIN
+	orders_subquery o
+ON (l_orderkey = o_orderkey)
+WHERE
+	(o_orderkey < l_quantity);
+ count 
+-------
+    25
+(1 row)
+
+-- Check that we support count distinct with a subquery
 SELECT
 	count(DISTINCT a)
 FROM (
@@ -156,8 +597,36 @@ FROM (
 	GROUP BY
 	   l_orderkey
 ) z;
-ERROR:  cannot push down this subquery
-DETAIL:  distinct in the outermost query is unsupported
+ count 
+-------
+     7
+(1 row)
+
+-- We do not support distinct aggregates other than count distinct with a subquery
+SELECT
+	sum(DISTINCT a)
+FROM (
+	SELECT
+		count(*) a
+	FROM
+		lineitem_subquery
+	GROUP BY
+	   l_orderkey
+) z;
+ERROR:  cannot compute aggregate (distinct)
+DETAIL:  Only count(distinct) aggregate is supported in subqueries
+SELECT
+	avg(DISTINCT a)
+FROM (
+	SELECT
+		count(*) a
+	FROM
+		lineitem_subquery
+	GROUP BY
+	   l_orderkey
+) z;
+ERROR:  cannot compute aggregate (distinct)
+DETAIL:  Only count(distinct) aggregate is supported in subqueries
 -- Check supported subquery types.
 SELECT
 	o_custkey,
@@ -260,6 +729,50 @@ SELECT max(l_orderkey) FROM
  14947
 (1 row)
 
+-- Subqueries filter by 2 different users
+SELECT *
+FROM
+  (SELECT *
+   FROM
+     (SELECT user_id,
+             sum(value_2) AS counter
+      FROM events_table
+      WHERE user_id = 2
+      GROUP BY user_id) AS foo,
+     (SELECT user_id,
+             sum(value_2) AS counter
+      FROM events_table
+      WHERE user_id = 3
+      GROUP BY user_id) AS bar
+   WHERE foo.user_id = bar.user_id ) AS baz;
+ user_id | counter | user_id | counter 
+---------+---------+---------+---------
+(0 rows)
+
+-- Subqueries filter by different users, one of which overlaps
+SELECT *
+FROM
+  (SELECT *
+   FROM
+     (SELECT user_id,
+             sum(value_2) AS counter
+      FROM events_table
+      WHERE user_id = 2
+        OR user_id = 3
+      GROUP BY user_id) AS foo,
+     (SELECT user_id,
+             sum(value_2) AS counter
+      FROM events_table
+      WHERE user_id = 2
+      GROUP BY user_id) AS bar
+   WHERE foo.user_id = bar.user_id ) AS baz
+ORDER BY 1,2
+LIMIT 5;
+ user_id | counter | user_id | counter 
+---------+---------+---------+---------
+       2 |      57 |       2 |      57
+(1 row)
+
 -- Add one more shard to one relation, then test if we error out because of different
 -- shard counts for joining relations.
 SELECT master_create_empty_shard('orders_subquery') AS new_shard_id
@@ -299,6 +812,8 @@ SELECT master_create_worker_shards('subquery_pruning_varchar_test_table', 4, 1);
  
 (1 row)
 
+-- temporarily disable router executor to test pruning behaviour of subquery pushdown
+SET citus.enable_router_execution TO off;
 SET client_min_messages TO DEBUG2;
 SELECT * FROM
 	(SELECT count(*) FROM subquery_pruning_varchar_test_table WHERE a = 'onder' GROUP BY a)
@@ -354,6 +869,7 @@ AS foo;
 (0 rows)
 
 DROP TABLE subquery_pruning_varchar_test_table;
+RESET citus.enable_router_execution;
 -- Simple join subquery pushdown
 SELECT
 	avg(array_length(events, 1)) AS event_average
@@ -608,4 +1124,3 @@ $f$);
 DROP FUNCTION run_command_on_master_and_workers(p_sql text);
 SET client_min_messages TO DEFAULT;
 SET citus.subquery_pushdown to OFF;
-SET citus.enable_router_execution TO 'true';

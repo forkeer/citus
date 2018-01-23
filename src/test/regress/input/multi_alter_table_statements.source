@@ -26,9 +26,17 @@ CREATE TABLE lineitem_alter (
 	l_shipinstruct char(25) not null,
 	l_shipmode char(10) not null,
 	l_comment varchar(44) not null
-	);
+	)
+  WITH ( fillfactor = 80 );
 SELECT master_create_distributed_table('lineitem_alter', 'l_orderkey', 'append');
 \copy lineitem_alter FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+
+-- verify that the storage options made it to the table definitions
+SELECT relname, reloptions FROM pg_class WHERE relname = 'lineitem_alter';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'lineitem_alter%' ORDER BY relname;
+\c - - - :master_port
 
 -- Verify that we can add columns
 
@@ -148,9 +156,8 @@ ALTER TABLE lineitem_alter ADD COLUMN new_column non_existent_type;
 ALTER TABLE lineitem_alter ALTER COLUMN null_column SET NOT NULL;
 ALTER TABLE lineitem_alter ALTER COLUMN l_partkey SET DEFAULT 'a';
 
--- Verify that we error out on non-column RENAME statements
+-- Verify that we error out on RENAME CONSTRAINT statement
 
-ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
 ALTER TABLE lineitem_alter RENAME CONSTRAINT constraint_a TO constraint_b;
 
 -- Verify that IF EXISTS works as expected with RENAME statements
@@ -240,9 +247,36 @@ COMMIT;
 SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
 
 -- Create single-shard table (to avoid deadlocks in the upcoming test hackery)
-CREATE TABLE single_shard_items (id integer, name text);
+CREATE TABLE single_shard_items (id integer NOT NULL, name text);
 SELECT master_create_distributed_table('single_shard_items', 'id', 'hash');
 SELECT master_create_worker_shards('single_shard_items', 1, 2);
+
+-- Verify that ALTER TABLE .. REPLICATION IDENTITY [USING INDEX]* .. works
+CREATE UNIQUE INDEX replica_idx on single_shard_items(id);
+
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+
+ALTER TABLE single_shard_items REPLICA IDENTITY nothing;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+
+ALTER TABLE single_shard_items REPLICA IDENTITY full;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+
+ALTER TABLE single_shard_items REPLICA IDENTITY USING INDEX replica_idx;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+
+ALTER TABLE single_shard_items REPLICA IDENTITY default, REPLICA IDENTITY USING INDEX replica_idx, REPLICA IDENTITY nothing;
+SELECT relreplident FROM pg_class WHERE relname = 'single_shard_items';
+SELECT run_command_on_workers('SELECT relreplident FROM pg_class WHERE relname LIKE ''single_shard_items_%'' LIMIT 1;');
+
+ALTER TABLE single_shard_items ADD COLUMN test_col int, REPLICA IDENTITY full;
+
+DROP INDEX replica_idx;
+ALTER TABLE single_shard_items REPLICA IDENTITY default;
 
 -- Drop the column from the worker...
 \c - - - :worker_2_port
@@ -273,7 +307,7 @@ COMMIT;
 SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'single_shard_items' ORDER BY 1;
 
 -- Now try with 2pc off
-RESET citus.multi_shard_commit_protocol;
+SET citus.multi_shard_commit_protocol TO '1pc';
 BEGIN;
 CREATE INDEX single_index_2 ON single_shard_items(id);
 CREATE INDEX single_index_3 ON single_shard_items(name);
@@ -288,13 +322,13 @@ DROP FUNCTION log_ddl_tag();
 DROP TABLE ddl_commands;
 
 \c - - - :master_port
--- Distributed SELECTs cannot appear after ALTER
+-- Distributed SELECTs may appear after ALTER
 BEGIN;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
 SELECT count(*) FROM lineitem_alter;
-COMMIT;
+ROLLBACK;
 
--- but are allowed before
+-- and before
 BEGIN;
 SELECT count(*) FROM lineitem_alter;
 CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
@@ -329,10 +363,60 @@ FROM
 ORDER BY attnum;
 \c - - - :master_port
 
+-- verify that we can rename distributed tables
+SHOW citus.enable_ddl_propagation;
+ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
+
+-- verify rename is performed
+SELECT relname FROM pg_class WHERE relname = 'lineitem_renamed';
+
+-- show rename worked on one worker, too
+\c - - - :worker_1_port
+SELECT relname FROM pg_class WHERE relname LIKE 'lineitem_renamed%'  ORDER BY relname;
+\c - - - :master_port
+
+-- revert it to original name
+ALTER TABLE lineitem_renamed RENAME TO lineitem_alter;
+
+-- show rename worked on one worker, too
+\c - - - :worker_1_port
+SELECT relname FROM pg_class WHERE relname LIKE 'lineitem_alter%' AND relname <> 'lineitem_alter_220009' /* failed copy trails */ ORDER BY relname;
+\c - - - :master_port
+
+-- verify that we can set and reset storage parameters
+ALTER TABLE lineitem_alter SET(fillfactor=40);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'lineitem_alter';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'lineitem_alter%' AND relname <> 'lineitem_alter_220009' /* failed copy trails */ ORDER BY relname;
+\c - - - :master_port
+
+ALTER TABLE lineitem_alter RESET(fillfactor);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'lineitem_alter';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'lineitem_alter%'  AND relname <> 'lineitem_alter_220009' /* failed copy trails */ ORDER BY relname;
+\c - - - :master_port
+
+-- verify that we can rename indexes on distributed tables
+CREATE INDEX temp_index_1 ON lineitem_alter(l_linenumber);
+ALTER INDEX temp_index_1 RENAME TO idx_lineitem_linenumber;
+
+-- verify rename is performed
+SELECT relname FROM pg_class WHERE relname = 'idx_lineitem_linenumber';
+
+-- show rename worked on one worker, too
+\c - - - :worker_1_port
+SELECT relname FROM pg_class WHERE relname LIKE 'idx_lineitem_linenumber%' ORDER BY relname;
+\c - - - :master_port
+
+-- now get rid of the index
+DROP INDEX idx_lineitem_linenumber;
+
 -- verify that we don't intercept DDL commands if propagation is turned off
 SET citus.enable_ddl_propagation to false;
 
--- table rename statement can be performed now
+-- table rename statement can be performed on the coordinator only now
 ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
 -- verify rename is performed
 SELECT relname FROM pg_class WHERE relname = 'lineitem_alter' or relname = 'lineitem_renamed';
@@ -399,7 +483,6 @@ CREATE TABLE trigger_table (
 );
 
 SELECT create_distributed_table('trigger_table', 'id');
-
 -- first set a trigger on a shard
 \c - - - :worker_1_port
 
@@ -411,7 +494,7 @@ CREATE FUNCTION update_value() RETURNS trigger AS $up$
 $up$ LANGUAGE plpgsql;
 
 CREATE TRIGGER update_value
-BEFORE INSERT ON trigger_table_220056
+BEFORE INSERT ON trigger_table_220028
 FOR EACH ROW EXECUTE PROCEDURE update_value();
 
 \c - - - :master_port
@@ -457,3 +540,45 @@ END;
 \c - - - :worker_1_port
 SELECT relname FROM pg_class WHERE relname LIKE 'test_table_1%';
 \c - - - :master_port
+
+-- Test WITH options on a normal simple hash-distributed table
+CREATE TABLE hash_dist(id bigint primary key, f1 text) WITH (fillfactor=40);
+SELECT create_distributed_table('hash_dist','id');
+
+-- verify that the storage options made it to the table definitions
+SELECT relname, reloptions FROM pg_class WHERE relname = 'hash_dist';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relkind = 'r' AND relname LIKE 'hash_dist%' ORDER BY relname;
+\c - - - :master_port
+
+-- verify that we can set and reset index storage parameters
+ALTER INDEX hash_dist_pkey SET(fillfactor=40);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'hash_dist_pkey';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'hash_dist_pkey%' ORDER BY relname;
+\c - - - :master_port
+
+ALTER INDEX hash_dist_pkey RESET(fillfactor);
+SELECT relname, reloptions FROM pg_class WHERE relname = 'hash_dist_pkey';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'hash_dist_pkey%' ORDER BY relname;
+\c - - - :master_port
+
+-- verify error message on ALTER INDEX, SET TABLESPACE is unsupported
+ALTER INDEX hash_dist_pkey SET TABLESPACE foo;
+
+-- verify that we can add indexes with new storage options
+CREATE UNIQUE INDEX another_index ON hash_dist(id) WITH (fillfactor=50);
+
+-- show the index and its storage options on coordinator, then workers
+SELECT relname, reloptions FROM pg_class WHERE relname = 'another_index';
+
+\c - - - :worker_1_port
+SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'another_index%' ORDER BY relname;
+\c - - - :master_port
+
+-- get rid of the index
+DROP INDEX another_index;

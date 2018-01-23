@@ -17,7 +17,7 @@
 #include "distributed/hash_helpers.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/placement_connection.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -53,6 +53,9 @@ typedef struct ConnectionReference
 	/* colocation group of the placement, if any */
 	uint32 colocationGroupId;
 	uint32 representativeValue;
+
+	/* placementId of the placement, used only for append distributed tables */
+	uint64 placementId;
 
 	/* membership in MultiConnection->referencedPlacements */
 	dlist_node connectionNode;
@@ -357,6 +360,7 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 			placementConnection->hadDML = false;
 			placementConnection->userName = MemoryContextStrdup(TopTransactionContext,
 																userName);
+			placementConnection->placementId = placementAccess->placement->placementId;
 
 			/* record association with connection */
 			dlist_push_tail(&chosenConnection->referencedPlacements,
@@ -507,10 +511,9 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 
 			ereport(ERROR,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-					 errmsg(
-						 "cannot perform DDL on placement %ld, which has been read over "
-						 "multiple connections",
-						 placement->placementId)));
+					 errmsg("cannot perform DDL on placement " UINT64_FORMAT
+							", which has been read over multiple connections",
+							placement->placementId)));
 		}
 		else if (accessType == PLACEMENT_ACCESS_DDL && colocatedEntry != NULL &&
 				 colocatedEntry->hasSecondaryConnections)
@@ -526,8 +529,8 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 
 			ereport(ERROR,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-					 errmsg("cannot perform DDL on placement %ld since a co-located "
-							"placement has been read over multiple connections",
+					 errmsg("cannot perform DDL on placement " UINT64_FORMAT
+							" since a co-located placement has been read over multiple connections",
 							placement->placementId)));
 		}
 		else if (foundModifyingConnection)
@@ -580,8 +583,9 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 
 			ereport(ERROR,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-					 errmsg("cannot establish a new connection for placement %ld, since "
-							"DDL has been executed on a connection that is in use",
+					 errmsg("cannot establish a new connection for "
+							"placement " UINT64_FORMAT
+							", since DDL has been executed on a connection that is in use",
 							placement->placementId)));
 		}
 		else if (placementConnection->hadDML)
@@ -602,8 +606,9 @@ FindPlacementListConnection(int flags, List *placementAccessList, const char *us
 
 			ereport(ERROR,
 					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-					 errmsg("cannot establish a new connection for placement %ld, since "
-							"DML has been executed on a connection that is in use",
+					 errmsg("cannot establish a new connection for "
+							"placement " UINT64_FORMAT
+							", since DML has been executed on a connection that is in use",
 							placement->placementId)));
 		}
 		else if (accessType == PLACEMENT_ACCESS_DDL)
@@ -785,6 +790,14 @@ ConnectionAccessedDifferentPlacement(MultiConnection *connection,
 		ConnectionReference *connectionReference =
 			dlist_container(ConnectionReference, connectionNode, placementIter.cur);
 
+		/* handle append and range distributed tables */
+		if (placement->partitionMethod != DISTRIBUTE_BY_HASH &&
+			placement->placementId != connectionReference->placementId)
+		{
+			return true;
+		}
+
+		/* handle hash distributed tables */
 		if (placement->colocationGroupId != INVALID_COLOCATION_ID &&
 			placement->colocationGroupId == connectionReference->colocationGroupId &&
 			placement->representativeValue != connectionReference->representativeValue)

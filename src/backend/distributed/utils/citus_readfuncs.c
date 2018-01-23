@@ -15,10 +15,11 @@
 
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/errormessage.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "nodes/parsenodes.h"
 #include "nodes/readfuncs.h"
+#include "utils/builtins.h"
 
 
 /*
@@ -158,7 +159,7 @@ CitusSetTag(Node *node, int tag)
 #define atooid(x)  ((Oid) strtoul((x), NULL, 10))
 
 /* XXX: Citus */
-#define atoull(x)  ((uint64) strtoull((x), NULL, 10))
+#define atoull(x)  ((uint64) pg_strtouint64((x), NULL, 10))
 
 #define strtobool(x)  ((*(x) == 't') ? true : false)
 
@@ -195,10 +196,11 @@ ReadJob(READFUNC_ARGS)
 
 
 READFUNC_RET
-ReadMultiPlan(READFUNC_ARGS)
+ReadDistributedPlan(READFUNC_ARGS)
 {
-	READ_LOCALS(MultiPlan);
+	READ_LOCALS(DistributedPlan);
 
+	READ_UINT64_FIELD(planId);
 	READ_INT_FIELD(operation);
 	READ_BOOL_FIELD(hasReturning);
 
@@ -211,7 +213,21 @@ ReadMultiPlan(READFUNC_ARGS)
 	READ_NODE_FIELD(insertTargetList);
 	READ_OID_FIELD(targetRelationId);
 
+	READ_NODE_FIELD(subPlanList);
+
 	READ_NODE_FIELD(planningError);
+
+	READ_DONE();
+}
+
+
+READFUNC_RET
+ReadDistributedSubPlan(READFUNC_ARGS)
+{
+	READ_LOCALS(DistributedSubPlan);
+
+	READ_UINT_FIELD(subPlanId);
+	READ_NODE_FIELD(plan);
 
 	READ_DONE();
 }

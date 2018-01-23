@@ -46,6 +46,7 @@
 #include "distributed/remote_commands.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_transaction.h"
+#include "distributed/version_compat.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "nodes/execnodes.h"
@@ -132,7 +133,13 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	 * sense of this table until we've committed, and we don't want multiple
 	 * backends manipulating this relation.
 	 */
-	relation = relation_open(relationId, ExclusiveLock);
+	relation = try_relation_open(relationId, ExclusiveLock);
+
+	if (relation == NULL)
+	{
+		ereport(ERROR, (errmsg("could not create distributed table: "
+							   "relation does not exist")));
+	}
 
 	/*
 	 * We should do this check here since the codes in the following lines rely
@@ -190,7 +197,13 @@ create_distributed_table(PG_FUNCTION_ARGS)
 	 * sense of this table until we've committed, and we don't want multiple
 	 * backends manipulating this relation.
 	 */
-	relation = relation_open(relationId, ExclusiveLock);
+	relation = try_relation_open(relationId, ExclusiveLock);
+
+	if (relation == NULL)
+	{
+		ereport(ERROR, (errmsg("could not create distributed table: "
+							   "relation does not exist")));
+	}
 
 	/*
 	 * We should do this check here since the codes in the following lines rely
@@ -635,7 +648,8 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 	if (distributionMethod == DISTRIBUTE_BY_HASH)
 	{
 		Oid hashSupportFunction = SupportFunctionForColumn(distributionColumn,
-														   HASH_AM_OID, HASHPROC);
+														   HASH_AM_OID,
+														   HASHSTANDARD_PROC);
 		if (hashSupportFunction == InvalidOid)
 		{
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_FUNCTION),
@@ -714,11 +728,12 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 		}
 
 		/* we currently don't support MX tables to be distributed partitioned table */
-		if (replicationModel == REPLICATION_MODEL_STREAMING)
+		if (replicationModel == REPLICATION_MODEL_STREAMING &&
+			CountPrimariesWithMetadata() > 0)
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("distributing partitioned tables which uses "
-								   "streaming replication is not supported")));
+							errmsg("distributing partitioned tables is not supported "
+								   "with Citus MX")));
 		}
 
 		/* we don't support distributing tables with multi-level partitioning */
@@ -1246,13 +1261,13 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 
 		if (rowsCopied % 1000000 == 0)
 		{
-			ereport(DEBUG1, (errmsg("Copied %ld rows", rowsCopied)));
+			ereport(DEBUG1, (errmsg("Copied " UINT64_FORMAT " rows", rowsCopied)));
 		}
 	}
 
 	if (rowsCopied % 1000000 != 0)
 	{
-		ereport(DEBUG1, (errmsg("Copied %ld rows", rowsCopied)));
+		ereport(DEBUG1, (errmsg("Copied " UINT64_FORMAT " rows", rowsCopied)));
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -1284,7 +1299,7 @@ TupleDescColumnNameList(TupleDesc tupleDescriptor)
 
 	for (columnIndex = 0; columnIndex < tupleDescriptor->natts; columnIndex++)
 	{
-		Form_pg_attribute currentColumn = tupleDescriptor->attrs[columnIndex];
+		Form_pg_attribute currentColumn = TupleDescAttr(tupleDescriptor, columnIndex);
 		char *columnName = NameStr(currentColumn->attname);
 
 		if (currentColumn->attisdropped)
@@ -1311,7 +1326,7 @@ RelationUsesIdentityColumns(TupleDesc relationDesc)
 
 	for (attributeIndex = 0; attributeIndex < relationDesc->natts; attributeIndex++)
 	{
-		Form_pg_attribute attributeForm = relationDesc->attrs[attributeIndex];
+		Form_pg_attribute attributeForm = TupleDescAttr(relationDesc, attributeIndex);
 
 		if (attributeForm->attidentity != '\0')
 		{

@@ -27,6 +27,7 @@
 #include "access/stratnum.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/relay_utility.h"
@@ -99,8 +100,19 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 			{
 				AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 
-				if (command->subtype == AT_AddConstraint ||
-					command->subtype == AT_DropConstraint)
+				if (command->subtype == AT_AddConstraint)
+				{
+					Constraint *constraint = (Constraint *) command->def;
+
+					if (constraint->contype == CONSTR_PRIMARY && constraint->indexname)
+					{
+						char **indexName = &(constraint->indexname);
+						AppendShardIdToName(indexName, shardId);
+					}
+
+					AppendShardIdToConstraintName(command, shardId);
+				}
+				if (command->subtype == AT_DropConstraint)
 				{
 					AppendShardIdToConstraintName(command, shardId);
 				}
@@ -108,6 +120,17 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 				{
 					char **indexName = &(command->name);
 					AppendShardIdToName(indexName, shardId);
+				}
+				else if (command->subtype == AT_ReplicaIdentity)
+				{
+					ReplicaIdentityStmt *replicaIdentity =
+						(ReplicaIdentityStmt *) command->def;
+
+					if (replicaIdentity->identity_type == REPLICA_IDENTITY_INDEX)
+					{
+						char **indexName = &(replicaIdentity->name);
+						AppendShardIdToName(indexName, shardId);
+					}
 				}
 			}
 
@@ -365,12 +388,37 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 				char **oldRelationName = &(renameStmt->relation->relname);
 				char **newRelationName = &(renameStmt->newname);
 				char **objectSchemaName = &(renameStmt->relation->schemaname);
+				int newRelationNameLength;
 
 				/* prefix with schema name if it is not added already */
 				SetSchemaNameIfNotExist(objectSchemaName, schemaName);
 
 				AppendShardIdToName(oldRelationName, shardId);
 				AppendShardIdToName(newRelationName, shardId);
+
+				/*
+				 * PostgreSQL creates array types for each ordinary table, with
+				 * the same name plus a prefix of '_'.
+				 *
+				 * ALTER TABLE ... RENAME TO ... also renames the underlying
+				 * array type, and the DDL is run in parallel connections over
+				 * all the placements and shards at once. Concurrent access
+				 * here deadlocks.
+				 *
+				 * Let's provide an easier to understand error message here
+				 * than the deadlock one.
+				 *
+				 * See also https://github.com/citusdata/citus/issues/1664
+				 */
+				newRelationNameLength = strlen(*newRelationName);
+				if (newRelationNameLength >= (NAMEDATALEN - 1))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_NAME_TOO_LONG),
+							 errmsg(
+								 "shard name %s exceeds %d characters",
+								 *newRelationName, NAMEDATALEN - 1)));
+				}
 			}
 			else if (objectType == OBJECT_COLUMN || objectType == OBJECT_TRIGGER)
 			{
@@ -708,7 +756,15 @@ shard_name(PG_FUNCTION_ARGS)
 
 	schemaId = get_rel_namespace(relationId);
 	schemaName = get_namespace_name(schemaId);
-	qualifiedName = quote_qualified_identifier(schemaName, relationName);
+
+	if (strncmp(schemaName, "public", NAMEDATALEN) == 0)
+	{
+		qualifiedName = (char *) quote_identifier(relationName);
+	}
+	else
+	{
+		qualifiedName = quote_qualified_identifier(schemaName, relationName);
+	}
 
 	PG_RETURN_TEXT_P(cstring_to_text(qualifiedName));
 }

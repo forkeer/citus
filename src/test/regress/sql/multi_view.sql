@@ -45,8 +45,11 @@ SELECT count(*) FROM orders_hash_part join air_shipped_lineitems ON (o_orderkey 
 -- join between views
 SELECT count(*) FROM priority_orders join air_shipped_lineitems ON (o_orderkey = l_orderkey);
 
--- count distinct on partition column is not supported
+-- count distinct on partition column is supported
 SELECT count(distinct o_orderkey) FROM priority_orders join air_shipped_lineitems ON (o_orderkey = l_orderkey);
+
+-- count distinct on non-partition column is supported
+SELECT count(distinct o_orderpriority) FROM priority_orders join air_shipped_lineitems ON (o_orderkey = l_orderkey);
 
 -- count distinct on partition column is supported on router queries
 SELECT count(distinct o_orderkey) FROM priority_orders join air_shipped_lineitems
@@ -71,7 +74,6 @@ SELECT count(*) FROM priority_orders right join lineitem_hash_part ON (o_orderke
 -- but view at the outer side is. This is essentially the same as a left join with arguments reversed.
 SELECT count(*) FROM lineitem_hash_part right join priority_orders ON (o_orderkey = l_orderkey) WHERE l_shipmode ='AIR';
 
-
 -- left join on router query is supported
 SELECT o_orderkey, l_linenumber FROM priority_orders left join air_shipped_lineitems ON (o_orderkey = l_orderkey)
 	WHERE o_orderkey = 2;
@@ -84,6 +86,7 @@ SET citus.task_executor_type to "task-tracker";
 SELECT count(*) FROM priority_orders JOIN air_shipped_lineitems ON (o_custkey = l_suppkey);
 SET citus.task_executor_type to DEFAULT;
 
+-- materialized views work
 -- insert into... select works with views
 CREATE TABLE temp_lineitem(LIKE lineitem_hash_part);
 SELECT create_distributed_table('temp_lineitem', 'l_orderkey', 'hash', 'lineitem_hash_part');
@@ -92,6 +95,25 @@ SELECT count(*) FROM temp_lineitem;
 -- following is a where false query, should not be inserting anything
 INSERT INTO temp_lineitem SELECT * FROM air_shipped_lineitems WHERE l_shipmode = 'MAIL';
 SELECT count(*) FROM temp_lineitem;
+
+-- can create and query materialized views
+CREATE MATERIALIZED VIEW mode_counts
+AS SELECT l_shipmode, count(*) FROM temp_lineitem GROUP BY l_shipmode;
+
+SELECT * FROM mode_counts WHERE l_shipmode = 'AIR' ORDER BY 2 DESC, 1 LIMIT 10;
+
+-- materialized views are local, cannot join with distributed tables
+SELECT count(*) FROM mode_counts JOIN temp_lineitem USING (l_shipmode);
+
+-- new data is not immediately reflected in the view
+INSERT INTO temp_lineitem SELECT * FROM air_shipped_lineitems;
+SELECT * FROM mode_counts WHERE l_shipmode = 'AIR' ORDER BY 2 DESC, 1 LIMIT 10;
+
+-- refresh updates the materialised view with new data
+REFRESH MATERIALIZED VIEW mode_counts;
+SELECT * FROM mode_counts WHERE l_shipmode = 'AIR' ORDER BY 2 DESC, 1 LIMIT 10;
+
+DROP MATERIALIZED VIEW mode_counts;
 
 SET citus.task_executor_type to "task-tracker";
 
@@ -124,8 +146,8 @@ SET citus.task_executor_type to DEFAULT;
 CREATE VIEW lineitems_by_shipping_method AS
 	SELECT l_shipmode, count(*) as cnt FROM lineitem_hash_part GROUP BY 1;
 
--- following will fail due to non GROUP BY of partition key
-SELECT * FROM  lineitems_by_shipping_method;
+-- following will be supported via recursive planning
+SELECT * FROM  lineitems_by_shipping_method ORDER BY 1,2 LIMIT 5;
 
 -- create a view with group by on partition column
 CREATE VIEW lineitems_by_orderkey AS
@@ -156,13 +178,13 @@ DROP VIEW priority_orders;
 CREATE VIEW recent_users AS
 	SELECT user_id, max(time) as lastseen FROM users_table
 	GROUP BY user_id
-	HAVING max(time) > '2014-01-21 05:45:49.978738'::timestamp order by 2 DESC; 
+	HAVING max(time) > '2017-11-23 16:20:33.264457'::timestamp order by 2 DESC; 
 SELECT * FROM recent_users;
 
 -- create a view for recent_events
 CREATE VIEW recent_events AS
 	SELECT user_id, time FROM events_table
-	WHERE time > '2014-01-20 01:45:49.978738'::timestamp;
+	WHERE time > '2017-11-23 16:20:33.264457'::timestamp;
 
 SELECT count(*) FROM recent_events;
 
@@ -221,14 +243,14 @@ SELECT count(*)
 	WHERE ru.user_id IS NULL;
 
 -- join between view and table
--- users who has recent activity and they have an entry with value_1 is less than 15
-SELECT ut.* FROM recent_users ru JOIN users_table ut USING (user_id) WHERE ut.value_1 < 15 ORDER BY 1,2;
+-- users who has recent activity and they have an entry with value_1 is less than 3
+SELECT ut.* FROM recent_users ru JOIN users_table ut USING (user_id) WHERE ut.value_1 < 3 ORDER BY 1,2;
 
 -- determine if a recent user has done a given event type or not
 SELECT ru.user_id, CASE WHEN et.user_id IS NULL THEN 'NO' ELSE 'YES' END as done_event
 	FROM recent_users ru
 	LEFT JOIN events_table et
-	ON(ru.user_id = et.user_id AND et.event_type = 625)
+	ON(ru.user_id = et.user_id AND et.event_type = 6)
 	ORDER BY 2 DESC, 1;
 
 -- view vs table join wrapped inside a subquery
@@ -236,7 +258,7 @@ SELECT * FROM
 	(SELECT ru.user_id, CASE WHEN et.user_id IS NULL THEN 'NO' ELSE 'YES' END as done_event
 		FROM recent_users ru
 		LEFT JOIN events_table et
-		ON(ru.user_id = et.user_id AND et.event_type = 625)
+		ON(ru.user_id = et.user_id AND et.event_type = 6)
 	) s1
 ORDER BY 2 DESC, 1;
 
@@ -250,7 +272,7 @@ SELECT * FROM
 ORDER BY 2 DESC, 1;
 
 -- create a select only view
-CREATE VIEW selected_users AS SELECT * FROM users_table WHERE value_1 >= 120 and value_1 <150;
+CREATE VIEW selected_users AS SELECT * FROM users_table WHERE value_1 >= 1 and value_1 <3;
 CREATE VIEW recent_selected_users AS SELECT su.* FROM selected_users su JOIN recent_users ru USING(user_id);
 
 SELECT user_id FROM recent_selected_users GROUP BY 1 ORDER BY 1;
@@ -259,12 +281,13 @@ SELECT user_id FROM recent_selected_users GROUP BY 1 ORDER BY 1;
 SELECT et.user_id, et.time FROM events_table et WHERE et.user_id IN (SELECT user_id FROM recent_selected_users) GROUP BY 1,2 ORDER BY 1 DESC,2 DESC LIMIT 5;
 
 -- it is supported when it is a router query
-SELECT count(*) FROM events_table et WHERE et.user_id IN (SELECT user_id FROM recent_selected_users WHERE user_id = 90);
+SELECT count(*) FROM events_table et WHERE et.user_id IN (SELECT user_id FROM recent_selected_users WHERE user_id = 1);
 
--- expected this to work but it did not
+-- union between views is supported through recursive planning
 (SELECT user_id FROM recent_users) 
 UNION
-(SELECT user_id FROM selected_users);
+(SELECT user_id FROM selected_users)
+ORDER BY 1;
 
 -- wrapping it inside a SELECT * works
 SELECT *
@@ -272,7 +295,7 @@ SELECT *
 		(SELECT user_id FROM recent_users) 
 		UNION
 		(SELECT user_id FROM selected_users) ) u
-	WHERE user_id < 15 AND user_id > 10
+	WHERE user_id < 2 AND user_id > 0
 	ORDER BY user_id;
 
 -- union all also works for views
@@ -281,7 +304,7 @@ SELECT *
 		(SELECT user_id FROM recent_users) 
 		UNION ALL
 		(SELECT user_id FROM selected_users) ) u
-	WHERE user_id < 15 AND user_id > 10
+	WHERE user_id < 2 AND user_id > 0
 	ORDER BY user_id;
 
 SELECT count(*)
@@ -289,59 +312,60 @@ SELECT count(*)
 		(SELECT user_id FROM recent_users) 
 		UNION
 		(SELECT user_id FROM selected_users) ) u
-	WHERE user_id < 15 AND user_id > 10;
+	WHERE user_id < 2 AND user_id > 0;
 
--- expected this to work but it does not
+-- UNION ALL between views is supported through recursive planning
 SELECT count(*)
 	FROM (
 		(SELECT user_id FROM recent_users) 
 		UNION ALL
 		(SELECT user_id FROM selected_users) ) u
-	WHERE user_id < 15 AND user_id > 10;
+	WHERE user_id < 2 AND user_id > 0;
 
 -- expand view definitions and re-run last 2 queries
 SELECT count(*)
 	FROM (
 		(SELECT user_id FROM (SELECT user_id, max(time) as lastseen FROM users_table
 			GROUP BY user_id
-			HAVING max(time) > '2014-01-21 05:45:49.978738'::timestamp order by 2 DESC) aa
+			HAVING max(time) > '2017-11-22 05:45:49.978738'::timestamp order by 2 DESC) aa
 		) 
 		UNION
-		(SELECT user_id FROM (SELECT * FROM users_table WHERE value_1 >= 120 and value_1 <150) bb) ) u
-	WHERE user_id < 15 AND user_id > 10;
+		(SELECT user_id FROM (SELECT * FROM users_table WHERE value_1 >= 1 and value_1 < 3) bb) ) u
+	WHERE user_id < 2 AND user_id > 0;
 
 SELECT count(*)
 	FROM (
 		(SELECT user_id FROM (SELECT user_id, max(time) as lastseen FROM users_table
 			GROUP BY user_id
-			HAVING max(time) > '2014-01-21 05:45:49.978738'::timestamp order by 2 DESC) aa
+			HAVING max(time) > '2017-11-22 05:45:49.978738'::timestamp order by 2 DESC) aa
 		) 
 		UNION ALL
-		(SELECT user_id FROM (SELECT * FROM users_table WHERE value_1 >= 120 and value_1 <150) bb) ) u
-	WHERE user_id < 15 AND user_id > 10;
+		(SELECT user_id FROM (SELECT * FROM users_table WHERE value_1 >= 1 and value_1 < 3) bb) ) u
+	WHERE user_id < 2 AND user_id > 0;
 
 -- test distinct
 -- distinct is supported if it is on a partition key
-CREATE VIEW distinct_user_with_value_1_15 AS SELECT DISTINCT user_id FROM users_table WHERE value_1 = 15;
-SELECT * FROM distinct_user_with_value_1_15 ORDER BY user_id;
+CREATE VIEW distinct_user_with_value_1_3 AS SELECT DISTINCT user_id FROM users_table WHERE value_1 = 3;
+SELECT * FROM distinct_user_with_value_1_3 ORDER BY user_id;
 
 -- distinct is not supported if it is on a non-partition key
-CREATE VIEW distinct_value_1 AS SELECT DISTINCT value_1 FROM users_table WHERE value_2 = 15;
-SELECT * FROM distinct_value_1;
+-- but will be supported via recursive planning
+CREATE VIEW distinct_value_1 AS SELECT DISTINCT value_1 FROM users_table WHERE value_2 = 3;
+SELECT * FROM distinct_value_1 ORDER BY 1 DESC LIMIT 5;
 
--- CTEs are not supported even if they are on views
+-- CTEs are supported even if they are on views
 CREATE VIEW cte_view_1 AS
-WITH c1 AS (SELECT * FROM users_table WHERE value_1 = 15) SELECT * FROM c1 WHERE value_2 < 500;
+WITH c1 AS (SELECT * FROM users_table WHERE value_1 = 3) SELECT * FROM c1 WHERE value_2 < 4;
 
-SELECT * FROM cte_view_1;
+SELECT * FROM cte_view_1 ORDER BY 1,2,3,4,5 LIMIT 5;
 
--- this is single shard query but still not supported since it has view + cte
+-- this is single shard query and still not supported since it has view + cte
 -- router planner can't detect it
-SELECT * FROM cte_view_1 WHERE user_id = 8;
+SELECT * FROM cte_view_1 WHERE user_id = 2 ORDER BY 1,2,3,4,5;
 
 -- if CTE itself prunes down to a single shard than the view is supported (router plannable)
 CREATE VIEW cte_view_2 AS
-WITH c1 AS (SELECT * FROM users_table WHERE user_id = 8) SELECT * FROM c1 WHERE value_1 = 15;
+WITH c1 AS (SELECT * FROM users_table WHERE user_id = 2) SELECT * FROM c1 WHERE value_1 = 3;
 SELECT * FROM cte_view_2;
 
 CREATE VIEW router_view AS SELECT * FROM users_table WHERE user_id = 2;
@@ -385,7 +409,7 @@ EXPLAIN (COSTS FALSE) SELECT *
 		(SELECT user_id FROM recent_users) 
 		UNION
 		(SELECT user_id FROM selected_users) ) u
-	WHERE user_id < 15 AND user_id > 10
+	WHERE user_id < 4 AND user_id > 1
 	ORDER BY user_id;
 
 EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USING(user_id) ORDER BY et.time DESC LIMIT 10;
@@ -399,7 +423,7 @@ DROP VIEW router_view;
 DROP VIEW cte_view_2;
 DROP VIEW cte_view_1;
 DROP VIEW distinct_value_1;
-DROP VIEW distinct_user_with_value_1_15;
+DROP VIEW distinct_user_with_value_1_3;
 DROP VIEW recent_selected_users;
 DROP VIEW selected_users;
 DROP VIEW recent_events;

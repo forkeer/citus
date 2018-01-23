@@ -62,15 +62,15 @@ double CountDistinctErrorRate = 0.0; /* precision of count(distinct) approximate
 
 typedef struct MasterAggregateWalkerContext
 {
-	bool repartitionSubquery;
 	AttrNumber columnId;
+	bool pullDistinctColumns;
 } MasterAggregateWalkerContext;
 
 typedef struct WorkerAggregateWalkerContext
 {
-	bool repartitionSubquery;
 	List *expressionList;
 	bool createGroupByClause;
+	bool pullDistinctColumns;
 } WorkerAggregateWalkerContext;
 
 
@@ -109,13 +109,17 @@ static void RemoveUnaryNode(MultiUnaryNode *unaryNode);
 static void PullUpUnaryNode(MultiUnaryNode *unaryNode);
 static void ParentSetNewChild(MultiNode *parentNode, MultiNode *oldChildNode,
 							  MultiNode *newChildNode);
+static bool GroupedByDisjointPartitionColumn(List *tableNodeList,
+											 MultiExtendedOp *opNode);
 
 /* Local functions forward declarations for aggregate expressions */
 static void ApplyExtendedOpNodes(MultiExtendedOp *originalNode,
 								 MultiExtendedOp *masterNode,
 								 MultiExtendedOp *workerNode);
-static void TransformSubqueryNode(MultiTable *subqueryNode);
-static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode);
+static void TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList);
+static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
+											  bool groupedByDisjointPartitionColumn,
+											  List *tableNodeList);
 static Node * MasterAggregateMutator(Node *originalNode,
 									 MasterAggregateWalkerContext *walkerContext);
 static Expr * MasterAggregateExpression(Aggref *originalAggregate,
@@ -123,7 +127,15 @@ static Expr * MasterAggregateExpression(Aggref *originalAggregate,
 static Expr * MasterAverageExpression(Oid sumAggregateType, Oid countAggregateType,
 									  AttrNumber *columnId);
 static Expr * AddTypeConversion(Node *originalAggregate, Node *newExpression);
-static MultiExtendedOp * WorkerExtendedOpNode(MultiExtendedOp *originalOpNode);
+static MultiExtendedOp * WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
+											  bool groupedByDisjointPartitionColumn,
+											  List *tableNodeList);
+static bool HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *havingQual,
+											 List *tableNodeList);
+static bool ShouldPullDistinctColumn(bool repartitionSubquery,
+									 bool groupedByDisjointPartitionColumn,
+									 bool hasNonPartitionColumnDistinctAgg);
+static bool PartitionColumnInTableList(Var *column, List *tableNodeList);
 static bool WorkerAggregateWalker(Node *node,
 								  WorkerAggregateWalkerContext *walkerContext);
 static List * WorkerAggregateExpressionList(Aggref *originalAggregate,
@@ -132,6 +144,7 @@ static AggregateType GetAggregateType(Oid aggFunctionId);
 static Oid AggregateArgumentType(Aggref *aggregate);
 static Oid AggregateFunctionOid(const char *functionName, Oid inputType);
 static Oid TypeOid(Oid schemaId, const char *typeName);
+static SortGroupClause * CreateSortGroupClause(Var *column);
 
 /* Local functions forward declarations for count(distinct) approximations */
 static char * CountDistinctHashFunctionName(Oid argumentType);
@@ -151,8 +164,10 @@ static bool TablePartitioningSupportsDistinct(List *tableNodeList,
 static bool GroupedByColumn(List *groupClauseList, List *targetList, Var *column);
 
 /* Local functions forward declarations for limit clauses */
-static Node * WorkerLimitCount(MultiExtendedOp *originalOpNode);
-static List * WorkerSortClauseList(MultiExtendedOp *originalOpNode);
+static Node * WorkerLimitCount(MultiExtendedOp *originalOpNode,
+							   bool groupedByDisjointPartitionColumn);
+static List * WorkerSortClauseList(MultiExtendedOp *originalOpNode,
+								   bool groupedByDisjointPartitionColumn);
 static bool CanPushDownLimitApproximate(List *sortClauseList, List *targetList);
 static bool HasOrderByAggregate(List *sortClauseList, List *targetList);
 static bool HasOrderByAverage(List *sortClauseList, List *targetList);
@@ -177,6 +192,7 @@ void
 MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 {
 	bool hasOrderByHllType = false;
+	bool groupedByDisjointPartitionColumn = false;
 	List *selectNodeList = NIL;
 	List *projectNodeList = NIL;
 	List *collectNodeList = NIL;
@@ -251,19 +267,26 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 	extendedOpNodeList = FindNodesOfType(logicalPlanNode, T_MultiExtendedOp);
 	extendedOpNode = (MultiExtendedOp *) linitial(extendedOpNodeList);
 
-	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
-	workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode);
+	tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
+	groupedByDisjointPartitionColumn = GroupedByDisjointPartitionColumn(tableNodeList,
+																		extendedOpNode);
+
+	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode,
+												groupedByDisjointPartitionColumn,
+												tableNodeList);
+	workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode,
+												groupedByDisjointPartitionColumn,
+												tableNodeList);
 
 	ApplyExtendedOpNodes(extendedOpNode, masterExtendedOpNode, workerExtendedOpNode);
 
-	tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
 	foreach(tableNodeCell, tableNodeList)
 	{
 		MultiTable *tableNode = (MultiTable *) lfirst(tableNodeCell);
 		if (tableNode->relationId == SUBQUERY_RELATION_ID)
 		{
 			ErrorIfContainsUnsupportedAggregate((MultiNode *) tableNode);
-			TransformSubqueryNode(tableNode);
+			TransformSubqueryNode(tableNode, tableNodeList);
 		}
 	}
 
@@ -1150,14 +1173,20 @@ ApplyExtendedOpNodes(MultiExtendedOp *originalNode, MultiExtendedOp *masterNode,
  * operator node.
  */
 static void
-TransformSubqueryNode(MultiTable *subqueryNode)
+TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList)
 {
 	MultiExtendedOp *extendedOpNode =
 		(MultiExtendedOp *) ChildNode((MultiUnaryNode *) subqueryNode);
 	MultiNode *collectNode = ChildNode((MultiUnaryNode *) extendedOpNode);
 	MultiNode *collectChildNode = ChildNode((MultiUnaryNode *) collectNode);
-	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
-	MultiExtendedOp *workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode);
+	bool groupedByDisjointPartitionColumn =
+		GroupedByDisjointPartitionColumn(tableNodeList, extendedOpNode);
+	MultiExtendedOp *masterExtendedOpNode =
+		MasterExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn,
+							 tableNodeList);
+	MultiExtendedOp *workerExtendedOpNode =
+		WorkerExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn,
+							 tableNodeList);
 	MultiPartition *partitionNode = CitusMakeNode(MultiPartition);
 	List *groupClauseList = extendedOpNode->groupClauseList;
 	List *targetEntryList = extendedOpNode->targetList;
@@ -1219,7 +1248,9 @@ TransformSubqueryNode(MultiTable *subqueryNode)
  * worker nodes' results.
  */
 static MultiExtendedOp *
-MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
+MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
+					 bool groupedByDisjointPartitionColumn,
+					 List *tableNodeList)
 {
 	MultiExtendedOp *masterExtendedOpNode = NULL;
 	List *targetEntryList = originalOpNode->targetList;
@@ -1231,14 +1262,22 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 	MultiNode *childNode = ChildNode((MultiUnaryNode *) originalOpNode);
 	MasterAggregateWalkerContext *walkerContext = palloc0(
 		sizeof(MasterAggregateWalkerContext));
+	bool hasNonPartitionColumnDistinctAgg = false;
+	bool repartitionSubquery = false;
 
 	walkerContext->columnId = 1;
-	walkerContext->repartitionSubquery = false;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
-		walkerContext->repartitionSubquery = true;
+		repartitionSubquery = true;
 	}
+
+	hasNonPartitionColumnDistinctAgg = HasNonPartitionColumnDistinctAgg(targetEntryList,
+																		originalHavingQual,
+																		tableNodeList);
+	walkerContext->pullDistinctColumns =
+		ShouldPullDistinctColumn(repartitionSubquery, groupedByDisjointPartitionColumn,
+								 hasNonPartitionColumnDistinctAgg);
 
 	/* iterate over original target entries */
 	foreach(targetEntryCell, targetEntryList)
@@ -1253,7 +1292,6 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 		{
 			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
 												   walkerContext);
-
 			newExpression = (Expr *) newNode;
 		}
 		else
@@ -1285,6 +1323,8 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 	masterExtendedOpNode->targetList = newTargetEntryList;
 	masterExtendedOpNode->groupClauseList = originalOpNode->groupClauseList;
 	masterExtendedOpNode->sortClauseList = originalOpNode->sortClauseList;
+	masterExtendedOpNode->distinctClause = originalOpNode->distinctClause;
+	masterExtendedOpNode->hasDistinctOn = originalOpNode->hasDistinctOn;
 	masterExtendedOpNode->limitCount = originalOpNode->limitCount;
 	masterExtendedOpNode->limitOffset = originalOpNode->limitOffset;
 	masterExtendedOpNode->havingQual = newHavingQual;
@@ -1364,7 +1404,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
-		walkerContext->repartitionSubquery)
+		walkerContext->pullDistinctColumns)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *varList = pull_var_clause_default((Node *) aggregate);
@@ -1754,12 +1794,14 @@ AddTypeConversion(Node *originalAggregate, Node *newExpression)
  * function to create aggregates for the worker nodes. Also, the function checks
  * if we can push down the limit to worker nodes; and if we can, sets the limit
  * count and sort clause list fields in the new operator node. It provides special
- * treatment for count distinct operator if it is used in repartition subqueries.
- * Each column in count distinct aggregate is added to target list, and group by
- * list of worker extended operator.
+ * treatment for count distinct operator if it is used in repartition subqueries
+ * or on non-partition columns. Each column in count distinct aggregate is added
+ * to target list, and group by list of worker extended operator.
  */
 static MultiExtendedOp *
-WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
+WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
+					 bool groupedByDisjointPartitionColumn,
+					 List *tableNodeList)
 {
 	MultiExtendedOp *workerExtendedOpNode = NULL;
 	MultiNode *parentNode = ParentNode((MultiNode *) originalOpNode);
@@ -1773,27 +1815,37 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 	WorkerAggregateWalkerContext *walkerContext =
 		palloc0(sizeof(WorkerAggregateWalkerContext));
 	Index nextSortGroupRefIndex = 0;
+	bool queryHasAggregates = false;
+	bool enableLimitPushdown = true;
+	bool hasNonPartitionColumnDistinctAgg = false;
+	bool repartitionSubquery = false;
 
-	walkerContext->repartitionSubquery = false;
 	walkerContext->expressionList = NIL;
+
+	/* find max of sort group ref index */
+	foreach(targetEntryCell, targetEntryList)
+	{
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+		if (targetEntry->ressortgroupref > nextSortGroupRefIndex)
+		{
+			nextSortGroupRefIndex = targetEntry->ressortgroupref;
+		}
+	}
+
+	/* next group ref index starts from max group ref index + 1 */
+	nextSortGroupRefIndex++;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
-		walkerContext->repartitionSubquery = true;
-
-		/* find max of sort group ref index */
-		foreach(targetEntryCell, targetEntryList)
-		{
-			TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-			if (targetEntry->ressortgroupref > nextSortGroupRefIndex)
-			{
-				nextSortGroupRefIndex = targetEntry->ressortgroupref;
-			}
-		}
-
-		/* next group ref index starts from max group ref index + 1 */
-		nextSortGroupRefIndex++;
+		repartitionSubquery = true;
 	}
+
+	hasNonPartitionColumnDistinctAgg = HasNonPartitionColumnDistinctAgg(targetEntryList,
+																		havingQual,
+																		tableNodeList);
+	walkerContext->pullDistinctColumns =
+		ShouldPullDistinctColumn(repartitionSubquery, groupedByDisjointPartitionColumn,
+								 hasNonPartitionColumnDistinctAgg);
 
 	/* iterate over original target entries */
 	foreach(targetEntryCell, targetEntryList)
@@ -1804,6 +1856,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 		ListCell *newExpressionCell = NULL;
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
 
+		/* reset walker context */
 		walkerContext->expressionList = NIL;
 		walkerContext->createGroupByClause = false;
 
@@ -1812,6 +1865,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			WorkerAggregateWalker((Node *) originalExpression, walkerContext);
 
 			newExpressionList = walkerContext->expressionList;
+			queryHasAggregates = true;
 		}
 		else
 		{
@@ -1834,26 +1888,19 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			 */
 			if (IsA(newExpression, Var) && walkerContext->createGroupByClause)
 			{
-				Var *column = (Var *) newExpression;
-				Oid lessThanOperator = InvalidOid;
-				Oid equalsOperator = InvalidOid;
-				bool hashable = false;
-				SortGroupClause *groupByClause = makeNode(SortGroupClause);
-
-				get_sort_group_operators(column->vartype, true, true, true,
-										 &lessThanOperator, &equalsOperator, NULL,
-										 &hashable);
-				groupByClause->eqop = equalsOperator;
-				groupByClause->hashable = hashable;
-				groupByClause->nulls_first = false;
-				groupByClause->sortop = lessThanOperator;
+				Var *column = (Var *) newTargetEntry->expr;
+				SortGroupClause *groupByClause = CreateSortGroupClause(column);
+				newTargetEntry->ressortgroupref = nextSortGroupRefIndex;
 				groupByClause->tleSortGroupRef = nextSortGroupRefIndex;
 
 				groupClauseList = lappend(groupClauseList, groupByClause);
-
-				newTargetEntry->ressortgroupref = nextSortGroupRefIndex;
-
 				nextSortGroupRefIndex++;
+
+				/*
+				 * If we introduce new columns accompanied by a new group by clause,
+				 * than pushing down limits will cause incorrect results.
+				 */
+				enableLimitPushdown = false;
 			}
 
 			if (newTargetEntry->resname == NULL)
@@ -1903,6 +1950,23 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			newTargetEntry->resjunk = false;
 			newTargetEntry->resno = targetProjectionNumber;
 
+			if (IsA(newExpression, Var) && walkerContext->createGroupByClause)
+			{
+				Var *column = (Var *) newTargetEntry->expr;
+				SortGroupClause *groupByClause = CreateSortGroupClause(column);
+				newTargetEntry->ressortgroupref = nextSortGroupRefIndex;
+				groupByClause->tleSortGroupRef = nextSortGroupRefIndex;
+
+				groupClauseList = lappend(groupClauseList, groupByClause);
+				nextSortGroupRefIndex++;
+
+				/*
+				 * If we introduce new columns accompanied by a new group by clause,
+				 * than pushing down limits will cause incorrect results.
+				 */
+				enableLimitPushdown = false;
+			}
+
 			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
 			targetProjectionNumber++;
 		}
@@ -1910,13 +1974,157 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 
 	workerExtendedOpNode = CitusMakeNode(MultiExtendedOp);
 	workerExtendedOpNode->targetList = newTargetEntryList;
+	workerExtendedOpNode->distinctClause = NIL;
+	workerExtendedOpNode->hasDistinctOn = false;
+
+	if (!queryHasAggregates)
+	{
+		workerExtendedOpNode->distinctClause = originalOpNode->distinctClause;
+		workerExtendedOpNode->hasDistinctOn = originalOpNode->hasDistinctOn;
+	}
+
 	workerExtendedOpNode->groupClauseList = groupClauseList;
 
-	/* if we can push down the limit, also set related fields */
-	workerExtendedOpNode->limitCount = WorkerLimitCount(originalOpNode);
-	workerExtendedOpNode->sortClauseList = WorkerSortClauseList(originalOpNode);
+	if (enableLimitPushdown)
+	{
+		/* if we can push down the limit, also set related fields */
+		workerExtendedOpNode->limitCount = WorkerLimitCount(originalOpNode,
+															groupedByDisjointPartitionColumn);
+		workerExtendedOpNode->sortClauseList =
+			WorkerSortClauseList(originalOpNode, groupedByDisjointPartitionColumn);
+	}
+
+	/*
+	 * If grouped by a partition column whose values are shards have disjoint sets
+	 * of partition values, we can push down the having qualifier.
+	 */
+	if (havingQual != NULL && groupedByDisjointPartitionColumn)
+	{
+		workerExtendedOpNode->havingQual = originalOpNode->havingQual;
+	}
 
 	return workerExtendedOpNode;
+}
+
+
+/*
+ * HasNonPartitionColumnDistinctAgg returns true if target entry or having qualifier
+ * has non-partition column reference in aggregate (distinct) definition. Note that,
+ * it only checks aggs subfield of Aggref, it does not check FILTER or SORT clauses.
+ */
+static bool
+HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *havingQual,
+								 List *tableNodeList)
+{
+	List *targetVarList = pull_var_clause((Node *) targetEntryList,
+										  PVC_INCLUDE_AGGREGATES);
+	List *havingVarList = pull_var_clause((Node *) havingQual, PVC_INCLUDE_AGGREGATES);
+	List *aggregateCheckList = list_concat(targetVarList, havingVarList);
+
+	ListCell *aggregateCheckCell = NULL;
+	foreach(aggregateCheckCell, aggregateCheckList)
+	{
+		Node *targetNode = lfirst(aggregateCheckCell);
+		Aggref *targetAgg = NULL;
+		List *varList = NIL;
+		ListCell *varCell = NULL;
+		bool isPartitionColumn = false;
+
+		if (IsA(targetNode, Var))
+		{
+			continue;
+		}
+
+		Assert(IsA(targetNode, Aggref));
+		targetAgg = (Aggref *) targetNode;
+		if (targetAgg->aggdistinct == NIL)
+		{
+			continue;
+		}
+
+		varList = pull_var_clause_default((Node *) targetAgg->args);
+		foreach(varCell, varList)
+		{
+			Node *targetVar = (Node *) lfirst(varCell);
+
+			Assert(IsA(targetVar, Var));
+
+			isPartitionColumn =
+				PartitionColumnInTableList((Var *) targetVar, tableNodeList);
+
+			if (!isPartitionColumn)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * ShouldPullDistinctColumn returns true if distinct aggregate should pull
+ * individual columns from worker to master and evaluate aggregate operation
+ * at master.
+ *
+ * Pull cases are:
+ * - repartition subqueries
+ * - query has count distinct on a non-partition column on at least one target
+ * - count distinct is on a non-partition column and query is not
+ *   grouped on partition column
+ */
+static bool
+ShouldPullDistinctColumn(bool repartitionSubquery,
+						 bool groupedByDisjointPartitionColumn,
+						 bool hasNonPartitionColumnDistinctAgg)
+{
+	if (repartitionSubquery)
+	{
+		return true;
+	}
+
+	if (groupedByDisjointPartitionColumn)
+	{
+		return false;
+	}
+	else if (!groupedByDisjointPartitionColumn && hasNonPartitionColumnDistinctAgg)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * PartitionColumnInTableList returns true if provided column is a partition
+ * column from provided table node list. It also returns false if a column is
+ * partition column of an append distributed table.
+ */
+static bool
+PartitionColumnInTableList(Var *column, List *tableNodeList)
+{
+	ListCell *tableNodeCell = NULL;
+	foreach(tableNodeCell, tableNodeList)
+	{
+		MultiTable *tableNode = lfirst(tableNodeCell);
+		Var *partitionColumn = tableNode->partitionColumn;
+
+		if (partitionColumn != NULL &&
+			partitionColumn->varno == column->varno &&
+			partitionColumn->varattno == column->varattno)
+		{
+			Assert(partitionColumn->varno == tableNode->rangeTableId);
+
+			if (PartitionMethod(tableNode->relationId) != DISTRIBUTE_BY_APPEND)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 
@@ -1978,7 +2186,7 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
-		walkerContext->repartitionSubquery)
+		walkerContext->pullDistinctColumns)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *columnList = pull_var_clause_default((Node *) aggregate);
@@ -2278,6 +2486,71 @@ TypeOid(Oid schemaId, const char *typeName)
 
 
 /*
+ * GroupedByDisjointPartitionColumn returns true if the query is grouped by the
+ * partition column of a table whose shards have disjoint sets of partition values.
+ */
+static bool
+GroupedByDisjointPartitionColumn(List *tableNodeList, MultiExtendedOp *opNode)
+{
+	bool result = false;
+	ListCell *tableNodeCell = NULL;
+
+	foreach(tableNodeCell, tableNodeList)
+	{
+		MultiTable *tableNode = (MultiTable *) lfirst(tableNodeCell);
+		Oid relationId = tableNode->relationId;
+		char partitionMethod = 0;
+
+		if (relationId == SUBQUERY_RELATION_ID || !IsDistributedTable(relationId))
+		{
+			continue;
+		}
+
+		partitionMethod = PartitionMethod(relationId);
+		if (partitionMethod != DISTRIBUTE_BY_RANGE &&
+			partitionMethod != DISTRIBUTE_BY_HASH)
+		{
+			continue;
+		}
+
+		if (GroupedByColumn(opNode->groupClauseList, opNode->targetList,
+							tableNode->partitionColumn))
+		{
+			result = true;
+			break;
+		}
+	}
+
+	return result;
+}
+
+
+/*
+ * CreateSortGroupClause creates SortGroupClause for a given column Var.
+ * The caller should set tleSortGroupRef field and respective
+ * TargetEntry->ressortgroupref fields to appropriate SortGroupRefIndex.
+ */
+static SortGroupClause *
+CreateSortGroupClause(Var *column)
+{
+	Oid lessThanOperator = InvalidOid;
+	Oid equalsOperator = InvalidOid;
+	bool hashable = false;
+	SortGroupClause *groupByClause = makeNode(SortGroupClause);
+
+	get_sort_group_operators(column->vartype, true, true, true,
+							 &lessThanOperator, &equalsOperator, NULL,
+							 &hashable);
+	groupByClause->eqop = equalsOperator;
+	groupByClause->hashable = hashable;
+	groupByClause->nulls_first = false;
+	groupByClause->sortop = lessThanOperator;
+
+	return groupByClause;
+}
+
+
+/*
  * CountDistinctHashFunctionName resolves the hll_hash function name to use for
  * the given input type, and returns this function name.
  */
@@ -2481,15 +2754,6 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 
 	AggregateType aggregateType = GetAggregateType(aggregateExpression->aggfnoid);
 
-	/* check if logical plan includes a subquery */
-	List *subqueryMultiTableList = SubqueryMultiTableList(logicalPlanNode);
-	if (subqueryMultiTableList != NIL)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot push down this subquery"),
-						errdetail("distinct in the outermost query is unsupported")));
-	}
-
 	/*
 	 * We partially support count(distinct) in subqueries, other distinct aggregates in
 	 * subqueries are not supported yet.
@@ -2517,7 +2781,8 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 		foreach(multiTableNodeCell, multiTableNodeList)
 		{
 			MultiTable *multiTable = (MultiTable *) lfirst(multiTableNodeCell);
-			if (multiTable->relationId == SUBQUERY_RELATION_ID)
+			if (multiTable->relationId == SUBQUERY_RELATION_ID ||
+				multiTable->relationId == SUBQUERY_PUSHDOWN_RELATION_ID)
 			{
 				ereport(ERROR, (errmsg("cannot compute aggregate (distinct)"),
 								errdetail("Only count(distinct) aggregate is "
@@ -2567,28 +2832,34 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	extendedOpNode = (MultiExtendedOp *) linitial(extendedOpNodeList);
 
 	distinctColumn = AggregateDistinctColumn(aggregateExpression);
-	if (distinctSupported && distinctColumn == NULL)
+	if (distinctSupported)
 	{
-		/*
-		 * If the query has a single table, and table is grouped by partition column,
-		 * then we support count distincts even distinct column can not be identified.
-		 */
-		distinctSupported = TablePartitioningSupportsDistinct(tableNodeList,
+		if (distinctColumn == NULL)
+		{
+			/*
+			 * If the query has a single table, and table is grouped by partition
+			 * column, then we support count distincts even distinct column can
+			 * not be identified.
+			 */
+			distinctSupported = TablePartitioningSupportsDistinct(tableNodeList,
+																  extendedOpNode,
+																  distinctColumn);
+			if (!distinctSupported)
+			{
+				errorDetail = "aggregate (distinct) on complex expressions is"
+							  " unsupported";
+			}
+		}
+		else if (aggregateType != AGGREGATE_COUNT)
+		{
+			bool supports = TablePartitioningSupportsDistinct(tableNodeList,
 															  extendedOpNode,
 															  distinctColumn);
-		if (!distinctSupported)
-		{
-			errorDetail = "aggregate (distinct) on complex expressions is unsupported";
-		}
-	}
-	else if (distinctSupported)
-	{
-		bool supports = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
-														  distinctColumn);
-		if (!supports)
-		{
-			distinctSupported = false;
-			errorDetail = "table partitioning is unsuitable for aggregate (distinct)";
+			if (!supports)
+			{
+				distinctSupported = false;
+				errorDetail = "table partitioning is unsuitable for aggregate (distinct)";
+			}
 		}
 	}
 
@@ -2993,194 +3264,17 @@ ExtractQueryWalker(Node *node, List **queryList)
 
 
 /*
- * LeafQuery checks if the given query is a leaf query. Leaf queries have only
- * simple relations in the join tree.
- */
-bool
-LeafQuery(Query *queryTree)
-{
-	List *rangeTableList = queryTree->rtable;
-	List *joinTreeTableIndexList = NIL;
-	ListCell *joinTreeTableIndexCell = NULL;
-	bool leafQuery = true;
-
-	/*
-	 * Extract all range table indexes from the join tree. Note that sub-queries
-	 * that get pulled up by PostgreSQL don't appear in this join tree.
-	 */
-	ExtractRangeTableIndexWalker((Node *) queryTree->jointree, &joinTreeTableIndexList);
-	foreach(joinTreeTableIndexCell, joinTreeTableIndexList)
-	{
-		/*
-		 * Join tree's range table index starts from 1 in the query tree. But,
-		 * list indexes start from 0.
-		 */
-		int joinTreeTableIndex = lfirst_int(joinTreeTableIndexCell);
-		int rangeTableListIndex = joinTreeTableIndex - 1;
-
-		RangeTblEntry *rangeTableEntry =
-			(RangeTblEntry *) list_nth(rangeTableList, rangeTableListIndex);
-
-		/*
-		 * Check if the range table in the join tree is a simple relation.
-		 */
-		if (rangeTableEntry->rtekind != RTE_RELATION)
-		{
-			leafQuery = false;
-		}
-	}
-
-	return leafQuery;
-}
-
-
-/*
- * PartitionColumnOpExpressionList returns operator expressions which are on
- * partition column in the query. This function walks over where clause list,
- * finds operator expressions on partition column and returns them in a new list.
- */
-List *
-PartitionColumnOpExpressionList(Query *query)
-{
-	List *whereClauseList = WhereClauseList(query->jointree);
-	List *partitionColumnOpExpressionList = NIL;
-
-	ListCell *whereClauseCell = NULL;
-	foreach(whereClauseCell, whereClauseList)
-	{
-		Node *whereNode = (Node *) lfirst(whereClauseCell);
-		Node *leftArgument = NULL;
-		Node *rightArgument = NULL;
-		Node *strippedLeftArgument = NULL;
-		Node *strippedRightArgument = NULL;
-		OpExpr *whereClause = NULL;
-		List *argumentList = NIL;
-		List *rangetableList = NIL;
-		uint32 argumentCount = 0;
-		Var *candidatePartitionColumn = NULL;
-		Var *partitionColumn = NULL;
-		Index rangeTableEntryIndex = 0;
-		RangeTblEntry *rangeTableEntry = NULL;
-		Oid relationId = InvalidOid;
-
-		if (!IsA(whereNode, OpExpr))
-		{
-			continue;
-		}
-
-		whereClause = (OpExpr *) whereNode;
-		argumentList = whereClause->args;
-
-		/*
-		 * Select clauses must have two arguments. Note that logic here use to
-		 * find select clauses is very similar to IsSelectClause(). But we are
-		 * not able to reuse it, because it calls pull_var_clause_default()
-		 * which in return deep down calls pull_var_clause_walker(), and this
-		 * function errors out for variable level other than 0 which is the case
-		 * for lateral joins.
-		 */
-		argumentCount = list_length(argumentList);
-		if (argumentCount != 2)
-		{
-			continue;
-		}
-
-		leftArgument = (Node *) linitial(argumentList);
-		rightArgument = (Node *) lsecond(argumentList);
-		strippedLeftArgument = strip_implicit_coercions(leftArgument);
-		strippedRightArgument = strip_implicit_coercions(rightArgument);
-
-		if (IsA(strippedLeftArgument, Var) && IsA(strippedRightArgument, Const))
-		{
-			candidatePartitionColumn = (Var *) strippedLeftArgument;
-		}
-		else if (IsA(strippedLeftArgument, Const) && IsA(strippedRightArgument, Var))
-		{
-			candidatePartitionColumn = (Var *) strippedRightArgument;
-		}
-		else
-		{
-			continue;
-		}
-
-		rangetableList = query->rtable;
-		rangeTableEntryIndex = candidatePartitionColumn->varno - 1;
-		rangeTableEntry = list_nth(rangetableList, rangeTableEntryIndex);
-
-		/*
-		 * We currently don't support checking for equality when user refers
-		 * to a column from the JOIN instead of the relation.
-		 */
-		if (rangeTableEntry->rtekind != RTE_RELATION)
-		{
-			continue;
-		}
-
-		relationId = rangeTableEntry->relid;
-		partitionColumn = DistPartitionKey(relationId);
-
-		if (partitionColumn != NULL &&
-			candidatePartitionColumn->varattno == partitionColumn->varattno)
-		{
-			partitionColumnOpExpressionList = lappend(partitionColumnOpExpressionList,
-													  whereClause);
-		}
-	}
-
-	return partitionColumnOpExpressionList;
-}
-
-
-/*
- * ReplaceColumnsInOpExpressionList walks over the given operator expression
- * list and copies every one them, replaces columns with the given new column
- * and finally returns new copies in a new list of operator expressions.
- */
-List *
-ReplaceColumnsInOpExpressionList(List *opExpressionList, Var *newColumn)
-{
-	List *newOpExpressionList = NIL;
-
-	ListCell *opExpressionCell = NULL;
-	foreach(opExpressionCell, opExpressionList)
-	{
-		OpExpr *opExpression = (OpExpr *) lfirst(opExpressionCell);
-		OpExpr *copyOpExpression = (OpExpr *) copyObject(opExpression);
-		List *argumentList = copyOpExpression->args;
-		List *newArgumentList = NIL;
-
-		Node *leftArgument = (Node *) linitial(argumentList);
-		Node *rightArgument = (Node *) lsecond(argumentList);
-		Node *strippedLeftArgument = strip_implicit_coercions(leftArgument);
-		Node *strippedRightArgument = strip_implicit_coercions(rightArgument);
-
-		if (IsA(strippedLeftArgument, Var))
-		{
-			newArgumentList = list_make2(newColumn, strippedRightArgument);
-		}
-		else if (IsA(strippedRightArgument, Var))
-		{
-			newArgumentList = list_make2(strippedLeftArgument, newColumn);
-		}
-
-		copyOpExpression->args = newArgumentList;
-		newOpExpressionList = lappend(newOpExpressionList, copyOpExpression);
-	}
-
-	return newOpExpressionList;
-}
-
-
-/*
  * WorkerLimitCount checks if the given extended node contains a limit node, and
  * if that node can be pushed down. For this, the function checks if this limit
  * count or a meaningful approximation of it can be pushed down to worker nodes.
  * If they can, the function returns the limit count.
  *
  * The limit push-down decision tree is as follows:
- *                                 group by?
- *                              1/           \0
- *                          order by?         (exact pd)
+ *                                         group by?
+ *                                       1/         \0
+ *                       group by partition column?   (exact pd)
+ *                              0/         \1
+ *                          order by?        (exact pd)
  *                       1/           \0
  *           has order by agg?          (no pd)
  *            1/           \0
@@ -3195,7 +3289,8 @@ ReplaceColumnsInOpExpressionList(List *opExpressionList, Var *newColumn)
  * returns null.
  */
 static Node *
-WorkerLimitCount(MultiExtendedOp *originalOpNode)
+WorkerLimitCount(MultiExtendedOp *originalOpNode,
+				 bool groupedByDisjointPartitionColumn)
 {
 	Node *workerLimitNode = NULL;
 	List *groupClauseList = originalOpNode->groupClauseList;
@@ -3221,11 +3316,12 @@ WorkerLimitCount(MultiExtendedOp *originalOpNode)
 		   IsA(originalOpNode->limitOffset, Const));
 
 	/*
-	 * If we don't have group by clauses, or if we have order by clauses without
-	 * aggregates, we can push down the original limit. Else if we have order by
-	 * clauses with commutative aggregates, we can push down approximate limits.
+	 * If we don't have group by clauses, or we have group by partition column,
+	 * or if we have order by clauses without aggregates, we can push down the
+	 * original limit. Else if we have order by clauses with commutative aggregates,
+	 * we can push down approximate limits.
 	 */
-	if (groupClauseList == NIL)
+	if (groupClauseList == NIL || groupedByDisjointPartitionColumn)
 	{
 		canPushDownLimit = true;
 	}
@@ -3287,21 +3383,22 @@ WorkerLimitCount(MultiExtendedOp *originalOpNode)
 
 /*
  * WorkerSortClauseList first checks if the given extended node contains a limit
- * that can be pushed down. If it does, the function then checks if we need to
- * add any sorting and grouping clauses to the sort list we push down for the
- * limit. If we do, the function adds these clauses and returns them. Otherwise,
- * the function returns null.
+ * or hasDistinctOn that can be pushed down. If it does, the function then
+ * checks if we need to add any sorting and grouping clauses to the sort list we
+ * push down for the limit. If we do, the function adds these clauses and
+ * returns them. Otherwise, the function returns null.
  */
 static List *
-WorkerSortClauseList(MultiExtendedOp *originalOpNode)
+WorkerSortClauseList(MultiExtendedOp *originalOpNode,
+					 bool groupedByDisjointPartitionColumn)
 {
 	List *workerSortClauseList = NIL;
 	List *groupClauseList = originalOpNode->groupClauseList;
 	List *sortClauseList = originalOpNode->sortClauseList;
 	List *targetList = originalOpNode->targetList;
 
-	/* if no limit node, no need to push down sort clauses */
-	if (originalOpNode->limitCount == NULL)
+	/* if no limit node and no hasDistinctOn, no need to push down sort clauses */
+	if (originalOpNode->limitCount == NULL && !originalOpNode->hasDistinctOn)
 	{
 		return NIL;
 	}
@@ -3314,7 +3411,7 @@ WorkerSortClauseList(MultiExtendedOp *originalOpNode)
 	 * in different task results. By ordering on the group by clause, we ensure
 	 * that query results are consistent.
 	 */
-	if (groupClauseList == NIL)
+	if (groupClauseList == NIL || groupedByDisjointPartitionColumn)
 	{
 		workerSortClauseList = originalOpNode->sortClauseList;
 	}

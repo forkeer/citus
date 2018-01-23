@@ -15,12 +15,13 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "distributed/citus_custom_scan.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_master_planner.h"
-#include "distributed/multi_planner.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_resowner.h"
@@ -33,382 +34,18 @@
 #include "nodes/makefuncs.h"
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
+#include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/snapmgr.h"
 #include "utils/memutils.h"
 
 
-/*
- * Define executor methods for the different executor types.
- */
-static CustomExecMethods RealTimeCustomExecMethods = {
-	.CustomName = "RealTimeScan",
-	.BeginCustomScan = CitusSelectBeginScan,
-	.ExecCustomScan = RealTimeExecScan,
-	.EndCustomScan = CitusEndScan,
-	.ReScanCustomScan = CitusReScan,
-	.ExplainCustomScan = CitusExplainScan
-};
-
-static CustomExecMethods TaskTrackerCustomExecMethods = {
-	.CustomName = "TaskTrackerScan",
-	.BeginCustomScan = CitusSelectBeginScan,
-	.ExecCustomScan = TaskTrackerExecScan,
-	.EndCustomScan = CitusEndScan,
-	.ReScanCustomScan = CitusReScan,
-	.ExplainCustomScan = CitusExplainScan
-};
-
-static CustomExecMethods RouterSequentialModifyCustomExecMethods = {
-	.CustomName = "RouterSequentialModifyScan",
-	.BeginCustomScan = CitusModifyBeginScan,
-	.ExecCustomScan = RouterSequentialModifyExecScan,
-	.EndCustomScan = CitusEndScan,
-	.ReScanCustomScan = CitusReScan,
-	.ExplainCustomScan = CitusExplainScan
-};
-
-static CustomExecMethods RouterMultiModifyCustomExecMethods = {
-	.CustomName = "RouterMultiModifyScan",
-	.BeginCustomScan = CitusModifyBeginScan,
-	.ExecCustomScan = RouterMultiModifyExecScan,
-	.EndCustomScan = CitusEndScan,
-	.ReScanCustomScan = CitusReScan,
-	.ExplainCustomScan = CitusExplainScan
-};
-
-static CustomExecMethods RouterSelectCustomExecMethods = {
-	.CustomName = "RouterSelectScan",
-	.BeginCustomScan = CitusSelectBeginScan,
-	.ExecCustomScan = RouterSelectExecScan,
-	.EndCustomScan = CitusEndScan,
-	.ReScanCustomScan = CitusReScan,
-	.ExplainCustomScan = CitusExplainScan
-};
-
-static CustomExecMethods CoordinatorInsertSelectCustomExecMethods = {
-	.CustomName = "CoordinatorInsertSelectScan",
-	.BeginCustomScan = CitusSelectBeginScan,
-	.ExecCustomScan = CoordinatorInsertSelectExecScan,
-	.EndCustomScan = CitusEndScan,
-	.ReScanCustomScan = CitusReScan,
-	.ExplainCustomScan = CoordinatorInsertSelectExplainScan
-};
+/* controls the connection type for multi shard update/delete queries */
+int MultiShardConnectionType = PARALLEL_CONNECTION;
 
 
-/* local function forward declarations */
-static void PrepareMasterJobDirectory(Job *workerJob);
-static void LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob);
+/* ocal function forward declarations */
 static Relation StubRelation(TupleDesc tupleDescriptor);
-
-
-/*
- * RealTimeCreateScan creates the scan state for real-time executor queries.
- */
-Node *
-RealTimeCreateScan(CustomScan *scan)
-{
-	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
-
-	scanState->executorType = MULTI_EXECUTOR_REAL_TIME;
-	scanState->customScanState.ss.ps.type = T_CustomScanState;
-	scanState->multiPlan = GetMultiPlan(scan);
-
-	scanState->customScanState.methods = &RealTimeCustomExecMethods;
-
-	return (Node *) scanState;
-}
-
-
-/*
- * TaskTrackerCreateScan creates the scan state for task-tracker executor queries.
- */
-Node *
-TaskTrackerCreateScan(CustomScan *scan)
-{
-	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
-
-	scanState->executorType = MULTI_EXECUTOR_TASK_TRACKER;
-	scanState->customScanState.ss.ps.type = T_CustomScanState;
-	scanState->multiPlan = GetMultiPlan(scan);
-
-	scanState->customScanState.methods = &TaskTrackerCustomExecMethods;
-
-	return (Node *) scanState;
-}
-
-
-/*
- * RouterCreateScan creates the scan state for router executor queries.
- */
-Node *
-RouterCreateScan(CustomScan *scan)
-{
-	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
-	MultiPlan *multiPlan = NULL;
-	Job *workerJob = NULL;
-	List *taskList = NIL;
-	bool isModificationQuery = false;
-
-	scanState->executorType = MULTI_EXECUTOR_ROUTER;
-	scanState->customScanState.ss.ps.type = T_CustomScanState;
-	scanState->multiPlan = GetMultiPlan(scan);
-
-	multiPlan = scanState->multiPlan;
-	workerJob = multiPlan->workerJob;
-	taskList = workerJob->taskList;
-
-	isModificationQuery = IsModifyMultiPlan(multiPlan);
-
-	/* check whether query has at most one shard */
-	if (list_length(taskList) <= 1)
-	{
-		if (isModificationQuery)
-		{
-			scanState->customScanState.methods = &RouterSequentialModifyCustomExecMethods;
-		}
-		else
-		{
-			scanState->customScanState.methods = &RouterSelectCustomExecMethods;
-		}
-	}
-	else
-	{
-		Assert(isModificationQuery);
-
-		if (IsMultiRowInsert(workerJob->jobQuery))
-		{
-			/*
-			 * Multi-row INSERT is executed sequentially instead of using
-			 * parallel connections.
-			 */
-			scanState->customScanState.methods = &RouterSequentialModifyCustomExecMethods;
-		}
-		else
-		{
-			scanState->customScanState.methods = &RouterMultiModifyCustomExecMethods;
-		}
-	}
-
-	return (Node *) scanState;
-}
-
-
-/*
- * CoordinatorInsertSelectCrateScan creates the scan state for executing
- * INSERT..SELECT into a distributed table via the coordinator.
- */
-Node *
-CoordinatorInsertSelectCreateScan(CustomScan *scan)
-{
-	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
-
-	scanState->executorType = MULTI_EXECUTOR_COORDINATOR_INSERT_SELECT;
-	scanState->customScanState.ss.ps.type = T_CustomScanState;
-	scanState->multiPlan = GetMultiPlan(scan);
-
-	scanState->customScanState.methods = &CoordinatorInsertSelectCustomExecMethods;
-
-	return (Node *) scanState;
-}
-
-
-/*
- * DelayedErrorCreateScan is only called if we could not plan for the given
- * query. This is the case when a plan is not ready for execution because
- * CreateDistributedPlan() couldn't find a plan due to unresolved prepared
- * statement parameters, but didn't error out, because we expect custom plans
- * to come to our rescue. But sql (not plpgsql) functions unfortunately don't
- * go through a codepath supporting custom plans. Here, we error out with this
- * delayed error message.
- */
-Node *
-DelayedErrorCreateScan(CustomScan *scan)
-{
-	MultiPlan *multiPlan = GetMultiPlan(scan);
-
-	/* raise the deferred error */
-	RaiseDeferredError(multiPlan->planningError, ERROR);
-
-	return NULL;
-}
-
-
-/*
- * CitusSelectBeginScan is an empty function for BeginCustomScan callback.
- */
-void
-CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags)
-{
-	/* just an empty function */
-}
-
-
-/*
- * RealTimeExecScan is a callback function which returns next tuple from a real-time
- * execution. In the first call, it executes distributed real-time plan and loads
- * results from temporary files into custom scan's tuple store. Then, it returns
- * tuples one by one from this tuple store.
- */
-TupleTableSlot *
-RealTimeExecScan(CustomScanState *node)
-{
-	CitusScanState *scanState = (CitusScanState *) node;
-	TupleTableSlot *resultSlot = NULL;
-
-	if (!scanState->finishedRemoteScan)
-	{
-		MultiPlan *multiPlan = scanState->multiPlan;
-		Job *workerJob = multiPlan->workerJob;
-
-		/* we are taking locks on partitions of partitioned tables */
-		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
-
-		PrepareMasterJobDirectory(workerJob);
-		MultiRealTimeExecute(workerJob);
-
-		LoadTuplesIntoTupleStore(scanState, workerJob);
-
-		scanState->finishedRemoteScan = true;
-	}
-
-	resultSlot = ReturnTupleFromTuplestore(scanState);
-
-	return resultSlot;
-}
-
-
-/*
- * PrepareMasterJobDirectory creates a directory on the master node to keep job
- * execution results. We also register this directory for automatic cleanup on
- * portal delete.
- */
-static void
-PrepareMasterJobDirectory(Job *workerJob)
-{
-	StringInfo jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
-	CreateDirectory(jobDirectoryName);
-
-	ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
-	ResourceOwnerRememberJobDirectory(CurrentResourceOwner, workerJob->jobId);
-}
-
-
-/*
- * Load data collected by real-time or task-tracker executors into the tuplestore
- * of CitusScanState. For that, we first create a tuple store, and then copy the
- * files one-by-one into the tuple store.
- *
- * Note that in the long term it'd be a lot better if Multi*Execute() directly
- * filled the tuplestores, but that's a fair bit of work.
- */
-static void
-LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob)
-{
-	CustomScanState customScanState = citusScanState->customScanState;
-	List *workerTaskList = workerJob->taskList;
-	List *copyOptions = NIL;
-	EState *executorState = NULL;
-	MemoryContext executorTupleContext = NULL;
-	ExprContext *executorExpressionContext = NULL;
-	TupleDesc tupleDescriptor = NULL;
-	Relation stubRelation = NULL;
-	ListCell *workerTaskCell = NULL;
-	uint32 columnCount = 0;
-	Datum *columnValues = NULL;
-	bool *columnNulls = NULL;
-	bool randomAccess = true;
-	bool interTransactions = false;
-
-	executorState = citusScanState->customScanState.ss.ps.state;
-	executorTupleContext = GetPerTupleMemoryContext(executorState);
-	executorExpressionContext = GetPerTupleExprContext(executorState);
-
-	tupleDescriptor = customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
-	stubRelation = StubRelation(tupleDescriptor);
-
-	columnCount = tupleDescriptor->natts;
-	columnValues = palloc0(columnCount * sizeof(Datum));
-	columnNulls = palloc0(columnCount * sizeof(bool));
-
-	Assert(citusScanState->tuplestorestate == NULL);
-	citusScanState->tuplestorestate =
-		tuplestore_begin_heap(randomAccess, interTransactions, work_mem);
-
-	if (BinaryMasterCopyFormat)
-	{
-		DefElem *copyOption = NULL;
-
-#if (PG_VERSION_NUM >= 100000)
-		int location = -1; /* "unknown" token location */
-		copyOption = makeDefElem("format", (Node *) makeString("binary"), location);
-#else
-		copyOption = makeDefElem("format", (Node *) makeString("binary"));
-#endif
-
-		copyOptions = lappend(copyOptions, copyOption);
-	}
-
-	foreach(workerTaskCell, workerTaskList)
-	{
-		Task *workerTask = (Task *) lfirst(workerTaskCell);
-		StringInfo jobDirectoryName = NULL;
-		StringInfo taskFilename = NULL;
-		CopyState copyState = NULL;
-
-		jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
-		taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
-
-#if (PG_VERSION_NUM >= 100000)
-		copyState = BeginCopyFrom(NULL, stubRelation, taskFilename->data, false, NULL,
-								  NULL, copyOptions);
-#else
-		copyState = BeginCopyFrom(stubRelation, taskFilename->data, false, NULL,
-								  copyOptions);
-#endif
-
-		while (true)
-		{
-			MemoryContext oldContext = NULL;
-			bool nextRowFound = false;
-
-			ResetPerTupleExprContext(executorState);
-			oldContext = MemoryContextSwitchTo(executorTupleContext);
-
-			nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
-										columnValues, columnNulls, NULL);
-			if (!nextRowFound)
-			{
-				MemoryContextSwitchTo(oldContext);
-				break;
-			}
-
-			tuplestore_putvalues(citusScanState->tuplestorestate, tupleDescriptor,
-								 columnValues, columnNulls);
-			MemoryContextSwitchTo(oldContext);
-		}
-
-		EndCopyFrom(copyState);
-	}
-}
-
-
-/*
- * StubRelation creates a stub Relation from the given tuple descriptor.
- * To be able to use copy.c, we need a Relation descriptor. As there is no
- * relation corresponding to the data loaded from workers, we need to fake one.
- * We just need the bare minimal set of fields accessed by BeginCopyFrom().
- */
-static Relation
-StubRelation(TupleDesc tupleDescriptor)
-{
-	Relation stubRelation = palloc0(sizeof(RelationData));
-	stubRelation->rd_att = tupleDescriptor;
-	stubRelation->rd_rel = palloc0(sizeof(FormData_pg_class));
-	stubRelation->rd_rel->relkind = RELKIND_RELATION;
-
-	return stubRelation;
-}
 
 
 /*
@@ -445,63 +82,218 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 
 
 /*
- * TaskTrackerExecScan is a callback function which returns next tuple from a
- * task-tracker execution. In the first call, it executes distributed task-tracker
- * plan and loads results from temporary files into custom scan's tuple store.
- * Then, it returns tuples one by one from this tuple store.
+ * Load data collected by real-time or task-tracker executors into the tuplestore
+ * of CitusScanState. For that, we first create a tuple store, and then copy the
+ * files one-by-one into the tuple store.
+ *
+ * Note that in the long term it'd be a lot better if Multi*Execute() directly
+ * filled the tuplestores, but that's a fair bit of work.
  */
-TupleTableSlot *
-TaskTrackerExecScan(CustomScanState *node)
+void
+LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob)
 {
-	CitusScanState *scanState = (CitusScanState *) node;
-	TupleTableSlot *resultSlot = NULL;
+	CustomScanState customScanState = citusScanState->customScanState;
+	List *workerTaskList = workerJob->taskList;
+	TupleDesc tupleDescriptor = NULL;
+	ListCell *workerTaskCell = NULL;
+	bool randomAccess = true;
+	bool interTransactions = false;
+	char *copyFormat = "text";
 
-	if (!scanState->finishedRemoteScan)
+	tupleDescriptor = customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
+
+	Assert(citusScanState->tuplestorestate == NULL);
+	citusScanState->tuplestorestate =
+		tuplestore_begin_heap(randomAccess, interTransactions, work_mem);
+
+	if (BinaryMasterCopyFormat)
 	{
-		MultiPlan *multiPlan = scanState->multiPlan;
-		Job *workerJob = multiPlan->workerJob;
-
-		/* we are taking locks on partitions of partitioned tables */
-		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
-
-		PrepareMasterJobDirectory(workerJob);
-		MultiTaskTrackerExecute(workerJob);
-
-		LoadTuplesIntoTupleStore(scanState, workerJob);
-
-		scanState->finishedRemoteScan = true;
+		copyFormat = "binary";
 	}
 
-	resultSlot = ReturnTupleFromTuplestore(scanState);
+	foreach(workerTaskCell, workerTaskList)
+	{
+		Task *workerTask = (Task *) lfirst(workerTaskCell);
+		StringInfo jobDirectoryName = NULL;
+		StringInfo taskFilename = NULL;
 
-	return resultSlot;
+		jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
+		taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
+
+		ReadFileIntoTupleStore(taskFilename->data, copyFormat, tupleDescriptor,
+							   citusScanState->tuplestorestate);
+	}
+
+	tuplestore_donestoring(citusScanState->tuplestorestate);
 }
 
 
 /*
- * CitusEndScan is used to clean up tuple store of the given custom scan state.
+ * ReadFileIntoTupleStore parses the records in a COPY-formatted file according
+ * according to the given tuple descriptor and stores the records in a tuple
+ * store.
  */
 void
-CitusEndScan(CustomScanState *node)
+ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc tupleDescriptor,
+					   Tuplestorestate *tupstore)
 {
-	CitusScanState *scanState = (CitusScanState *) node;
+	CopyState copyState = NULL;
 
-	if (scanState->tuplestorestate)
+	/*
+	 * Trick BeginCopyFrom into using our tuple descriptor by pretending it belongs
+	 * to a relation.
+	 */
+	Relation stubRelation = StubRelation(tupleDescriptor);
+
+	EState *executorState = CreateExecutorState();
+	MemoryContext executorTupleContext = GetPerTupleMemoryContext(executorState);
+	ExprContext *executorExpressionContext = GetPerTupleExprContext(executorState);
+
+	int columnCount = tupleDescriptor->natts;
+	Datum *columnValues = palloc0(columnCount * sizeof(Datum));
+	bool *columnNulls = palloc0(columnCount * sizeof(bool));
+
+	DefElem *copyOption = NULL;
+	List *copyOptions = NIL;
+
+#if (PG_VERSION_NUM >= 100000)
+	int location = -1; /* "unknown" token location */
+	copyOption = makeDefElem("format", (Node *) makeString(copyFormat), location);
+#else
+	copyOption = makeDefElem("format", (Node *) makeString(copyFormat));
+#endif
+	copyOptions = lappend(copyOptions, copyOption);
+
+#if (PG_VERSION_NUM >= 100000)
+	copyState = BeginCopyFrom(NULL, stubRelation, fileName, false, NULL,
+							  NULL, copyOptions);
+#else
+	copyState = BeginCopyFrom(stubRelation, fileName, false, NULL,
+							  copyOptions);
+#endif
+
+	while (true)
 	{
-		tuplestore_end(scanState->tuplestorestate);
-		scanState->tuplestorestate = NULL;
+		MemoryContext oldContext = NULL;
+		bool nextRowFound = false;
+
+		ResetPerTupleExprContext(executorState);
+		oldContext = MemoryContextSwitchTo(executorTupleContext);
+
+		nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
+									columnValues, columnNulls, NULL);
+		if (!nextRowFound)
+		{
+			MemoryContextSwitchTo(oldContext);
+			break;
+		}
+
+		tuplestore_putvalues(tupstore, tupleDescriptor, columnValues, columnNulls);
+		MemoryContextSwitchTo(oldContext);
 	}
+
+	EndCopyFrom(copyState);
+	pfree(columnValues);
+	pfree(columnNulls);
 }
 
 
 /*
- * CitusReScan is just a place holder for rescan callback. Currently, we don't
- * support rescan given that there is not any way to reach this code path.
+ * StubRelation creates a stub Relation from the given tuple descriptor.
+ * To be able to use copy.c, we need a Relation descriptor. As there is no
+ * relation corresponding to the data loaded from workers, we need to fake one.
+ * We just need the bare minimal set of fields accessed by BeginCopyFrom().
+ */
+static Relation
+StubRelation(TupleDesc tupleDescriptor)
+{
+	Relation stubRelation = palloc0(sizeof(RelationData));
+	stubRelation->rd_att = tupleDescriptor;
+	stubRelation->rd_rel = palloc0(sizeof(FormData_pg_class));
+	stubRelation->rd_rel->relkind = RELKIND_RELATION;
+
+	return stubRelation;
+}
+
+
+/*
+ * ExecuteQueryStringIntoDestReceiver plans and executes a query and sends results
+ * to the given DestReceiver.
  */
 void
-CitusReScan(CustomScanState *node)
+ExecuteQueryStringIntoDestReceiver(const char *queryString, ParamListInfo params,
+								   DestReceiver *dest)
 {
-	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("rescan is unsupported"),
-					errdetail("We don't expect this code path to be executed.")));
+	Query *query = NULL;
+
+#if (PG_VERSION_NUM >= 100000)
+	RawStmt *rawStmt = (RawStmt *) ParseTreeRawStmt(queryString);
+	List *queryTreeList = pg_analyze_and_rewrite(rawStmt, queryString, NULL, 0, NULL);
+#else
+	Node *queryTreeNode = ParseTreeNode(queryString);
+	List *queryTreeList = pg_analyze_and_rewrite(queryTreeNode, queryString, NULL, 0);
+#endif
+
+	if (list_length(queryTreeList) != 1)
+	{
+		ereport(ERROR, (errmsg("can only execute a single query")));
+	}
+
+	query = (Query *) linitial(queryTreeList);
+
+	ExecuteQueryIntoDestReceiver(query, params, dest);
+}
+
+
+/*
+ * ExecuteQueryIntoDestReceiver plans and executes a query and sends results to the given
+ * DestReceiver.
+ */
+void
+ExecuteQueryIntoDestReceiver(Query *query, ParamListInfo params, DestReceiver *dest)
+{
+	PlannedStmt *queryPlan = NULL;
+	int cursorOptions = 0;
+
+	cursorOptions = CURSOR_OPT_PARALLEL_OK;
+
+	/* plan the subquery, this may be another distributed query */
+	queryPlan = pg_plan_query(query, cursorOptions, params);
+
+	ExecutePlanIntoDestReceiver(queryPlan, params, dest);
+}
+
+
+/*
+ * ExecuteIntoDestReceiver plans and executes a query and sends results to the given
+ * DestReceiver.
+ */
+void
+ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
+							DestReceiver *dest)
+{
+	Portal portal = NULL;
+	int eflags = 0;
+	long count = FETCH_ALL;
+
+	/* create a new portal for executing the query */
+	portal = CreateNewPortal();
+
+	/* don't display the portal in pg_cursors, it is for internal use only */
+	portal->visible = false;
+
+	PortalDefineQuery(portal,
+					  NULL,
+					  "",
+					  "SELECT",
+					  list_make1(queryPlan),
+					  NULL);
+
+	PortalStart(portal, params, eflags, GetActiveSnapshot());
+#if (PG_VERSION_NUM >= 100000)
+	PortalRun(portal, count, false, true, dest, dest, NULL);
+#else
+	PortalRun(portal, count, false, dest, dest, NULL);
+#endif
+	PortalDrop(portal, false);
 }

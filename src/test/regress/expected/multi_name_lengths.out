@@ -39,9 +39,9 @@ SELECT shard_name(NULL, 666666);
 SELECT shard_name(0, 666666);
 ERROR:  object_name does not reference a valid relation
 SELECT shard_name('too_long_12345678901234567890123456789012345678901234567890'::regclass, 666666);
-                               shard_name                               
-------------------------------------------------------------------------
- public.too_long_12345678901234567890123456789012345678_e0119164_666666
+                           shard_name                            
+-----------------------------------------------------------------
+ too_long_12345678901234567890123456789012345678_e0119164_666666
 (1 row)
 
 SELECT shard_name('too_long_12345678901234567890123456789012345678901234567890'::regclass, NULL);
@@ -74,8 +74,6 @@ SELECT master_create_worker_shards('name_lengths', '2', '2');
 -- Verify that we CAN add columns with "too-long names", because
 -- the columns' names are not extended in the corresponding shard tables.
 ALTER TABLE name_lengths ADD COLUMN float_col_12345678901234567890123456789012345678901234567890 FLOAT;
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 ALTER TABLE name_lengths ADD COLUMN date_col_12345678901234567890123456789012345678901234567890 DATE;
 ALTER TABLE name_lengths ADD COLUMN int_col_12345678901234567890123456789012345678901234567890 INTEGER DEFAULT 1;
 -- Placeholders for unsupported ALTER TABLE to add constraints with implicit names that are likely too long
@@ -105,8 +103,6 @@ ALTER TABLE name_lengths ADD CONSTRAINT nl_exclude_12345678901234567890123456789
 ERROR:  cannot create constraint on "name_lengths"
 DETAIL:  Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column (with an equality operator if EXCLUDE).
 ALTER TABLE name_lengths ADD CONSTRAINT nl_checky_12345678901234567890123456789012345678901234567890 CHECK (date_col_12345678901234567890123456789012345678901234567890 >= '2014-01-01'::date);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 \c - - - :worker_1_port
 SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.name_lengths_225002'::regclass;
                            Constraint                            |                                        Definition                                         
@@ -117,13 +113,12 @@ SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.name_len
 \c - - - :master_port
 -- Placeholders for RENAME operations
 ALTER TABLE name_lengths RENAME TO name_len_12345678901234567890123456789012345678901234567890;
-ERROR:  renaming distributed tables is currently unsupported
+ERROR:  shard name name_len_12345678901234567890123456789012345678_fcd8ab6f_225002 exceeds 63 characters
+CONTEXT:  while executing command on localhost:57638
 ALTER TABLE name_lengths RENAME CONSTRAINT unique_12345678901234567890123456789012345678901234567890 TO unique2_12345678901234567890123456789012345678901234567890;
 ERROR:  renaming constraints belonging to distributed tables is currently unsupported
 -- Verify that CREATE INDEX on already distributed table has proper shard names.
 CREATE INDEX tmp_idx_12345678901234567890123456789012345678901234567890 ON name_lengths(col2);
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 \c - - - :worker_1_port
 \d tmp_idx_*
 Index "public.tmp_idx_123456789012345678901234567890123456789_5e470afa_225002"
@@ -143,8 +138,6 @@ btree, for table "public.name_lengths_225003"
 -- by the parser/rewriter before further processing, just as in Postgres.
 CREATE INDEX tmp_idx_123456789012345678901234567890123456789012345678901234567890 ON name_lengths(col2);
 NOTICE:  identifier "tmp_idx_123456789012345678901234567890123456789012345678901234567890" will be truncated to "tmp_idx_1234567890123456789012345678901234567890123456789012345"
-NOTICE:  using one-phase commit for distributed DDL commands
-HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 \c - - - :worker_1_port
 \d tmp_idx_*
 Index "public.tmp_idx_123456789012345678901234567890123456789_599636aa_225002"
@@ -316,9 +309,9 @@ SELECT master_create_worker_shards(U&'elephant_!0441!043B!043E!043D!0441!043B!04
 SELECT shard_name(U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!'::regclass, min(shardid))
 FROM pg_dist_shard
 WHERE logicalrelid = U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!'::regclass;
-                        shard_name                        
-----------------------------------------------------------
- public."elephant_слонслонслонсло_c8b737c2_2250000000002"
+                    shard_name                     
+---------------------------------------------------
+ "elephant_слонслонслонсло_c8b737c2_2250000000002"
 (1 row)
 
 \c - - - :worker_1_port

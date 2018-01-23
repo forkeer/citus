@@ -86,7 +86,9 @@ extern List * DistTableOidList(void);
 extern List * ShardPlacementList(uint64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
-extern void ClearMetadataOIDCache(void);
+extern void FlushDistTableCache(void);
+extern void InvalidateMetadataSystemCache(void);
+extern Datum DistNodeMetadata(void);
 
 extern bool CitusHasBeenLoaded(void);
 extern bool CheckCitusVersion(int elevel);
@@ -109,6 +111,7 @@ extern Oid DistNodeRelationId(void);
 extern Oid DistLocalGroupIdRelationId(void);
 
 /* index oids */
+extern Oid DistNodeNodeIdIndexId(void);
 extern Oid DistPartitionLogicalRelidIndexId(void);
 extern Oid DistPartitionColocationidIndexId(void);
 extern Oid DistShardLogicalRelidIndexId(void);
@@ -117,16 +120,24 @@ extern Oid DistPlacementShardidIndexId(void);
 extern Oid DistPlacementPlacementidIndexId(void);
 extern Oid DistTransactionRelationId(void);
 extern Oid DistTransactionGroupIndexId(void);
+extern Oid DistTransactionRecordIndexId(void);
 extern Oid DistPlacementGroupidIndexId(void);
 
+/* type oids */
+extern Oid CitusCopyFormatTypeId(void);
+
 /* function oids */
+extern Oid CitusReadIntermediateResultFuncId(void);
 extern Oid CitusExtraDataContainerFuncId(void);
 extern Oid CitusWorkerHashFunctionId(void);
 
-/* nodeRole enum oids */
+/* enum oids */
 extern Oid PrimaryNodeRoleId(void);
 extern Oid SecondaryNodeRoleId(void);
 extern Oid UnavailableNodeRoleId(void);
+extern Oid CitusCopyFormatTypeId(void);
+extern Oid TextCopyFormatId(void);
+extern Oid BinaryCopyFormatId(void);
 
 /* user related functions */
 extern Oid CitusExtensionOwner(void);

@@ -30,6 +30,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "optimizer/var.h"
 #include "parser/parsetree.h"
 #include "parser/parse_coerce.h"
@@ -37,9 +38,9 @@
 #include "utils/lsyscache.h"
 
 
-static MultiPlan * CreateDistributedInsertSelectPlan(Query *originalQuery,
-													 PlannerRestrictionContext *
-													 plannerRestrictionContext);
+static DistributedPlan * CreateDistributedInsertSelectPlan(Query *originalQuery,
+														   PlannerRestrictionContext *
+														   plannerRestrictionContext);
 static bool SafeToPushDownSubquery(PlannerRestrictionContext *plannerRestrictionContext,
 								   Query *originalQuery);
 static Task * RouterModifyTaskForShardInterval(Query *originalQuery,
@@ -53,17 +54,17 @@ static DeferredErrorMessage * DistributedInsertSelectSupported(Query *queryTree,
 															   RangeTblEntry *subqueryRte,
 															   bool allReferenceTables);
 static DeferredErrorMessage * MultiTaskRouterSelectQuerySupported(Query *query);
+static bool HasUnsupportedDistinctOn(Query *query);
 static DeferredErrorMessage * InsertPartitionColumnMatchesSelect(Query *query,
 																 RangeTblEntry *insertRte,
 																 RangeTblEntry *
 																 subqueryRte,
 																 Oid *
 																 selectPartitionColumnTableId);
-static MultiPlan * CreateCoordinatorInsertSelectPlan(Query *parse);
+static DistributedPlan * CreateCoordinatorInsertSelectPlan(Query *parse);
 static DeferredErrorMessage * CoordinatorInsertSelectSupported(Query *insertSelectQuery);
 static Query * WrapSubquery(Query *subquery);
-static void CastSelectTargetList(List *selectTargetList, Oid targetRelationId,
-								 List *insertTargetList);
+static bool CheckInsertSelectQuery(Query *query);
 
 
 /*
@@ -73,18 +74,62 @@ static void CastSelectTargetList(List *selectTargetList, Oid targetRelationId,
  *
  * Note that the input query should be the original parsetree of
  * the query (i.e., not passed trough the standard planner).
+ */
+bool
+InsertSelectIntoDistributedTable(Query *query)
+{
+	bool insertSelectQuery = CheckInsertSelectQuery(query);
+
+	if (insertSelectQuery)
+	{
+		RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(query);
+		if (IsDistributedTable(insertRte->relid))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * InsertSelectIntoLocalTable checks whether INSERT INTO ... SELECT inserts
+ * into local table. Note that query must be a sample of INSERT INTO ... SELECT
+ * type of query.
+ */
+bool
+InsertSelectIntoLocalTable(Query *query)
+{
+	bool insertSelectQuery = CheckInsertSelectQuery(query);
+
+	if (insertSelectQuery)
+	{
+		RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(query);
+		if (!IsDistributedTable(insertRte->relid))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * CheckInsertSelectQuery returns true when the input query is an INSERT INTO
+ * ... SELECT kind of query.
  *
  * This function is inspired from getInsertSelectQuery() on
  * rewrite/rewriteManip.c.
  */
-bool
-InsertSelectIntoDistributedTable(Query *query)
+static bool
+CheckInsertSelectQuery(Query *query)
 {
 	CmdType commandType = query->commandType;
 	List *fromList = NULL;
 	RangeTblRef *rangeTableReference = NULL;
 	RangeTblEntry *subqueryRte = NULL;
-	RangeTblEntry *insertRte = NULL;
 
 	if (commandType != CMD_INSERT)
 	{
@@ -117,12 +162,6 @@ InsertSelectIntoDistributedTable(Query *query)
 	/* ensure that there is a query */
 	Assert(IsA(subqueryRte->subquery, Query));
 
-	insertRte = ExtractInsertRangeTableEntry(query);
-	if (!IsDistributedTable(insertRte->relid))
-	{
-		return false;
-	}
-
 	return true;
 }
 
@@ -133,11 +172,11 @@ InsertSelectIntoDistributedTable(Query *query)
  * command to the workers and if that is not possible it creates a
  * plan for evaluating the SELECT on the coordinator.
  */
-MultiPlan *
+DistributedPlan *
 CreateInsertSelectPlan(Query *originalQuery,
 					   PlannerRestrictionContext *plannerRestrictionContext)
 {
-	MultiPlan *distributedPlan = NULL;
+	DistributedPlan *distributedPlan = NULL;
 
 	distributedPlan = CreateDistributedInsertSelectPlan(originalQuery,
 														plannerRestrictionContext);
@@ -155,12 +194,12 @@ CreateInsertSelectPlan(Query *originalQuery,
 
 
 /*
- * CreateDistributedInsertSelectPlan Creates a MultiPlan for distributed
+ * CreateDistributedInsertSelectPlan Creates a DistributedPlan for distributed
  * INSERT ... SELECT queries which could consists of multiple tasks.
  *
- * The function never returns NULL, it errors out if cannot create the MultiPlan.
+ * The function never returns NULL, it errors out if cannot create the DistributedPlan.
  */
-static MultiPlan *
+static DistributedPlan *
 CreateDistributedInsertSelectPlan(Query *originalQuery,
 								  PlannerRestrictionContext *plannerRestrictionContext)
 {
@@ -169,7 +208,7 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 	uint32 taskIdIndex = 1;     /* 0 is reserved for invalid taskId */
 	Job *workerJob = NULL;
 	uint64 jobId = INVALID_JOB_ID;
-	MultiPlan *multiPlan = CitusMakeNode(MultiPlan);
+	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
 	RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(originalQuery);
 	RangeTblEntry *subqueryRte = ExtractSelectRangeTableEntry(originalQuery);
 	Oid targetRelationId = insertRte->relid;
@@ -180,18 +219,19 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 	bool allReferenceTables = relationRestrictionContext->allReferenceTables;
 	bool safeToPushDownSubquery = false;
 
-	multiPlan->operation = originalQuery->commandType;
+	distributedPlan->operation = originalQuery->commandType;
 
 	/*
 	 * Error semantics for INSERT ... SELECT queries are different than regular
 	 * modify queries. Thus, handle separately.
 	 */
-	multiPlan->planningError = DistributedInsertSelectSupported(originalQuery, insertRte,
-																subqueryRte,
-																allReferenceTables);
-	if (multiPlan->planningError)
+	distributedPlan->planningError = DistributedInsertSelectSupported(originalQuery,
+																	  insertRte,
+																	  subqueryRte,
+																	  allReferenceTables);
+	if (distributedPlan->planningError)
 	{
-		return multiPlan;
+		return distributedPlan;
 	}
 
 	safeToPushDownSubquery = SafeToPushDownSubquery(plannerRestrictionContext,
@@ -199,7 +239,7 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 
 	/*
 	 * Plan select query for each shard in the target table. Do so by replacing the
-	 * partitioning qual parameter added in multi_planner() using the current shard's
+	 * partitioning qual parameter added in distributed_planner() using the current shard's
 	 * actual boundary values. Also, add the current shard's boundary values to the
 	 * top level subquery to ensure that even if the partitioning qual is not distributed
 	 * to all the tables, we never run the queries on the shards that don't match with
@@ -228,15 +268,6 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 		++taskIdIndex;
 	}
 
-	if (MultiTaskQueryLogLevel != MULTI_TASK_QUERY_INFO_OFF &&
-		list_length(sqlTaskList) > 1)
-	{
-		ereport(MultiTaskQueryLogLevel, (errmsg("multi-task query about to be executed"),
-										 errhint("Queries are split to multiple tasks "
-												 "if they have to be split into several"
-												 " queries on the workers.")));
-	}
-
 	/* Create the worker job */
 	workerJob = CitusMakeNode(Job);
 	workerJob->taskList = sqlTaskList;
@@ -247,17 +278,17 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 	workerJob->requiresMasterEvaluation = RequiresMasterEvaluation(originalQuery);
 
 	/* and finally the multi plan */
-	multiPlan->workerJob = workerJob;
-	multiPlan->masterQuery = NULL;
-	multiPlan->routerExecutable = true;
-	multiPlan->hasReturning = false;
+	distributedPlan->workerJob = workerJob;
+	distributedPlan->masterQuery = NULL;
+	distributedPlan->routerExecutable = true;
+	distributedPlan->hasReturning = false;
 
 	if (list_length(originalQuery->returningList) > 0)
 	{
-		multiPlan->hasReturning = true;
+		distributedPlan->hasReturning = true;
 	}
 
-	return multiPlan;
+	return distributedPlan;
 }
 
 
@@ -286,14 +317,6 @@ DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "distributed INSERT ... SELECT can only select from "
 							 "distributed tables",
-							 NULL, NULL);
-	}
-
-	if (GetLocalGroupId() != 0)
-	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "distributed INSERT ... SELECT can only be performed from "
-							 "the coordinator",
 							 NULL, NULL);
 	}
 
@@ -380,8 +403,6 @@ static bool
 SafeToPushDownSubquery(PlannerRestrictionContext *plannerRestrictionContext,
 					   Query *originalQuery)
 {
-	RelationRestrictionContext *relationRestrictionContext =
-		plannerRestrictionContext->relationRestrictionContext;
 	bool restrictionEquivalenceForPartitionKeys =
 		RestrictionEquivalenceForPartitionKeys(plannerRestrictionContext);
 
@@ -392,7 +413,7 @@ SafeToPushDownSubquery(PlannerRestrictionContext *plannerRestrictionContext,
 
 	if (ContainsUnionSubquery(originalQuery))
 	{
-		return SafeToPushdownUnionSubquery(relationRestrictionContext);
+		return SafeToPushdownUnionSubquery(plannerRestrictionContext);
 	}
 
 	return false;
@@ -401,7 +422,7 @@ SafeToPushDownSubquery(PlannerRestrictionContext *plannerRestrictionContext,
 
 /*
  * RouterModifyTaskForShardInterval creates a modify task by
- * replacing the partitioning qual parameter added in multi_planner()
+ * replacing the partitioning qual parameter added in distributed_planner()
  * with the shardInterval's boundary value. Then perform the normal
  * shard pruning on the subquery. Finally, checks if the target shardInterval
  * has exactly same placements with the select task's available anchor
@@ -443,6 +464,7 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	List *shardOpExpressions = NIL;
 	RestrictInfo *shardRestrictionList = NULL;
 	DeferredErrorMessage *planningError = NULL;
+	bool multiShardModifyQuery = false;
 
 	/* grab shared metadata lock to stop concurrent placement additions */
 	LockShardDistributionMetadata(shardId, ShareLock);
@@ -502,7 +524,10 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	 */
 	planningError = PlanRouterQuery(copiedSubquery, copiedRestrictionContext,
 									&selectPlacementList, &selectAnchorShardId,
-									&relationShardList, replacePrunedQueryWithDummy);
+									&relationShardList, replacePrunedQueryWithDummy,
+									&multiShardModifyQuery);
+
+	Assert(!multiShardModifyQuery);
 
 	if (planningError)
 	{
@@ -516,8 +541,9 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	/* ensure that we do not send queries where select is pruned away completely */
 	if (list_length(selectPlacementList) == 0)
 	{
-		ereport(DEBUG2, (errmsg("Skipping target shard interval %ld since "
-								"SELECT query for it pruned away", shardId)));
+		ereport(DEBUG2, (errmsg("Skipping target shard interval " UINT64_FORMAT
+								" since SELECT query for it pruned away",
+								shardId)));
 
 		return NULL;
 	}
@@ -537,7 +563,7 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 						errmsg("cannot perform distributed planning for the given "
 							   "modification"),
 						errdetail("Insert query cannot be executed on all placements "
-								  "for shard %ld", shardId)));
+								  "for shard " UINT64_FORMAT "", shardId)));
 	}
 
 
@@ -737,6 +763,8 @@ MultiTaskRouterSelectQuerySupported(Query *query)
 {
 	List *queryList = NIL;
 	ListCell *queryCell = NULL;
+	StringInfo errorDetail = NULL;
+	bool hasUnsupportedDistinctOn = false;
 
 	ExtractQueryWalker((Node *) query, &queryList);
 	foreach(queryCell, queryList)
@@ -758,7 +786,7 @@ MultiTaskRouterSelectQuerySupported(Query *query)
 		if (subquery->limitCount != NULL)
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "LIMIT clauses are not allowed in distirbuted INSERT "
+								 "LIMIT clauses are not allowed in distributed INSERT "
 								 "... SELECT queries",
 								 NULL, NULL);
 		}
@@ -772,17 +800,34 @@ MultiTaskRouterSelectQuerySupported(Query *query)
 								 NULL, NULL);
 		}
 
-		/*
-		 * We could potentially support window clauses where the data is partitioned
-		 * over distribution column. For simplicity, we currently do not support window
-		 * clauses at all.
-		 */
-		if (subquery->windowClause != NULL)
+		/* group clause list must include partition column */
+		if (subquery->groupClause)
 		{
-			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "window functions are not allowed in distributed "
-								 "INSERT ... SELECT queries",
-								 NULL, NULL);
+			List *groupClauseList = subquery->groupClause;
+			List *targetEntryList = subquery->targetList;
+			List *groupTargetEntryList = GroupTargetEntryList(groupClauseList,
+															  targetEntryList);
+			bool groupOnPartitionColumn = TargetListOnPartitionColumn(subquery,
+																	  groupTargetEntryList);
+			if (!groupOnPartitionColumn)
+			{
+				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									 "Group by list without distribution column is "
+									 "not allowed  in distributed INSERT ... "
+									 "SELECT queries",
+									 NULL, NULL);
+			}
+		}
+
+		/*
+		 * We support window functions when the window function
+		 * is partitioned on distribution column.
+		 */
+		if (subquery->windowClause && !SafeToPushdownWindowFunction(subquery,
+																	&errorDetail))
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED, errorDetail->data, NULL,
+								 NULL);
 		}
 
 		if (subquery->setOperations != NULL)
@@ -808,19 +853,49 @@ MultiTaskRouterSelectQuerySupported(Query *query)
 		}
 
 		/*
-		 * We cannot support DISTINCT ON clauses since it could be on a non-partition column.
-		 * In that case, there is no way that Citus can support this.
+		 * We don't support DISTINCT ON clauses on non-partition columns.
 		 */
-		if (subquery->hasDistinctOn)
+		hasUnsupportedDistinctOn = HasUnsupportedDistinctOn(subquery);
+		if (hasUnsupportedDistinctOn)
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "DISTINCT ON clauses are not allowed in distributed "
-								 "INSERT ... SELECT queries",
+								 "DISTINCT ON (non-partition column) clauses are not "
+								 "allowed in distributed INSERT ... SELECT queries",
 								 NULL, NULL);
 		}
 	}
 
 	return NULL;
+}
+
+
+/*
+ * HasUnsupportedDistinctOn returns true if the query has distinct on and
+ * distinct targets do not contain partition column.
+ */
+static bool
+HasUnsupportedDistinctOn(Query *query)
+{
+	ListCell *distinctCell = NULL;
+
+	if (!query->hasDistinctOn)
+	{
+		return false;
+	}
+
+	foreach(distinctCell, query->distinctClause)
+	{
+		SortGroupClause *distinctClause = lfirst(distinctCell);
+		TargetEntry *distinctEntry = get_sortgroupclause_tle(distinctClause,
+															 query->targetList);
+
+		if (IsPartitionColumn(distinctEntry->expr, query))
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
@@ -1059,7 +1134,7 @@ InsertPartitionColumnMatchesSelect(Query *query, RangeTblEntry *insertRte,
  * CreatteCoordinatorInsertSelectPlan creates a query plan for a SELECT into a
  * distributed table. The query plan can also be executed on a worker in MX.
  */
-static MultiPlan *
+static DistributedPlan *
 CreateCoordinatorInsertSelectPlan(Query *parse)
 {
 	Query *insertSelectQuery = copyObject(parse);
@@ -1069,15 +1144,15 @@ CreateCoordinatorInsertSelectPlan(Query *parse)
 	RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(insertSelectQuery);
 	Oid targetRelationId = insertRte->relid;
 
-	MultiPlan *multiPlan = CitusMakeNode(MultiPlan);
-	multiPlan->operation = CMD_INSERT;
+	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
+	distributedPlan->operation = CMD_INSERT;
 
-	multiPlan->planningError =
+	distributedPlan->planningError =
 		CoordinatorInsertSelectSupported(insertSelectQuery);
 
-	if (multiPlan->planningError != NULL)
+	if (distributedPlan->planningError != NULL)
 	{
-		return multiPlan;
+		return distributedPlan;
 	}
 
 	selectQuery = selectRte->subquery;
@@ -1108,15 +1183,11 @@ CreateCoordinatorInsertSelectPlan(Query *parse)
 
 	ReorderInsertSelectTargetLists(insertSelectQuery, insertRte, selectRte);
 
-	/* make sure the SELECT returns the right type for copying into the table */
-	CastSelectTargetList(selectQuery->targetList, targetRelationId,
-						 insertSelectQuery->targetList);
+	distributedPlan->insertSelectSubquery = selectQuery;
+	distributedPlan->insertTargetList = insertSelectQuery->targetList;
+	distributedPlan->targetRelationId = targetRelationId;
 
-	multiPlan->insertSelectSubquery = selectQuery;
-	multiPlan->insertTargetList = insertSelectQuery->targetList;
-	multiPlan->targetRelationId = targetRelationId;
-
-	return multiPlan;
+	return distributedPlan;
 }
 
 
@@ -1231,63 +1302,4 @@ WrapSubquery(Query *subquery)
 	outerQuery->targetList = newTargetList;
 
 	return outerQuery;
-}
-
-
-/*
- * CastSelectTargetList adds casts to the target entries in selectTargetList
- * to match the type in insertTargetList. This ensures that the results of
- * the SELECT will have the right type when serialised during COPY. For
- * example, a float that is inserted into a an int column normally has an
- * implicit cast, but if we send it through the COPY protocol the serialised
- * form would contain decimal notation, which is not valid for int.
- */
-static void
-CastSelectTargetList(List *selectTargetList, Oid targetRelationId, List *insertTargetList)
-{
-	ListCell *insertTargetCell = NULL;
-	ListCell *selectTargetCell = NULL;
-
-	/* add casts when the SELECT output does not directly match the table */
-	forboth(insertTargetCell, insertTargetList,
-			selectTargetCell, selectTargetList)
-	{
-		TargetEntry *insertTargetEntry = (TargetEntry *) lfirst(insertTargetCell);
-		TargetEntry *selectTargetEntry = (TargetEntry *) lfirst(selectTargetCell);
-
-		Var *columnVar = NULL;
-		Oid columnType = InvalidOid;
-		int32 columnTypeMod = 0;
-		Oid selectOutputType = InvalidOid;
-
-		/* indirection is not supported, e.g. INSERT INTO table (composite_column.x) */
-		if (!IsA(insertTargetEntry->expr, Var))
-		{
-			ereport(ERROR, (errmsg("can only handle regular columns in the target "
-								   "list")));
-		}
-
-		columnVar = (Var *) insertTargetEntry->expr;
-		columnType = get_atttype(targetRelationId, columnVar->varattno);
-		columnTypeMod = get_atttypmod(targetRelationId, columnVar->varattno);
-		selectOutputType = columnVar->vartype;
-
-		/*
-		 * If the type in the target list does not match the type of the column,
-		 * we need to cast to the column type. PostgreSQL would do this
-		 * automatically during the insert, but we're passing the SELECT
-		 * output directly to COPY.
-		 */
-		if (columnType != selectOutputType)
-		{
-			Expr *selectExpression = selectTargetEntry->expr;
-			Expr *typeCastedSelectExpr =
-				(Expr *) coerce_to_target_type(NULL, (Node *) selectExpression,
-											   selectOutputType, columnType,
-											   columnTypeMod, COERCION_EXPLICIT,
-											   COERCE_IMPLICIT_CAST, -1);
-
-			selectTargetEntry->expr = typeCastedSelectExpr;
-		}
-	}
 }
